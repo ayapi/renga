@@ -1,16 +1,32 @@
 use super::super::*;
+use crate::app::codex_peer::codex_composer_has_draft_on_screen;
 
 fn seed_focused_pane_screen(app: &mut App, bytes: &[u8]) -> usize {
     let pane_id = app.ws().focused_pane_id;
-    let pane = app
-        .ws_mut()
-        .panes
-        .get_mut(&pane_id)
-        .expect("focused pane exists");
+    seed_pane_screen(app, pane_id, bytes);
+    pane_id
+}
+
+fn seed_pane_screen(app: &mut App, pane_id: usize, bytes: &[u8]) {
+    let pane = app.ws_mut().panes.get_mut(&pane_id).expect("pane exists");
     let mut parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
     parser.process(bytes);
-    drop(parser);
-    pane_id
+}
+
+fn seed_codex_draft(app: &mut App, pane_id: usize) {
+    seed_pane_screen(
+        app,
+        pane_id,
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA typed draft\x1b[1;15H",
+    );
+}
+
+fn seed_codex_ready_placeholder(app: &mut App, pane_id: usize) {
+    seed_pane_screen(
+        app,
+        pane_id,
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\n\nenter to send\x1b[1;3H",
+    );
 }
 
 #[test]
@@ -415,6 +431,7 @@ fn handle_peer_send_defers_codex_nudge_while_target_is_focused() {
         .insert(sibling_id, PeerClientKind::Codex);
     app.handle_focus(&ipc::PaneRef::Id(sibling_id))
         .expect("focus sibling");
+    seed_codex_draft(&mut app, sibling_id);
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(
@@ -515,6 +532,7 @@ fn handle_peer_send_coalesces_focused_codex_notifications() {
         .insert(sibling_id, PeerClientKind::Codex);
     app.handle_focus(&ipc::PaneRef::Id(sibling_id))
         .expect("focus sibling");
+    seed_codex_draft(&mut app, sibling_id);
 
     app.handle_peer_send(
         sender_id,
@@ -561,6 +579,7 @@ fn focused_codex_notification_esc_dismisses_without_queueing_nudge() {
         .insert(sibling_id, PeerClientKind::Codex);
     app.handle_focus(&ipc::PaneRef::Id(sibling_id))
         .expect("focus sibling");
+    seed_codex_draft(&mut app, sibling_id);
     app.handle_peer_send(
         sender_id,
         &ipc::PaneRef::Id(sibling_id),
@@ -597,6 +616,7 @@ fn focused_codex_notification_commit_clears_notification() {
         .insert(sibling_id, PeerClientKind::Codex);
     app.handle_focus(&ipc::PaneRef::Id(sibling_id))
         .expect("focus sibling");
+    seed_codex_draft(&mut app, sibling_id);
     app.handle_peer_send(
         sender_id,
         &ipc::PaneRef::Id(sibling_id),
@@ -828,6 +848,189 @@ fn flush_pending_codex_peer_messages_does_not_interrupt_existing_codex_draft() {
     app.shutdown();
 }
 
+#[test]
+fn focused_codex_without_draft_auto_submits_when_ready() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(sibling_id, PeerClientKind::Codex);
+    app.handle_focus(&ipc::PaneRef::Id(sibling_id))
+        .expect("focus sibling");
+    seed_codex_ready_placeholder(&mut app, sibling_id);
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "hello focused codex".to_string(),
+    )
+    .expect("peer send");
+
+    assert!(app.visible_codex_peer_notification().is_none());
+    let queued = app
+        .pending_codex_peer_messages
+        .get(&sibling_id)
+        .expect("submit should be delayed");
+    assert!(matches!(
+        queued.front(),
+        Some(PendingCodexPeerDelivery::SubmitAt(_))
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn focused_codex_without_draft_queues_when_not_ready() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(sibling_id, PeerClientKind::Codex);
+    app.handle_focus(&ipc::PaneRef::Id(sibling_id))
+        .expect("focus sibling");
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "hello focused codex".to_string(),
+    )
+    .expect("peer send");
+
+    assert!(app.visible_codex_peer_notification().is_none());
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&sibling_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::Draft(_))
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn unfocused_codex_with_draft_stays_silent_and_queued() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(sibling_id, PeerClientKind::Codex);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    seed_codex_draft(&mut app, sibling_id);
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "hello codex".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(app.visible_codex_peer_notification().is_none());
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&sibling_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::Draft(_))
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn focus_transition_routes_pending_codex_by_draft_state() {
+    let mut app = App::new(40, 160).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let draft_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(draft_id, PeerClientKind::Codex);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    seed_codex_draft(&mut app, draft_id);
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(draft_id), "draft".to_string())
+        .expect("peer send");
+
+    app.handle_focus(&ipc::PaneRef::Id(draft_id))
+        .expect("focus draft pane");
+    assert!(app.visible_codex_peer_notification().is_some());
+
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    let ready_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(ready_id, PeerClientKind::Codex);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    seed_codex_ready_placeholder(&mut app, ready_id);
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(ready_id), "ready".to_string())
+        .expect("peer send");
+
+    app.handle_focus(&ipc::PaneRef::Id(ready_id))
+        .expect("focus ready pane");
+    assert!(app.visible_codex_peer_notification().is_none());
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&ready_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt(_))
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn dim_codex_placeholder_is_not_a_draft() {
+    let mut parser = vt100::Parser::new(40, 80, 0);
+    parser.process(
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[1;3H",
+    );
+
+    assert_eq!(
+        codex_composer_has_draft_on_screen(parser.screen()),
+        Some(false)
+    );
+}
 #[test]
 fn handle_peer_list_excludes_caller_and_lists_siblings() {
     let mut app = App::new(40, 80).expect("App::new");

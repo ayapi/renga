@@ -157,6 +157,71 @@ fn codex_prompt_allows_peer_nudge(pane: &Pane) -> Option<bool> {
     codex_prompt_allows_peer_nudge_on_screen(parser.screen())
 }
 
+pub(crate) fn codex_composer_has_draft_on_screen(screen: &vt100::Screen) -> Option<bool> {
+    let (rows, cols) = screen.size();
+    let (cursor_row, _) = screen.cursor_position();
+    let mut last_content_row = None;
+    for row in 0..rows {
+        let mut has_text = false;
+        for col in 0..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                if !cell.contents().trim().is_empty() {
+                    has_text = true;
+                    break;
+                }
+            }
+        }
+        if has_text {
+            last_content_row = Some(row);
+        }
+    }
+    let end_row = last_content_row.unwrap_or(cursor_row).max(cursor_row);
+    let start_row = end_row
+        .saturating_add(1)
+        .saturating_sub(CODEX_APPEND_ENTER_SNAPSHOT_LINES as u16);
+    for row in (start_row..=end_row).rev() {
+        let mut prompt_col = None;
+        for col in 0..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                if cell.contents() == "›" {
+                    prompt_col = Some(col);
+                    break;
+                }
+            }
+        }
+        let Some(prompt_col) = prompt_col else {
+            continue;
+        };
+        let input_start = prompt_col.saturating_add(1);
+        let mut has_input_text = false;
+        let mut has_normal_input_text = false;
+        for col in input_start..cols {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.contents().trim().is_empty() {
+                continue;
+            }
+            has_input_text = true;
+            if !cell.dim() {
+                has_normal_input_text = true;
+            }
+        }
+        if !has_input_text {
+            return Some(false);
+        }
+        return Some(has_normal_input_text);
+    }
+    None
+}
+
+fn codex_composer_has_draft(pane: &Pane) -> Option<bool> {
+    let Ok(parser) = pane.parser.lock() else {
+        return None;
+    };
+    codex_composer_has_draft_on_screen(parser.screen())
+}
+
 fn codex_peer_screen_tail(pane: &Pane) -> Option<String> {
     Some(
         pane_screen_tail_lines(pane)?
@@ -260,20 +325,7 @@ impl App {
                 && self.workspaces[target_ws].focus_target == FocusTarget::Pane
                 && self.workspaces[target_ws].focused_pane_id == target_id;
             if target_is_focused {
-                self.pending_codex_peer_messages.remove(&target_id);
-                match self.codex_peer_notification.as_mut() {
-                    Some(notification) if notification.target_pane == target_id => {
-                        notification.register_message(message);
-                    }
-                    _ => {
-                        self.codex_peer_notification = Some(CodexPeerNotificationState {
-                            target_pane: target_id,
-                            message,
-                            pending_count: 1,
-                        });
-                    }
-                }
-                self.dirty = true;
+                self.route_focused_codex_peer_message(target_id, message)?;
             } else {
                 self.push_pending_codex_peer_nudge(target_id, message);
             }
@@ -335,6 +387,69 @@ impl App {
         if queue.is_empty() {
             queue.push_back(PendingCodexPeerDelivery::Draft(message));
         }
+    }
+
+    fn show_codex_peer_notification(&mut self, pane_id: usize, message: PendingCodexPeerMessage) {
+        self.pending_codex_peer_messages.remove(&pane_id);
+        match self.codex_peer_notification.as_mut() {
+            Some(notification) if notification.target_pane == pane_id => {
+                notification.register_message(message);
+            }
+            _ => {
+                self.codex_peer_notification = Some(CodexPeerNotificationState {
+                    target_pane: pane_id,
+                    message,
+                    pending_count: 1,
+                });
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn route_focused_codex_peer_message(
+        &mut self,
+        pane_id: usize,
+        message: PendingCodexPeerMessage,
+    ) -> std::result::Result<(), ipc::CodedError> {
+        let registered_codex = self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex);
+        let has_draft = self
+            .ws()
+            .panes
+            .get(&pane_id)
+            .and_then(codex_composer_has_draft)
+            .unwrap_or(false);
+        if has_draft {
+            self.show_codex_peer_notification(pane_id, message);
+            return Ok(());
+        }
+        let ready = self
+            .ws()
+            .panes
+            .get(&pane_id)
+            .is_some_and(|pane| Self::codex_peer_delivery_ready(registered_codex, pane));
+        if !ready {
+            self.push_pending_codex_peer_nudge(pane_id, message);
+            return Ok(());
+        }
+        let payload = crate::mcp_peer::build_send_keys_payload(
+            &format_codex_peer_message(&message),
+            None,
+            false,
+        )
+        .expect("codex peer draft payload");
+        let pane =
+            self.ws_mut().panes.get_mut(&pane_id).ok_or_else(|| {
+                ipc::CodedError::new(ipc::err_code::PANE_VANISHED, "pane vanished")
+            })?;
+        write_input_to_pane(pane, payload.as_bytes(), false)?;
+        let queue = self.pending_codex_peer_messages.entry(pane_id).or_default();
+        queue.clear();
+        queue.push_back(PendingCodexPeerDelivery::SubmitAt(
+            Instant::now() + CODEX_PEER_NUDGE_SUBMIT_DELAY,
+        ));
+        self.codex_peer_notification = None;
+        self.dirty = true;
+        Ok(())
     }
 
     pub(crate) fn codex_peer_notification_is_visible(&self) -> bool {
@@ -448,12 +563,14 @@ impl App {
         self.materialize_unfocused_codex_peer_notification();
         let now = Instant::now();
         let mut empty_panes = Vec::new();
-        for ws in &mut self.workspaces {
+        let mut focused_notifications = Vec::new();
+        let active_tab = self.active_tab;
+        for (ws_index, ws) in self.workspaces.iter_mut().enumerate() {
             let pane_ids: Vec<usize> = ws.panes.keys().copied().collect();
             for pane_id in pane_ids {
-                if ws.focused_pane_id == pane_id {
-                    continue;
-                }
+                let pane_is_focused = ws_index == active_tab
+                    && ws.focus_target == FocusTarget::Pane
+                    && ws.focused_pane_id == pane_id;
                 let Some(queue) = self.pending_codex_peer_messages.get_mut(&pane_id) else {
                     continue;
                 };
@@ -464,6 +581,14 @@ impl App {
                 if let Some(pane) = ws.panes.get_mut(&pane_id) {
                     match delivery {
                         PendingCodexPeerDelivery::Draft(message) => {
+                            if codex_composer_has_draft(pane).unwrap_or(false) {
+                                if pane_is_focused {
+                                    queue.pop_front();
+                                    focused_notifications.push((pane_id, message));
+                                    self.dirty = true;
+                                }
+                                continue;
+                            }
                             let registered_codex = self.peer_client_kinds.get(&pane_id)
                                 == Some(&PeerClientKind::Codex);
                             if !Self::codex_peer_delivery_ready(registered_codex, pane) {
@@ -503,6 +628,9 @@ impl App {
         }
         for pane_id in empty_panes {
             self.pending_codex_peer_messages.remove(&pane_id);
+        }
+        for (pane_id, message) in focused_notifications {
+            self.show_codex_peer_notification(pane_id, message);
         }
     }
 }

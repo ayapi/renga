@@ -399,75 +399,81 @@ impl App {
     }
 
     pub(crate) fn focus_next_pane(&mut self) {
-        let ws = self.ws_mut();
-        let ids = ws.layout.collect_pane_ids();
-        let tree_visible = ws.file_tree_visible;
-        let preview_active = ws.preview.is_active();
+        {
+            let ws = self.ws_mut();
+            let ids = ws.layout.collect_pane_ids();
+            let tree_visible = ws.file_tree_visible;
+            let preview_active = ws.preview.is_active();
 
-        match ws.focus_target {
-            FocusTarget::FileTree => {
-                if preview_active {
-                    ws.focus_target = FocusTarget::Preview;
-                } else {
-                    ws.focus_target = FocusTarget::Pane;
-                }
-            }
-            FocusTarget::Preview => {
-                ws.focus_target = FocusTarget::Pane;
-            }
-            FocusTarget::Pane => {
-                if let Some(idx) = ids.iter().position(|&id| id == ws.focused_pane_id) {
-                    if idx + 1 < ids.len() {
-                        ws.focused_pane_id = ids[idx + 1];
-                    } else if tree_visible {
-                        ws.focus_target = FocusTarget::FileTree;
-                    } else if preview_active {
+            match ws.focus_target {
+                FocusTarget::FileTree => {
+                    if preview_active {
                         ws.focus_target = FocusTarget::Preview;
                     } else {
-                        ws.focused_pane_id = ids[0];
+                        ws.focus_target = FocusTarget::Pane;
+                    }
+                }
+                FocusTarget::Preview => {
+                    ws.focus_target = FocusTarget::Pane;
+                }
+                FocusTarget::Pane => {
+                    if let Some(idx) = ids.iter().position(|&id| id == ws.focused_pane_id) {
+                        if idx + 1 < ids.len() {
+                            ws.focused_pane_id = ids[idx + 1];
+                        } else if tree_visible {
+                            ws.focus_target = FocusTarget::FileTree;
+                        } else if preview_active {
+                            ws.focus_target = FocusTarget::Preview;
+                        } else {
+                            ws.focused_pane_id = ids[0];
+                        }
                     }
                 }
             }
         }
+        self.flush_pending_codex_peer_messages();
     }
 
     pub(crate) fn focus_prev_pane(&mut self) {
-        let ws = self.ws_mut();
-        let ids = ws.layout.collect_pane_ids();
-        let tree_visible = ws.file_tree_visible;
-        let preview_active = ws.preview.is_active();
+        {
+            let ws = self.ws_mut();
+            let ids = ws.layout.collect_pane_ids();
+            let tree_visible = ws.file_tree_visible;
+            let preview_active = ws.preview.is_active();
 
-        match ws.focus_target {
-            FocusTarget::FileTree => {
-                ws.focus_target = FocusTarget::Pane;
-                if let Some(&last) = ids.last() {
-                    ws.focused_pane_id = last;
-                }
-            }
-            FocusTarget::Preview => {
-                if tree_visible {
-                    ws.focus_target = FocusTarget::FileTree;
-                } else {
+            match ws.focus_target {
+                FocusTarget::FileTree => {
                     ws.focus_target = FocusTarget::Pane;
                     if let Some(&last) = ids.last() {
                         ws.focused_pane_id = last;
                     }
                 }
-            }
-            FocusTarget::Pane => {
-                if let Some(idx) = ids.iter().position(|&id| id == ws.focused_pane_id) {
-                    if idx > 0 {
-                        ws.focused_pane_id = ids[idx - 1];
-                    } else if preview_active {
-                        ws.focus_target = FocusTarget::Preview;
-                    } else if tree_visible {
+                FocusTarget::Preview => {
+                    if tree_visible {
                         ws.focus_target = FocusTarget::FileTree;
                     } else {
-                        ws.focused_pane_id = ids[ids.len() - 1];
+                        ws.focus_target = FocusTarget::Pane;
+                        if let Some(&last) = ids.last() {
+                            ws.focused_pane_id = last;
+                        }
+                    }
+                }
+                FocusTarget::Pane => {
+                    if let Some(idx) = ids.iter().position(|&id| id == ws.focused_pane_id) {
+                        if idx > 0 {
+                            ws.focused_pane_id = ids[idx - 1];
+                        } else if preview_active {
+                            ws.focus_target = FocusTarget::Preview;
+                        } else if tree_visible {
+                            ws.focus_target = FocusTarget::FileTree;
+                        } else {
+                            ws.focused_pane_id = ids[ids.len() - 1];
+                        }
                     }
                 }
             }
         }
+        self.flush_pending_codex_peer_messages();
     }
 }
 

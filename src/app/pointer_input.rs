@@ -395,6 +395,7 @@ impl App {
                             {
                                 self.ws_mut().focused_pane_id = target_id;
                                 self.ws_mut().focus_target = FocusTarget::Pane;
+                                self.flush_pending_codex_peer_messages();
                                 if let Ok(Some(new_id)) =
                                     self.split_focused_pane_with_position(dir, new_pane_first, None)
                                 {
@@ -437,6 +438,7 @@ impl App {
                             self.last_edge_click = None;
                             self.ws_mut().focused_pane_id = target_id;
                             self.ws_mut().focus_target = FocusTarget::Pane;
+                            self.flush_pending_codex_peer_messages();
                             let (direction, new_pane_first) = split_intent_for_edge(side);
                             if let Ok(Some(new_id)) = self.split_focused_pane_with_position(
                                 direction,
@@ -512,6 +514,7 @@ impl App {
                     {
                         self.ws_mut().focused_pane_id = pane_id;
                         self.ws_mut().focus_target = FocusTarget::Pane;
+                        self.flush_pending_codex_peer_messages();
 
                         if !mouse.modifiers.contains(KeyModifiers::SHIFT)
                             && !mouse_forward_disabled()

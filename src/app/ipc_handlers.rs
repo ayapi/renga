@@ -527,6 +527,7 @@ impl App {
         let ws = self.ws_mut();
         ws.focused_pane_id = pane_id;
         ws.focus_target = FocusTarget::Pane;
+        self.flush_pending_codex_peer_messages();
         self.dirty = true;
         Ok(())
     }
