@@ -1031,6 +1031,41 @@ fn dim_codex_placeholder_is_not_a_draft() {
         Some(false)
     );
 }
+
+#[test]
+fn colored_codex_placeholder_is_not_a_draft_when_cursor_is_at_prompt() {
+    let mut parser = vt100::Parser::new(40, 80, 0);
+    parser.process(
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA \x1b[38;5;240mAsk Codex anything...\x1b[39m\x1b[1;3H",
+    );
+
+    assert_eq!(
+        codex_composer_has_draft_on_screen(parser.screen()),
+        Some(false)
+    );
+}
+
+#[test]
+fn codex_composer_draft_uses_cursor_position_on_prompt_row() {
+    let mut parser = vt100::Parser::new(40, 80, 0);
+    parser.process(b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA typed draft\x1b[1;15H");
+
+    assert_eq!(
+        codex_composer_has_draft_on_screen(parser.screen()),
+        Some(true)
+    );
+}
+
+#[test]
+fn codex_composer_draft_uses_cursor_position_below_prompt_row() {
+    let mut parser = vt100::Parser::new(40, 80, 0);
+    parser.process(b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA \nsecond line\x1b[2;12H");
+
+    assert_eq!(
+        codex_composer_has_draft_on_screen(parser.screen()),
+        Some(true)
+    );
+}
 #[test]
 fn handle_peer_list_excludes_caller_and_lists_siblings() {
     let mut app = App::new(40, 80).expect("App::new");

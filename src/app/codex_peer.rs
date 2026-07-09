@@ -157,9 +157,15 @@ fn codex_prompt_allows_peer_nudge(pane: &Pane) -> Option<bool> {
     codex_prompt_allows_peer_nudge_on_screen(parser.screen())
 }
 
+fn looks_like_codex_placeholder(text: &str) -> bool {
+    let normalized = text.trim();
+    normalized.eq_ignore_ascii_case("Ask Codex anything...")
+        || normalized.eq_ignore_ascii_case("Ask Codex anything")
+}
+
 pub(crate) fn codex_composer_has_draft_on_screen(screen: &vt100::Screen) -> Option<bool> {
     let (rows, cols) = screen.size();
-    let (cursor_row, _) = screen.cursor_position();
+    let (cursor_row, cursor_col) = screen.cursor_position();
     let mut last_content_row = None;
     for row in 0..rows {
         let mut has_text = false;
@@ -193,12 +199,29 @@ pub(crate) fn codex_composer_has_draft_on_screen(screen: &vt100::Screen) -> Opti
             continue;
         };
         let input_start = prompt_col.saturating_add(1);
+        let editable_start = if screen
+            .cell(row, input_start)
+            .is_some_and(|cell| cell.contents().trim().is_empty())
+        {
+            input_start.saturating_add(1)
+        } else {
+            input_start
+        };
+        if cursor_row > row {
+            return Some(true);
+        }
+        if cursor_row == row && cursor_col > editable_start {
+            return Some(true);
+        }
+
+        let mut input_text = String::new();
         let mut has_input_text = false;
         let mut has_normal_input_text = false;
         for col in input_start..cols {
             let Some(cell) = screen.cell(row, col) else {
                 continue;
             };
+            input_text.push_str(cell.contents());
             if cell.contents().trim().is_empty() {
                 continue;
             }
@@ -207,7 +230,7 @@ pub(crate) fn codex_composer_has_draft_on_screen(screen: &vt100::Screen) -> Opti
                 has_normal_input_text = true;
             }
         }
-        if !has_input_text {
+        if !has_input_text || looks_like_codex_placeholder(&input_text) {
             return Some(false);
         }
         return Some(has_normal_input_text);
