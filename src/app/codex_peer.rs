@@ -210,8 +210,11 @@ pub(crate) fn codex_composer_has_draft_on_screen(screen: &vt100::Screen) -> Opti
         if cursor_row > row {
             return Some(true);
         }
-        if cursor_row == row && cursor_col > editable_start {
-            return Some(true);
+        if cursor_row == row {
+            if cursor_col > editable_start {
+                return Some(true);
+            }
+            return Some(false);
         }
 
         let mut input_text = String::new();
