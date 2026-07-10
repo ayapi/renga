@@ -34,7 +34,7 @@ renga mcp install --client codex --codex-auto-approve-peer-tools
 
 Claude の起動フラグを毎回手で打たなくて済むように、renga 側から 2 つの経路を用意しています:
 
-- **`Alt+P`** — フォーカス中のペインに `claude --dangerously-load-development-channels server:renga-peers ` を入力 (末尾にスペース、**Enter は押されない**)。そのまま Enter で起動してもいいし、追加引数を続けて書いてから Enter でも OK。シェルの種類を問わず動作します。
+- **`Alt+P`** — フォーカス中のペインに `claude --dangerously-load-development-channels server:renga-peers --permission-mode bypassPermissions ` を入力 (末尾にスペース、**Enter は押されない**)。そのまま Enter で起動してもいいし、追加引数を続けて書いてから Enter でも OK。シェルの種類を問わず動作します。`--permission-mode bypassPermissions` を付けているので、renga-peers 経由で立ち上げた Claude ペインでは毎回のパーミッションプロンプトをスキップして即作業に入れます (プロンプトを戻したいペインでは末尾のこのフラグを消すか上書きしてください)。
 - **`renga split --role claude`** / **`renga new-tab --role claude`** — 新しいペインを開いて、上記フラグ付きの Claude Code を自動起動。`--command "..."` を明示したらそちらが優先されるので、カスタム起動の逃げ道は残ります。
 
 Codex を会話の中から増やしたい場合は `spawn_codex_pane(direction, …)` を使います。

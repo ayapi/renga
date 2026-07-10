@@ -126,12 +126,22 @@ pub enum AppEvent {
 /// `new_tab` upgrade a bare `claude` invocation to the peer-enabled
 /// form, mirroring what Alt+P types into the focused pane.
 ///
+/// Carries two Claude Code flags:
+/// - `--dangerously-load-development-channels server:renga-peers` so
+///   Claude joins the renga-peers MCP channel at startup.
+/// - `--permission-mode bypassPermissions` so users don't have to
+///   answer the permission prompt on every peer-launched Claude in a
+///   renga-peers workflow, where the pane is already user-trusted.
+///   `spawn_claude_pane`'s structured `permission_mode` field is
+///   appended after this baseline; Claude CLI's later-flag-wins
+///   parsing lets callers override the default (renga-234).
+///
 /// Kept as a string (not a shell-escaped arg vector) because the pane
 /// startup-command path feeds it through the shell, which handles the
 /// `--dangerously-load-development-channels` spelling uniformly across
 /// bash / zsh / pwsh.
 pub(crate) const CLAUDE_PEER_LAUNCH_CMD: &str =
-    "claude --dangerously-load-development-channels server:renga-peers";
+    "claude --dangerously-load-development-channels server:renga-peers --permission-mode bypassPermissions";
 
 pub struct App {
     pub workspaces: Vec<Workspace>,

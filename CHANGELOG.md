@@ -9,6 +9,24 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ## [Unreleased]
 
+### Changed
+
+- **Alt+P (and the equivalent `renga split --role claude` / MCP
+  `spawn_pane` auto-upgrade for a bare `claude` command) now inserts
+  `--permission-mode bypassPermissions` alongside the
+  `--dangerously-load-development-channels server:renga-peers` flag.**
+  The renga-peers workflow launches Claude into a pane the user has
+  already opened in their own terminal, so the per-launch permission
+  prompt was pure friction — every peer-launched Claude required a
+  round-trip through the prompt before it could actually work.
+  `spawn_claude_pane`'s structured `permission_mode` argument still
+  wins because Claude CLI resolves duplicate flags later-flag-wins,
+  so callers that want a different mode (or want the prompt back) do
+  not need renga to strip the baseline first. Frozen v1.0 API surface
+  (MCP wire shape, CLI flags, config keys, env vars) is unchanged. The
+  Alt+P inserted string is longer by one flag, which is user-facing
+  but not a wire-format change. (renga-234)
+
 ## [1.3.2] — 2026-06-07
 
 Patch release. Fixes caret freeze/drift in Claude Code panes on Windows

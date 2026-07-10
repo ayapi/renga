@@ -420,7 +420,8 @@ Launching Claude Code: prefer spawn_claude_pane for Claude launches — it takes
 launch policy in renga so orchestrator prompts never have to synthesize shell-quoted command \
 strings. For arbitrary shell commands (non-Claude), use spawn_pane / new_tab. When those \
 are asked to run a bare `claude` invocation the MCP still auto-upgrades it to the \
-peer-enabled form (`claude --dangerously-load-development-channels server:renga-peers`), but \
+peer-enabled form (`claude --dangerously-load-development-channels server:renga-peers \
+--permission-mode bypassPermissions`), but \
 spawn_claude_pane is the recommended API for agent harnesses. For Codex launches, prefer \
 spawn_codex_pane once `renga mcp install --client codex` has been run for that user.\n\n\
 IMPORTANT about pane control: these tools affect the user's live layout. Use them with \
@@ -1048,7 +1049,7 @@ fn opt_string(args: &Value, key: &str) -> Option<String> {
 ///   unrelated command by accident.
 /// - Preserve the caller's trailing arguments: `"claude --resume"`
 ///   becomes `"claude --dangerously-load-development-channels
-///   server:renga-peers --resume"`.
+///   server:renga-peers --permission-mode bypassPermissions --resume"`.
 pub(crate) fn upgrade_claude_command(cmd: &str) -> String {
     if cmd.contains("--dangerously-load-development-channels") {
         return cmd.to_string();
@@ -1304,10 +1305,18 @@ fn shell_quote(value: &str) -> String {
 
 /// Build the final `claude` launch command for `spawn_claude_pane`.
 /// Order (matches the issue #137 spec):
-///   1. `claude --dangerously-load-development-channels server:renga-peers`
+///   1. `CLAUDE_PEER_LAUNCH_CMD` (peer-channel flag +
+///      `--permission-mode bypassPermissions` baseline, renga-234)
 ///   2. `--permission-mode <permission_mode>` if present
 ///   3. `--model <model>` if present
 ///   4. caller-supplied `args[]`
+///
+/// The structured `permission_mode` field is emitted after the
+/// baseline `--permission-mode bypassPermissions` in the prefix; the
+/// Claude CLI resolves duplicate flags later-wins, so a caller-supplied
+/// `permission_mode` overrides the default without renga having to
+/// strip the baseline. The command line looks slightly noisier when
+/// both are present but the semantics stay correct.
 ///
 /// Each value (structured field or extra arg) flows through
 /// `shell_quote` so whitespace and shell metacharacters can't
@@ -2617,10 +2626,7 @@ mod tests {
 
     #[test]
     fn upgrade_claude_command_bare_claude_becomes_peer_enabled() {
-        assert_eq!(
-            upgrade_claude_command("claude"),
-            "claude --dangerously-load-development-channels server:renga-peers"
-        );
+        assert_eq!(upgrade_claude_command("claude"), CLAUDE_PEER_LAUNCH_CMD);
     }
 
     #[test]
@@ -2629,7 +2635,8 @@ mod tests {
         // peer-channel flag is inserted right after the `claude` token.
         let got = upgrade_claude_command("claude --resume");
         assert_eq!(
-            got, "claude --dangerously-load-development-channels server:renga-peers --resume",
+            got,
+            format!("{CLAUDE_PEER_LAUNCH_CMD} --resume"),
             "got {got:?}"
         );
     }
@@ -2673,7 +2680,7 @@ mod tests {
         // surprising rewrite.
         assert_eq!(
             upgrade_claude_command("  claude --resume"),
-            "  claude --dangerously-load-development-channels server:renga-peers --resume"
+            format!("  {CLAUDE_PEER_LAUNCH_CMD} --resume")
         );
     }
 
@@ -2874,10 +2881,20 @@ mod tests {
         // Regression guard: any future refactor of the ordering must
         // keep the peer-channel flag at the front so Claude joins
         // renga-peers even when permission_mode / model are unset.
+        // Also asserts the `--permission-mode bypassPermissions`
+        // baseline (renga-234) survives independently of the
+        // `CLAUDE_PEER_LAUNCH_CMD` constant — a substring check the
+        // `format!("{CLAUDE_PEER_LAUNCH_CMD} ...")`-based tests can't
+        // provide because they'd stay green if someone silently
+        // dropped the flag from the constant.
         let got = build_claude_launch_command(None, None, &["--resume".to_string()]);
         assert!(
             got.contains("--dangerously-load-development-channels server:renga-peers"),
             "peer-channel flag missing: {got}"
+        );
+        assert!(
+            got.contains("--permission-mode bypassPermissions"),
+            "bypassPermissions baseline missing: {got}"
         );
     }
 

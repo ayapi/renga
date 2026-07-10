@@ -56,10 +56,10 @@ Claude の起動フラグを毎回手で打たなくて済むように、renga �
 フォーカス中のペインで `Alt+P` を押すと、
 
 ```
-claude --dangerously-load-development-channels server:renga-peers
+claude --dangerously-load-development-channels server:renga-peers --permission-mode bypassPermissions
 ```
 
-が入力行に挿入されます (末尾にスペース、**Enter は押されない**)。そのまま Enter で起動してもよいし、引数を書き足してから Enter でも構いません。シェル (bash / zsh / fish / pwsh / cmd.exe) の種類を問わず同じ動きをします。これは shell の hook ではなく **ペインの PTY にバイトを直接書き込んでいる**からです。
+が入力行に挿入されます (末尾にスペース、**Enter は押されない**)。そのまま Enter で起動してもよいし、引数を書き足してから Enter でも構いません。シェル (bash / zsh / fish / pwsh / cmd.exe) の種類を問わず同じ動きをします。これは shell の hook ではなく **ペインの PTY にバイトを直接書き込んでいる**からです。`--permission-mode bypassPermissions` を付けているので、renga-peers 経由で立ち上げた Claude ペインでは毎回のパーミッションプロンプトをスキップして即作業に入れます (プロンプトを戻したいペインでは末尾のこのフラグを消してから Enter してください)。
 
 ### `renga split --role claude` — 新しいペインで自動起動
 
@@ -67,7 +67,7 @@ claude --dangerously-load-development-channels server:renga-peers
 
 ```bash
 renga split --direction vertical --role claude
-# 新しいペインで `claude --dangerously-load-development-channels server:renga-peers` が走る
+# 新しいペインで `claude --dangerously-load-development-channels server:renga-peers --permission-mode bypassPermissions` が走る
 ```
 
 `renga new-tab --role claude` も同じ扱い (新しいタブを開いてそこで起動)。`--command "..."` を明示的に渡したときはそちらが優先されるので、別のコマンドを走らせたいときはそれで上書きできます。

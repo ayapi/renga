@@ -32,7 +32,7 @@ Peer delivery is client-specific:
 
 renga gives you two shortcuts so you don't have to type the Claude launch flag by hand:
 
-- **`Alt+P`** — Inserts `claude --dangerously-load-development-channels server:renga-peers ` into the focused pane (trailing space, *no* Enter). Review, optionally tack on args, press Enter to run. Works in any pane, any shell.
+- **`Alt+P`** — Inserts `claude --dangerously-load-development-channels server:renga-peers --permission-mode bypassPermissions ` into the focused pane (trailing space, *no* Enter). Review, optionally tack on args, press Enter to run. Works in any pane, any shell. `--permission-mode bypassPermissions` skips Claude's per-launch permission prompt so peer-launched Claude panes come up ready to work; drop or override the flag if you want the prompt back for that pane.
 - **`renga split --role claude`** / **`renga new-tab --role claude`** — Creates a new pane and auto-launches Claude Code with the flag already applied. Explicit `--command` wins if you pass one, so the flag path stays an escape hatch you can override.
 
 Once Codex is registered, orchestrator panes can also launch it in-band with `spawn_codex_pane(direction, …)`.

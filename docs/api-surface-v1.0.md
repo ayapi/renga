@@ -146,11 +146,15 @@ Returns: text containing the new pane's numeric id.
 
 **`command` rewrite contract (Q3)**: when `command` starts with the bare token
 `claude` (no `--dangerously-load-development-channels`), renga injects the
-peer-enabled launch flags so the new Claude pane joins the renga-peers
-channel. An explicit `--dangerously-load-development-channels` is left alone.
-This is **frozen behavior**; no opt-out flag in v1.0. Callers that want
-verbatim execution should pick a different leading token (e.g. `bash -c
-'claude ...'`).
+peer-enabled launch flags so the new Claude pane joins the renga-peers channel
+and skips the per-launch permission prompt — currently
+`--dangerously-load-development-channels server:renga-peers --permission-mode
+bypassPermissions` (renga-234). Callers that want a different permission mode
+can append their own `--permission-mode <value>`; Claude CLI's later-flag-wins
+resolution lets it override the baseline without renga having to strip it. An
+explicit `--dangerously-load-development-channels` is left alone. This is
+**frozen behavior**; no opt-out flag in v1.0. Callers that want verbatim
+execution should pick a different leading token (e.g. `bash -c 'claude ...'`).
 
 Errors: `split_refused` (MAX_PANES = 16, or below `min_pane_width` /
 `min_pane_height`), `cwd_invalid`, `pane_not_found`, `name_in_use`,

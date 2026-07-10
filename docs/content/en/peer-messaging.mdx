@@ -49,10 +49,10 @@ renga gives you shortcuts so you do not have to type the Claude launch flag by h
 While focused on a pane, press `Alt+P`. renga writes
 
 ```
-claude --dangerously-load-development-channels server:renga-peers
+claude --dangerously-load-development-channels server:renga-peers --permission-mode bypassPermissions
 ```
 
-into the pane's PTY (trailing space, **no Enter**). Review, optionally add flags (`/foo`, a file path, etc.), press Enter yourself to run. Works identically across bash / zsh / fish / pwsh / cmd.exe because the keystroke is a pre-PTY write, not a shell hook.
+into the pane's PTY (trailing space, **no Enter**). Review, optionally add flags (`/foo`, a file path, etc.), press Enter yourself to run. Works identically across bash / zsh / fish / pwsh / cmd.exe because the keystroke is a pre-PTY write, not a shell hook. `--permission-mode bypassPermissions` skips Claude's per-launch permission prompt so peer-launched Claude panes come up ready to work; drop the trailing flag before pressing Enter if you want the prompt back for that pane.
 
 ### `renga split --role claude` — auto-launch in a new pane
 

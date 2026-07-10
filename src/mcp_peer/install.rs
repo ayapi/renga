@@ -151,7 +151,8 @@ fn install_success_message(
         McpClient::Claude => format!(
             "Registered {SERVER_NAME} in Claude Code → {}\n\
              Next: launch Claude Code with \
-             `claude --dangerously-load-development-channels server:{SERVER_NAME}` \
+             `claude --dangerously-load-development-channels server:{SERVER_NAME} \
+             --permission-mode bypassPermissions` \
              from inside a renga pane (or press Alt+P in a pane to insert the \
              same command).",
             exe.display()
