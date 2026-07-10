@@ -1002,6 +1002,50 @@ fn refocusing_unfocused_codex_with_existing_draft_shows_pending_overlay() {
 }
 
 #[test]
+fn focused_codex_pending_queue_auto_submits_after_draft_clears_to_unknown_placeholder() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.handle_focus(&ipc::PaneRef::Id(codex_id))
+        .expect("focus codex");
+    seed_codex_draft(&mut app, codex_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "draft ping".to_string(),
+    )
+    .expect("peer send");
+    assert!(app.visible_codex_peer_notification().is_some());
+
+    app.requeue_codex_peer_notification();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Write tests for @filename\n\nenter to send\x1b[1;3H",
+    );
+    app.flush_pending_codex_peer_messages();
+
+    assert!(app.visible_codex_peer_notification().is_none());
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt(_))
+    ));
+    app.shutdown();
+}
+#[test]
 fn focused_codex_pending_overlay_requeues_when_typing_then_auto_submits_after_draft_clears() {
     let mut app = App::new(40, 80).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
@@ -1124,6 +1168,16 @@ fn dim_codex_placeholder_is_not_a_draft() {
     );
 }
 
+#[test]
+fn unknown_codex_placeholder_at_prompt_is_not_a_draft_without_dim() {
+    let mut parser = vt100::Parser::new(40, 80, 0);
+    parser.process(b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Write tests for @filename\x1b[1;3H");
+
+    assert_eq!(
+        codex_composer_has_draft_on_screen(parser.screen()),
+        Some(false)
+    );
+}
 #[test]
 fn colored_codex_placeholder_is_not_a_draft_when_cursor_is_at_prompt() {
     let mut parser = vt100::Parser::new(40, 80, 0);
