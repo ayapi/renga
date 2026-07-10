@@ -46,7 +46,7 @@ impl App {
                     .accept_codex_peer_notification()
                     .map_err(|e| anyhow::anyhow!(e.to_string()));
             }
-            self.dismiss_codex_peer_notification();
+            self.requeue_codex_peer_notification();
         }
 
         // Rename mode — swallow all input until Enter/Esc.

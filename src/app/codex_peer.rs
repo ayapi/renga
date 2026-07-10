@@ -499,6 +499,14 @@ impl App {
         }
     }
 
+    pub(crate) fn requeue_codex_peer_notification(&mut self) {
+        let Some(notification) = self.codex_peer_notification.take() else {
+            return;
+        };
+        self.push_pending_codex_peer_nudge(notification.target_pane, notification.message);
+        self.dirty = true;
+    }
+
     fn materialize_unfocused_codex_peer_notification(&mut self) {
         let Some(notification) = self.codex_peer_notification.clone() else {
             return;
