@@ -962,6 +962,98 @@ fn unfocused_codex_with_draft_stays_silent_and_queued() {
 }
 
 #[test]
+fn refocusing_unfocused_codex_with_existing_draft_shows_pending_overlay() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let pane_a = app.ws().focused_pane_id;
+    let pane_b = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds.insert(pane_a, PeerClientKind::Codex);
+    seed_codex_draft(&mut app, pane_a);
+    assert_eq!(app.ws().focused_pane_id, pane_b);
+
+    app.handle_peer_send(pane_b, &ipc::PaneRef::Id(pane_a), "draft ping".to_string())
+        .expect("peer send");
+    assert!(app.visible_codex_peer_notification().is_none());
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&pane_a)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::Draft(_))
+    ));
+
+    app.handle_focus(&ipc::PaneRef::Id(pane_a))
+        .expect("refocus draft pane");
+
+    let notification = app
+        .visible_codex_peer_notification()
+        .expect("pending nudge should become a focused overlay");
+    assert_eq!(notification.target_pane, pane_a);
+    assert_eq!(notification.pending_count, 1);
+    assert!(!app.pending_codex_peer_messages.contains_key(&pane_a));
+    app.shutdown();
+}
+
+#[test]
+fn focused_codex_pending_overlay_requeues_when_typing_then_auto_submits_after_draft_clears() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.handle_focus(&ipc::PaneRef::Id(codex_id))
+        .expect("focus codex");
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA x\x1b[1;5H",
+    );
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "draft ping".to_string(),
+    )
+    .expect("peer send");
+    assert!(app.visible_codex_peer_notification().is_some());
+
+    let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+    let consumed = app.handle_key_event(backspace).expect("route backspace");
+    assert!(!consumed);
+    assert!(app.visible_codex_peer_notification().is_none());
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::Draft(_))
+    ));
+
+    seed_codex_ready_placeholder(&mut app, codex_id);
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt(_))
+    ));
+    app.shutdown();
+}
+#[test]
 fn focus_transition_routes_pending_codex_by_draft_state() {
     let mut app = App::new(40, 160).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
