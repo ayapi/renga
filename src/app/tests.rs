@@ -1,4 +1,5 @@
 mod codex_peer;
+mod dirty_gating;
 mod ipc_state;
 mod layout_tree;
 mod overlay;
