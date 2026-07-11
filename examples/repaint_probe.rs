@@ -1,18 +1,22 @@
 //! Repaint-cost probe for renga-pgd: measures how much CPU a renga
-//! instance burns while a pane spams output (a) on the active tab and
-//! (b) on a background tab after `Alt+T`.
+//! instance burns while a pane emits spinner-shaped output (a) on the
+//! active tab and (b) on a background tab after `renga new-tab`.
 //!
-//! With the tab-visibility dirty gate, phase B should cost close to
-//! nothing; without it (e.g. the released 1.3.2 binary) phase B stays
-//! as expensive as phase A because every PtyOutput repaints the frame.
+//! With the tab-visibility dirty gate, phase B triggers no draw at
+//! all. Without it (e.g. the released 1.3.2 binary) every background
+//! chunk still runs a full `terminal.draw`; measured in release mode
+//! that ungated draw turned out cheap (the ratatui diff of an
+//! unchanged frame emits nothing), so treat the gate as a correctness
+//! cleanup — this probe exists to keep that trade-off measurable.
 //!
 //! Usage (Windows):
 //! ```text
-//! cargo run --example repaint_probe -- target\debug\renga.exe
+//! cargo run --release --example repaint_probe -- target\release\renga.exe
 //! ```
 //! Prints per-phase CPU percentages for the renga process itself.
+//! Compare debug-vs-debug or release-vs-release only.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
