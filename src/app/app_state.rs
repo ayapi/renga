@@ -111,8 +111,10 @@ pub enum AppCommand {
 
 /// Events dispatched within the app.
 pub enum AppEvent {
-    /// PTY output received for a pane.
-    PtyOutput(#[allow(dead_code)] usize),
+    /// PTY output received for a pane. The pane id gates repainting:
+    /// only output for a pane on the active tab dirties the frame
+    /// (see `drain_pty_events`).
+    PtyOutput(usize),
     /// A pane emitted OSC 52 with clipboard text.
     ClipboardCopy(String),
     /// PTY process exited for a pane.

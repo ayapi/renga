@@ -10,6 +10,14 @@ impl App {
         // overlay, but state-changing events still need to repaint
         // because they affect non-pane UI (tab labels, sidebar cwd).
         let mut had_state_change = false;
+        // Raw output only dirties the frame when its pane is actually
+        // on screen (active tab). Background-tab spinners used to force
+        // full-fps repaints of a screen they don't appear on — with
+        // several renga instances each running Claude panes that was a
+        // measurable constant CPU cost (renga-pgd). Hidden panes lose
+        // nothing: their vt100 parsers advance on the reader threads,
+        // and a tab switch always repaints via mark_layout_change.
+        let mut had_visible_output = false;
         while let Ok(event) = self.event_rx.try_recv() {
             had_events = true;
             match event {
@@ -71,13 +79,25 @@ impl App {
                         }
                     }
                 }
-                AppEvent::PtyOutput(_) => {}
+                AppEvent::PtyOutput(pane_id) => {
+                    if self
+                        .workspaces
+                        .get(self.active_tab)
+                        .is_some_and(|ws| ws.panes.contains_key(&pane_id))
+                    {
+                        had_visible_output = true;
+                    }
+                }
                 AppEvent::ClipboardCopy(text) => {
+                    // Repaint-neutral, but kept dirty-triggering (as it
+                    // always was) so any future copy-feedback UI can't
+                    // silently miss its frame.
+                    had_state_change = true;
                     self.copy_to_clipboard(&text);
                 }
             }
         }
-        if had_events {
+        if had_state_change || had_visible_output {
             let freeze_output = self.ime_freeze_panes_on_overlay && self.overlay.is_some();
             if had_state_change || !freeze_output {
                 self.dirty = true;
