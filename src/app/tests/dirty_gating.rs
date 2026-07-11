@@ -10,12 +10,21 @@ use crate::app::{App, AppEvent};
 
 /// Drain until the freshly spawned shells stop emitting startup
 /// output, so live PtyOutput can't race the synthetic events these
-/// tests inject. Caps at ~3s; the shells prompt well within that.
+/// tests inject. Requires several consecutive quiet windows — a
+/// single one can fall inside a >50ms pause mid shell startup (cold
+/// CI machine, profile scripts) and let a late prompt chunk land
+/// after the test cleared `dirty`. Caps at ~6s.
 fn quiesce(app: &mut App) {
-    for _ in 0..60 {
+    let mut quiet_windows = 0;
+    for _ in 0..120 {
         std::thread::sleep(std::time::Duration::from_millis(50));
-        if !app.drain_pty_events() {
-            return;
+        if app.drain_pty_events() {
+            quiet_windows = 0;
+        } else {
+            quiet_windows += 1;
+            if quiet_windows >= 5 {
+                return;
+            }
         }
     }
 }

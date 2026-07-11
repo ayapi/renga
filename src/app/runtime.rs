@@ -89,10 +89,11 @@ impl App {
                     }
                 }
                 AppEvent::ClipboardCopy(text) => {
-                    // Repaint-neutral, but kept dirty-triggering (as it
-                    // always was) so any future copy-feedback UI can't
-                    // silently miss its frame.
-                    had_state_change = true;
+                    // Repaint-neutral today, but keep the legacy dirty
+                    // semantics exactly: repaint unless the IME freeze
+                    // gate is holding the frame (it is NOT a state
+                    // change that punches through the freeze).
+                    had_visible_output = true;
                     self.copy_to_clipboard(&text);
                 }
             }
