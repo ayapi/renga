@@ -29,7 +29,9 @@
 //! - `RENGA_DEBUG_HOST_OSC_COLOR_LOG=path` — write the query outcome.
 //! - `RENGA_DEBUG_CONPTY_COLOR_LOG=path` — append sidecar seed diagnostics.
 
-use portable_pty::{CommandBuilder, SlavePty};
+#[cfg(windows)]
+use portable_pty::CommandBuilder;
+use portable_pty::SlavePty;
 
 /// argv[1] sentinel selecting the sidecar seeding mode. Dispatched at the top
 /// of `main()` before clap parsing; not part of the public CLI surface.
@@ -286,6 +288,9 @@ mod win {
 
     pub const STD_INPUT_HANDLE: u32 = -10i32 as u32;
     pub const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    pub const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+    pub const ENABLE_LINE_INPUT: u32 = 0x0002;
+    pub const ENABLE_ECHO_INPUT: u32 = 0x0004;
     pub const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
     pub const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
     pub const WAIT_OBJECT_0: u32 = 0x00000000;
@@ -423,7 +428,14 @@ fn query_host_osc_colors() -> Option<(String, String)> {
     let old_input_mode = unsafe { get_mode(input)? };
     let old_output_mode = unsafe { get_mode(output)? };
 
-    let _ = unsafe { SetConsoleMode(input, old_input_mode | ENABLE_VIRTUAL_TERMINAL_INPUT) };
+    // Read the reply in raw mode: with ENABLE_LINE_INPUT set, a console
+    // ReadFile blocks until CR, and an OSC reply contains none — cooked mode
+    // could stall startup until the user presses Enter (and ECHO_INPUT would
+    // print the reply). Same flag handling as crossterm's enable_raw_mode.
+    let raw_input_mode = (old_input_mode
+        & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+        | ENABLE_VIRTUAL_TERMINAL_INPUT;
+    let _ = unsafe { SetConsoleMode(input, raw_input_mode) };
     let _ = unsafe { SetConsoleMode(output, old_output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) };
 
     let query = b"\x1b]10;?\x07\x1b]11;?\x07";
