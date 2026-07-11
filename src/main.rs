@@ -2,6 +2,7 @@ mod app;
 mod claude_monitor;
 mod cli;
 mod config;
+mod conpty_colors;
 mod filetree;
 mod i18n;
 mod input;
@@ -29,6 +30,11 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 fn main() -> Result<()> {
+    // Internal sidecar mode (`renga __conpty-color-seed <bg> <fg>`): spawned
+    // into each pane's ConPTY to seed the console screen buffer colors.
+    // Exits the process when requested; must run before clap parsing.
+    conpty_colors::run_seed_mode_if_requested();
+
     // Parse CLI args. clap handles --help / --version and exits cleanly
     // before we enter raw mode below.
     let cli = cli::Cli::parse();
@@ -82,6 +88,11 @@ fn main() -> Result<()> {
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         default_hook(info);
     }));
+
+    // Capture the host terminal's OSC 10/11 default colors BEFORE raw mode
+    // and the alternate screen, while replies still arrive on our stdin.
+    // Pane spawns use them to seed each ConPTY's console color defaults.
+    conpty_colors::capture_host_default_colors();
 
     // Query terminal for graphics protocol support BEFORE raw mode.
     // Falls back to halfblocks if detection fails.

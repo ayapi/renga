@@ -150,6 +150,12 @@ impl Pane {
             .spawn_command(cmd)
             .context("Failed to spawn shell")?;
 
+        // Windows: seed this ConPTY's console color defaults with the host
+        // terminal's colors so color-probing TUIs (Codex) don't fall back to
+        // the dark Campbell palette. Spawned after the shell so the session
+        // always has a long-lived client. See src/conpty_colors.rs.
+        crate::conpty_colors::spawn_seed_sidecar(pair.slave.as_ref());
+
         // Drop the slave side — we only use master
         drop(pair.slave);
 
