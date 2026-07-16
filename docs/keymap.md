@@ -21,7 +21,25 @@ Full keybinding reference. The README only carries a "first 5–8 keys" cheat sh
 | `Ctrl+P` | Swap preview/terminal layout |
 | `Ctrl+Right/Left` | Cycle focus (sidebar, preview, panes) |
 | `Ctrl+;` / `Alt+;` / `Alt+I` | Open IME composition overlay (centered multi-line — see [`ime.md`](./ime.md)). `Alt+;` and `Alt+I` are fallbacks for terminals that swallow `Ctrl+;` (WSL under Windows Terminal, VS Code terminal on Linux, some tmux configs). |
+| `Alt+M` / `Ctrl+Shift+M` | Enter keyboard copy mode on the focused pane (see [Copy mode](#copy-mode-after-altm)) |
 | `Ctrl+Q` | Quit |
+
+## Copy mode (after `Alt+M`)
+
+Keyboard-only text selection and copy, modeled on Windows Terminal's mark mode. A `COPY` hint appears on the pane's bottom border and a block cursor appears at the pane's caret. While the mode is active no key (or paste) reaches the PTY.
+
+> `Ctrl+Shift+M` matches Windows Terminal's own mark-mode binding, but most host terminals (including Windows Terminal itself) intercept it before renga sees it — `Alt+M` is the binding that always works.
+
+| Key | Action |
+|-----|--------|
+| `←` `↑` `↓` `→` | Move the cursor. `↑` at the top edge scrolls into history. |
+| `Home` / `End` | Jump to the first / last column |
+| `PageUp` / `PageDown` | Scroll the view a page through history |
+| `Shift` + any movement above | Extend the selection (anchored at the cursor before the first shifted move) |
+| Movement without `Shift` | Collapse the selection |
+| `Enter` / `Ctrl+C` | Copy the selection to the clipboard and exit |
+| `Esc` | Exit without copying |
+| Any mouse click / wheel | Cancels the mode (mouse selection takes over) |
 
 ## macOS: Option as Meta
 
