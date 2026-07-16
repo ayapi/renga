@@ -389,6 +389,13 @@ impl App {
             self.dirty = true;
             return Ok(true);
         }
+        // Copy mode swallows pastes: no input may reach the PTY while
+        // the mode is active, and `forward_paste_to_pty`'s
+        // `scroll_reset` would yank a scrolled-back view to the live
+        // screen underneath the screen-relative selection.
+        if self.copy_mode.is_some() {
+            return Ok(true);
+        }
         self.forward_paste_to_pty(text)?;
         Ok(false)
     }
@@ -447,6 +454,12 @@ impl App {
             let Some(pane) = self.ws().panes.get(&pane_id) else {
                 return;
             };
+            // Exited panes stay in the pane map but skip content
+            // rendering, so the mode's cursor and selection would be
+            // invisible — refuse to enter.
+            if pane.exited {
+                return;
+            }
             let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
             parser.screen().cursor_position()
         };
@@ -497,9 +510,16 @@ impl App {
         let Some(mut cm) = self.copy_mode.clone() else {
             return Ok(false);
         };
-        // Pane closed, tab switched away, or layout degenerated under
-        // us — bail out rather than operate on a stale target.
-        if !self.ws().panes.contains_key(&cm.pane_id) {
+        // Pane closed / exited, tab switched away, or layout
+        // degenerated under us — bail out rather than operate on a
+        // stale target (exited panes skip content rendering, which
+        // would leave the cursor and selection invisible).
+        if self
+            .ws()
+            .panes
+            .get(&cm.pane_id)
+            .is_none_or(|pane| pane.exited)
+        {
             self.exit_copy_mode();
             return Ok(true);
         }
