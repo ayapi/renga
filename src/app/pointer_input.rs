@@ -298,6 +298,10 @@ impl App {
                 let col = mouse.column;
                 let row = mouse.row;
                 self.selection = None;
+                // A click starts a fresh mouse interaction; keeping a
+                // keyboard copy-mode session alive alongside it would
+                // leave two owners fighting over `selection`.
+                self.exit_copy_mode();
 
                 for &(tab_idx, rect) in &self.last_tab_rects {
                     if col >= rect.x

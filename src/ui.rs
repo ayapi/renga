@@ -736,6 +736,7 @@ fn render_panes(app: &mut App, frame: &mut Frame, area: Rect) -> Option<(u16, u1
     let focused_id = app.ws().focused_pane_id;
     let focus_target = app.ws().focus_target;
     let selection = app.selection.clone();
+    let copy_mode = app.copy_mode.clone();
     let mut caret: Option<(u16, u16)> = None;
     for (pane_id, rect) in rects {
         if let Some(pane) = app.ws().panes.get(&pane_id) {
@@ -743,9 +744,17 @@ fn render_panes(app: &mut App, frame: &mut Frame, area: Rect) -> Option<(u16, u1
             let pane_sel = selection.as_ref().filter(
                 |s| matches!(s.target, crate::app::SelectionTarget::Pane(id) if id == pane_id),
             );
+            let pane_copy_mode = copy_mode.as_ref().filter(|cm| cm.pane_id == pane_id);
             let claude_state = app.claude_monitor.state(pane_id);
-            let pane_caret =
-                render_single_pane(pane, is_focused, pane_sel, &claude_state, frame, rect);
+            let pane_caret = render_single_pane(
+                pane,
+                is_focused,
+                pane_sel,
+                pane_copy_mode,
+                &claude_state,
+                frame,
+                rect,
+            );
             if is_focused {
                 caret = pane_caret;
             }
@@ -807,6 +816,7 @@ fn render_single_pane(
     pane: &crate::pane::Pane,
     is_focused: bool,
     selection: Option<&crate::app::TextSelection>,
+    copy_mode: Option<&crate::app::CopyModeState>,
     claude_state: &crate::claude_monitor::ClaudeState,
     frame: &mut Frame,
     area: Rect,
@@ -885,8 +895,16 @@ fn render_single_pane(
         Style::default().fg(TEXT_DIM)
     };
 
-    // Bottom title: scroll indicator OR claude stats
-    let bottom_title = if is_scrolled {
+    // Bottom title: copy-mode indicator OR scroll indicator OR claude stats
+    let bottom_title = if copy_mode.is_some() {
+        Line::from(Span::styled(
+            " COPY \u{2190}\u{2191}\u{2193}\u{2192}:move Shift:select Enter:copy Esc:exit ",
+            Style::default()
+                .fg(ACCENT_GREEN)
+                .bg(SCROLL_BG)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else if is_scrolled {
         Line::from(Span::styled(
             " \u{2191} SCROLL ",
             Style::default()
@@ -951,7 +969,8 @@ fn render_single_pane(
         frame.render_widget(msg, inner);
         None
     } else {
-        render_terminal_content(pane, is_focused, selection, frame, inner)
+        let copy_cursor = copy_mode.map(|cm| (cm.cursor_row as u16, cm.cursor_col as u16));
+        render_terminal_content(pane, is_focused, selection, copy_cursor, frame, inner)
     }
 }
 
@@ -965,6 +984,7 @@ fn render_terminal_content(
     pane: &crate::pane::Pane,
     is_focused: bool,
     selection: Option<&crate::app::TextSelection>,
+    copy_cursor: Option<(u16, u16)>,
     frame: &mut Frame,
     area: Rect,
 ) -> Option<(u16, u16)> {
@@ -1010,7 +1030,13 @@ fn render_terminal_content(
                     let (sr, sc, er, ec) = s.normalized();
                     (sr != er || sc != ec) && s.contains(row as u32, col as u32)
                 });
-                let final_style = if has_selection {
+                // Copy-mode cursor cell: distinguishable from the
+                // plain REVERSED selection in any color theme.
+                let is_copy_cursor = copy_cursor == Some((row as u16, col as u16));
+                let final_style = if is_copy_cursor {
+                    Style::default()
+                        .add_modifier(Modifier::REVERSED | Modifier::BOLD | Modifier::UNDERLINED)
+                } else if has_selection {
                     Style::default().add_modifier(Modifier::REVERSED)
                 } else {
                     style
@@ -1045,7 +1071,10 @@ fn render_terminal_content(
         screen.hide_cursor(),
     );
     let mut caret: Option<(u16, u16)> = None;
-    let show_cursor = is_focused && (!screen.hide_cursor() || claude_pane);
+    // While copy mode is active the block cursor drawn above is the
+    // caret; parking the hardware caret at the vt100 cursor as well
+    // would show two competing cursors.
+    let show_cursor = is_focused && copy_cursor.is_none() && (!screen.hide_cursor() || claude_pane);
     if show_cursor {
         let cursor = screen.cursor_position();
         // Legacy Claude paints its visible caret as an inverse-video

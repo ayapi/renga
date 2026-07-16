@@ -41,7 +41,7 @@ use self::pointer_input::{
     detect_outer_edge, detect_shared_boundary, mouse_forward_disabled, pane_local_coords,
     pane_local_coords_clamped, split_intent_for_edge, EdgeSide,
 };
-pub use self::selection::{SelectionTarget, TextSelection};
+pub use self::selection::{CopyModeScroll, CopyModeState, SelectionTarget, TextSelection};
 #[cfg(test)]
 use self::workspace_state::resolve_pane_ref_impl;
 pub use self::workspace_state::{DragTarget, FocusTarget, Workspace};

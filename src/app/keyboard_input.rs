@@ -54,6 +54,12 @@ impl App {
             return Ok(self.handle_rename_key(key));
         }
 
+        // Keyboard copy mode — while active, every key is handled (or
+        // swallowed) here so nothing leaks to the PTY.
+        if self.copy_mode.is_some() {
+            return self.handle_copy_mode_key(key);
+        }
+
         // Open the IME composition overlay. Primary hotkey is
         // `Ctrl+;`, with `Alt+;` and `Alt+I` as fallbacks for
         // terminals that refuse to pass `Ctrl+;` through to
@@ -166,6 +172,22 @@ impl App {
             if !self.status_bar_visible {
                 self.mark_layout_change();
             }
+            return Ok(true);
+        }
+
+        // Alt+M / Ctrl+Shift+M — enter keyboard copy mode (WT
+        // mark-mode style). Ctrl+Shift+M matches Windows Terminal's
+        // own markMode default, but many hosts (including WT itself,
+        // which binds it to its native mark mode) intercept it before
+        // it reaches renga — and legacy terminals encode it as a bare
+        // CR. Alt+M arrives as an ESC-prefixed sequence every tier-1
+        // terminal forwards reliably, so it is the binding that
+        // always works.
+        if matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M'))
+            && (key.modifiers == KeyModifiers::ALT
+                || key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        {
+            self.enter_copy_mode();
             return Ok(true);
         }
 
@@ -404,6 +426,169 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    // ─── Keyboard copy mode ───────────────────────────────
+
+    /// Enter keyboard copy mode on the focused pane. No-op when focus
+    /// isn't on a terminal pane, the pane has exited, or its rect
+    /// hasn't been rendered yet (first frame).
+    pub(crate) fn enter_copy_mode(&mut self) {
+        if self.ws().focus_target != FocusTarget::Pane {
+            return;
+        }
+        let pane_id = self.ws().focused_pane_id;
+        let Some(inner) = self.pane_content_rect(pane_id) else {
+            return;
+        };
+        // Start at the pane's live cursor cell (like WT mark mode),
+        // clamped into the content area.
+        let (crow, ccol) = {
+            let Some(pane) = self.ws().panes.get(&pane_id) else {
+                return;
+            };
+            let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+            parser.screen().cursor_position()
+        };
+        self.copy_mode = Some(CopyModeState {
+            pane_id,
+            cursor_row: (crow as u32).min(inner.height.saturating_sub(1) as u32),
+            cursor_col: (ccol as u32).min(inner.width.saturating_sub(1) as u32),
+            anchor: None,
+        });
+        self.selection = None;
+        self.dirty = true;
+    }
+
+    /// Leave copy mode, dropping any in-progress selection.
+    pub(crate) fn exit_copy_mode(&mut self) {
+        if self.copy_mode.take().is_some() {
+            self.selection = None;
+            self.dirty = true;
+        }
+    }
+
+    /// Content rect (inside the border) of a pane from the last
+    /// rendered layout, or `None` when unknown or too small to hold
+    /// content.
+    fn pane_content_rect(&self, pane_id: usize) -> Option<Rect> {
+        let (_, rect) = self
+            .ws()
+            .last_pane_rects
+            .iter()
+            .copied()
+            .find(|&(id, _)| id == pane_id)?;
+        if rect.width < 3 || rect.height < 3 {
+            return None;
+        }
+        Some(Rect::new(
+            rect.x + 1,
+            rect.y + 1,
+            rect.width - 2,
+            rect.height - 2,
+        ))
+    }
+
+    /// Modal key handler while copy mode is active. Every key is
+    /// consumed: movement keys move the cursor / extend the selection,
+    /// Enter / Ctrl+C copy and exit, Esc exits, anything else is
+    /// swallowed so stray input can't reach the PTY.
+    fn handle_copy_mode_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(mut cm) = self.copy_mode.clone() else {
+            return Ok(false);
+        };
+        // Pane closed, tab switched away, or layout degenerated under
+        // us — bail out rather than operate on a stale target.
+        if !self.ws().panes.contains_key(&cm.pane_id) {
+            self.exit_copy_mode();
+            return Ok(true);
+        }
+        let Some(inner) = self.pane_content_rect(cm.pane_id) else {
+            self.exit_copy_mode();
+            return Ok(true);
+        };
+
+        if key.code == KeyCode::Esc {
+            self.exit_copy_mode();
+            return Ok(true);
+        }
+
+        let is_copy_key = key.code == KeyCode::Enter
+            || (key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')));
+        if is_copy_key {
+            if let Some(sel) = self.selection.clone() {
+                let (sr, sc, er, ec) = sel.normalized();
+                if sr != er || sc != ec {
+                    let text = self
+                        .ws()
+                        .panes
+                        .get(&cm.pane_id)
+                        .map(|p| extract_selected_text(p, sr, sc, er, ec))
+                        .unwrap_or_default();
+                    if !text.is_empty() {
+                        self.copy_to_clipboard(&text);
+                    }
+                }
+            }
+            self.exit_copy_mode();
+            return Ok(true);
+        }
+
+        if matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        ) {
+            let max_row = inner.height.saturating_sub(1) as u32;
+            let max_col = inner.width.saturating_sub(1) as u32;
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            let scroll = cm.apply_move(key.code, shift, max_row, max_col, inner.height as usize);
+
+            // Apply the requested view scroll and measure how far the
+            // view actually moved (vt100 clamps at the ends of
+            // scrollback) so the anchor can track its content.
+            match scroll {
+                CopyModeScroll::Up(n) => {
+                    if let Some(pane) = self.ws().panes.get(&cm.pane_id) {
+                        let before = pane.scrollbar_info().0;
+                        pane.scroll_up(n);
+                        let moved = pane.scrollbar_info().0.saturating_sub(before);
+                        cm.shift_anchor_for_scroll(moved, true, max_row);
+                    }
+                }
+                CopyModeScroll::Down(n) => {
+                    if let Some(pane) = self.ws().panes.get(&cm.pane_id) {
+                        let before = pane.scrollbar_info().0;
+                        pane.scroll_down(n);
+                        let moved = before.saturating_sub(pane.scrollbar_info().0);
+                        cm.shift_anchor_for_scroll(moved, false, max_row);
+                    }
+                }
+                CopyModeScroll::None => {}
+            }
+
+            self.selection = cm.anchor.map(|(ar, ac)| TextSelection {
+                target: SelectionTarget::Pane(cm.pane_id),
+                start_row: ar,
+                start_col: ac,
+                end_row: cm.cursor_row,
+                end_col: cm.cursor_col,
+                content_rect: inner,
+            });
+            self.copy_mode = Some(cm);
+            self.dirty = true;
+            return Ok(true);
+        }
+
+        // Swallow everything else — copy mode must not leak keys.
+        Ok(true)
     }
 }
 

@@ -230,6 +230,10 @@ pub struct App {
     pub(crate) last_boundary_click: Option<(usize, u16, u16, Instant)>,
     // Text selection
     pub selection: Option<TextSelection>,
+    /// Keyboard copy mode (WT mark-mode style, Alt+M / Ctrl+Shift+M).
+    /// While `Some`, `handle_key_event` routes every key into
+    /// `handle_copy_mode_key` and nothing reaches the PTY.
+    pub copy_mode: Option<CopyModeState>,
     // Version check (background)
     pub version_info: crate::version_check::VersionInfo,
     // Claude Code JSONL monitoring
