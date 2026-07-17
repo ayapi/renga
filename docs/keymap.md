@@ -6,7 +6,7 @@ Full keybinding reference. The README only carries a "first 5–8 keys" cheat sh
 
 ## Pane mode (default)
 
-Every global renga chord lives in the `Alt` namespace. Bare `Ctrl+<key>` combinations (`Ctrl+D`, `Ctrl+W`, `Ctrl+Q`, …) are deliberately **not** bound — they pass through to the program running inside the pane (shell readline, vim, fzf, …) untouched. The only exceptions are `Ctrl+C` (renga-side copy, but only while a text selection exists) and `Ctrl+;` (IME overlay).
+Every global renga chord lives in the `Alt` namespace. Bare `Ctrl+<key>` combinations (`Ctrl+D`, `Ctrl+W`, `Ctrl+Q`, …) are deliberately **not** bound — they pass through to the program running inside the pane (shell readline, vim, fzf, …) untouched. The only exceptions are `Ctrl+C` (renga-side copy, but only while a text selection exists), `Ctrl+;` (IME overlay), and the `Ctrl+Shift+M` copy-mode alias.
 
 | Key | Action |
 |-----|--------|
