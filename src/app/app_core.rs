@@ -63,6 +63,7 @@ impl App {
             last_edge_click: None,
             last_boundary_click: None,
             selection: None,
+            copy_mode: None,
             version_info: {
                 let info = crate::version_check::VersionInfo::new();
                 crate::version_check::spawn_check(info.clone());

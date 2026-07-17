@@ -298,6 +298,10 @@ impl App {
                 let col = mouse.column;
                 let row = mouse.row;
                 self.selection = None;
+                // A click starts a fresh mouse interaction; keeping a
+                // keyboard copy-mode session alive alongside it would
+                // leave two owners fighting over `selection`.
+                self.exit_copy_mode();
 
                 for &(tab_idx, rect) in &self.last_tab_rects {
                     if col >= rect.x
@@ -547,6 +551,7 @@ impl App {
             MouseEventKind::Down(btn @ (MouseButton::Middle | MouseButton::Right)) => {
                 let col = mouse.column;
                 let row = mouse.row;
+                self.exit_copy_mode();
                 if mouse.modifiers.contains(KeyModifiers::SHIFT) || mouse_forward_disabled() {
                     return;
                 }
@@ -751,8 +756,19 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::ScrollUp => self.handle_wheel(mouse.column, mouse.row, false),
-            MouseEventKind::ScrollDown => self.handle_wheel(mouse.column, mouse.row, true),
+            MouseEventKind::ScrollUp => {
+                // Wheel scrolling moves the view without the anchor
+                // tracking that keyboard scrolling performs, which
+                // would leave the screen-relative selection glued to
+                // different text — treat it like a click and drop the
+                // mode (WT mark mode also cancels on mouse input).
+                self.exit_copy_mode();
+                self.handle_wheel(mouse.column, mouse.row, false)
+            }
+            MouseEventKind::ScrollDown => {
+                self.exit_copy_mode();
+                self.handle_wheel(mouse.column, mouse.row, true)
+            }
             MouseEventKind::ScrollLeft => {
                 let col = mouse.column;
                 let row = mouse.row;
