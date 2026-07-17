@@ -136,15 +136,17 @@ The first keys to learn. Full tables (Pane / File tree / Preview / Mouse) and th
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+D` / `Ctrl+E` | Split vertically / horizontally |
+| `Alt+D` / `Alt+E` | Split vertically / horizontally |
 | Double-click pane outer edge | Split toward the clicked side (top/left spawns the new pane on the clicked side, bottom/right behind it) |
 | Double-click shared border | Split the adjacent pane, dropping the new pane on the border between the two siblings (drag still resizes) |
-| `Ctrl+Right` / `Ctrl+Left` | Cycle focus (panes, sidebar, preview) |
+| `Alt+Up` / `Alt+Down` | Cycle focus (panes, sidebar, preview) |
 | `Alt+T` / `Alt+1..9` | New tab / jump to tab N |
 | `Alt+P` | Insert peer-enabled `claude …` launch into the focused pane |
-| `Ctrl+F` | Toggle file tree sidebar |
+| `Alt+F` | Toggle file tree sidebar |
 | `Ctrl+;` | Open IME composition overlay (`Alt+;` / `Alt+I` as fallbacks) |
-| `Ctrl+Q` | Quit |
+| `Alt+Q` | Quit |
+
+renga's global chords all live on `Alt` so that bare `Ctrl` keys (`Ctrl+D`, `Ctrl+W`, `Ctrl+Q`, …) pass through to whatever runs inside the pane.
 
 ## Documentation
 

@@ -4,27 +4,29 @@
 
 renga のフルキーバインド一覧です。README には「最初に覚える 5〜8 個のチートシート」だけを残し、それ以外はすべてこのページにあります。
 
-> **macOS ユーザーへ:** macOS のターミナルは既定で `Option+<キー>` を Unicode 入力 (`å` `∫` など) に割り当てているため、そのままだと `Alt+T` / `Alt+P` / `Alt+1..9` / `Alt+Left/Right` が renga まで届きません。1 行の設定で解決できます → [macOS: Option をメタキーにする](#macos-option-をメタキーにする) (WezTerm / iTerm2 / Alacritty / Ghostty / Kitty / Terminal.app 別に記載)。
+> **macOS ユーザーへ:** macOS のターミナルは既定で `Option+<キー>` を Unicode 入力 (`å` `∫` など) に割り当てているため、そのままだと `Alt+<キー>` のショートカット — つまりグローバルキーマップのほぼ全部 — が renga まで届きません。1 行の設定で解決できます → [macOS: Option をメタキーにする](#macos-option-をメタキーにする) (WezTerm / iTerm2 / Alacritty / Ghostty / Kitty / Terminal.app 別に記載)。
 
 ## ペインモード (通常状態)
 
+renga のグローバルキーはすべて `Alt` 名前空間にあります。素の `Ctrl+<キー>` (`Ctrl+D` `Ctrl+W` `Ctrl+Q` など) は意図的に **バインドしていません** — ペイン内で動くプログラム (シェルの readline、vim、fzf など) にそのまま届きます。例外は `Ctrl+C` (テキスト選択中のみ renga 側でコピー) と `Ctrl+;` (IME overlay) の 2 つだけです。
+
 | キー | 動作 |
 |-----|--------|
-| `Ctrl+D` | 縦分割 |
-| `Ctrl+E` | 横分割 |
-| `Ctrl+W` | ペインを閉じる (最後の 1 つならタブごと閉じる) |
-| `Alt+T` / `Ctrl+T` | 新しいタブ |
+| `Alt+D` | 縦分割 |
+| `Alt+E` | 横分割 |
+| `Alt+W` | ペインを閉じる (最後の 1 つならタブごと閉じる) |
+| `Alt+T` | 新しいタブ |
 | `Alt+1..9` | 指定番号のタブに移動 |
 | `Alt+Left/Right` | 前 / 次のタブ |
 | `Alt+R` | タブ名を変更 (セッション内のみ) |
 | `Alt+S` | ステータスバー表示切替 |
 | `Alt+P` | フォーカス中のペインにメッセージング対応の Claude Code 起動コマンドを入力 ([`peer-messaging.ja.md`](./peer-messaging.ja.md) 参照)。フォーカス中のペインが alt-screen モード (vim / less / lazygit / 起動中の Claude / Codex の TUI 等) かペインタイトルに "claude" を含む場合は仕様として silently no-op になります — 起動中の TUI にコマンドのバイト列がキーストロークとして注入されるのを防ぐためです。シェルプロンプトのペインにフォーカスを移してから再度押してください。 |
-| `Ctrl+F` | ファイルツリー表示切替 |
-| `Ctrl+P` | プレビューとターミナルの位置を入れ替え |
-| `Ctrl+Right/Left` | サイドバー / プレビュー / ペイン間のフォーカス移動 |
+| `Alt+F` | ファイルツリー表示切替 |
+| `Alt+O` | プレビューとターミナルの位置を入れ替え |
+| `Alt+Up/Down` | サイドバー / プレビュー / ペイン間のフォーカス移動 |
 | `Ctrl+;` / `Alt+;` / `Alt+I` | IME 合成 overlay を開く (中央に複数行入力ボックス — [`ime.ja.md`](./ime.ja.md) 参照)。`Alt+;` / `Alt+I` は `Ctrl+;` を奪うターミナル (WSL + Windows Terminal、Linux 上の VS Code ターミナル、一部の tmux 設定など) のフォールバック。 |
 | `Alt+M` / `Ctrl+Shift+M` | フォーカス中のペインでキーボードコピーモードに入る ([コピーモード](#コピーモード-altm-押下後) 参照) |
-| `Ctrl+Q` | renga 終了 |
+| `Alt+Q` | renga 終了 |
 
 ## コピーモード (`Alt+M` 押下後)
 
@@ -45,7 +47,7 @@ Windows Terminal の mark mode を手本にした、キーボードだけでの�
 
 ## macOS: Option をメタキーにする
 
-macOS のターミナルは既定で `Option+<キー>` を Unicode 入力 (`å` `∫` `π` など) に割り当てているため、renga の `Alt+T` / `Alt+P` / `Alt+R` / `Alt+S` / `Alt+1..9` / `Alt+Left/Right` が発火しません。Option をメタキー扱いに切り替えれば解決します。どの端末も 1 行の設定変更で済みます。**素の Terminal.app はあまりおすすめしません** — IME 対応・ligature・画像プレビューのどれも下表のモダン端末の方が良いため、乗り換えが結局近道です。
+macOS のターミナルは既定で `Option+<キー>` を Unicode 入力 (`å` `∫` `π` など) に割り当てているため、renga の `Alt` 系ショートカット — 分割・タブ・終了を含むグローバルキーマップのほぼ全部 — が発火しません。Option をメタキー扱いに切り替えれば解決します。どの端末も 1 行の設定変更で済みます。**素の Terminal.app はあまりおすすめしません** — IME 対応・ligature・画像プレビューのどれも下表のモダン端末の方が良いため、乗り換えが結局近道です。
 
 | ターミナル | 設定 |
 |---|---|
@@ -61,7 +63,7 @@ macOS のターミナルは既定で `Option+<キー>` を Unicode 入力 (`å` 
 - 一部の macOS IME (ことえりの「英字」切替、日本語キー配列など) は Option を独自に使っているため、Meta 化と競合する場合があります。IME が壊れたら `OnlyLeft` / `OnlyRight` で片側だけ Meta にするのが妥協点です。
 - `Alt+1..9` は macOS の Mission Control / Spaces のショートカットと衝突することがあります。OS 側に奪われる場合はタブ巡回を `Alt+Left/Right` で代替してください。
 
-## ファイルツリーモード (`Ctrl+F` 押下後)
+## ファイルツリーモード (`Alt+F` 押下後)
 
 | キー | 動作 |
 |-----|--------|
@@ -80,7 +82,7 @@ macOS のターミナルは既定で `Option+<キー>` を Unicode 入力 (`å` 
 |-----|--------|
 | `j` / `k` | 縦スクロール |
 | `h` / `l` | 横スクロール |
-| `Ctrl+W` | プレビューを閉じる |
+| `Alt+W` | プレビューを閉じる |
 | `Esc` | ペインに戻る |
 
 ## マウス

@@ -697,7 +697,7 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
             {
-                // Don't leak renga chord keys (Ctrl+D, Alt+T …)
+                // Don't leak renga chord keys (Alt+D, Alt+T …)
                 // into the buffer, but also don't let them
                 // trigger renga's layout commands mid-composition
                 // — the overlay is modal.

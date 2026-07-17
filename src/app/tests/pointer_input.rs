@@ -335,7 +335,8 @@ fn split_intent_top_left_place_new_pane_first() {
 #[test]
 fn split_intent_bottom_right_place_new_pane_second() {
     // Bottom and Right clicks place the new pane in the trailing
-    // slot, matching the historical Ctrl+D / Ctrl+E placement.
+    // slot, matching the historical split-chord placement (Alt+D /
+    // Alt+E, formerly Ctrl+D / Ctrl+E).
     assert_eq!(
         split_intent_for_edge(EdgeSide::Bottom),
         (SplitDirection::Horizontal, false)

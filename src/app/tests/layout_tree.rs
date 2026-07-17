@@ -198,8 +198,8 @@ fn split_with_position_first_places_new_pane_in_first_slot() {
 #[test]
 fn split_with_position_second_keeps_legacy_placement() {
     // new_pane_first = false must place the new pane in the second
-    // (bottom / right) child slot — what Ctrl+D / Ctrl+E have always
-    // done. Regression guard for the historical placement.
+    // (bottom / right) child slot — what the split chords (Alt+D /
+    // Alt+E, formerly Ctrl+D / Ctrl+E) have always done. Regression guard for the historical placement.
     let mut layout = LayoutNode::Leaf { pane_id: 1 };
     layout.split_pane_with_position(1, 2, SplitDirection::Vertical, false);
     let rects = layout.calculate_rects(Rect::new(0, 0, 100, 50));

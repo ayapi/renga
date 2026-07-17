@@ -2,27 +2,29 @@
 
 Full keybinding reference. The README only carries a "first 5–8 keys" cheat sheet; everything else lives here.
 
-> **macOS users:** the default macOS terminal swallows `Option+<key>` before renga sees it, so `Alt+T`, `Alt+P`, `Alt+1..9`, `Alt+Left/Right` etc. won't fire out of the box. See [macOS: Option as Meta](#macos-option-as-meta) below for the one-line fix per terminal.
+> **macOS users:** the default macOS terminal swallows `Option+<key>` before renga sees it, so the `Alt+<key>` shortcuts — which is nearly the whole global keymap — won't fire out of the box. See [macOS: Option as Meta](#macos-option-as-meta) below for the one-line fix per terminal.
 
 ## Pane mode (default)
 
+Every global renga chord lives in the `Alt` namespace. Bare `Ctrl+<key>` combinations (`Ctrl+D`, `Ctrl+W`, `Ctrl+Q`, …) are deliberately **not** bound — they pass through to the program running inside the pane (shell readline, vim, fzf, …) untouched. The only exceptions are `Ctrl+C` (renga-side copy, but only while a text selection exists) and `Ctrl+;` (IME overlay).
+
 | Key | Action |
 |-----|--------|
-| `Ctrl+D` | Split vertically |
-| `Ctrl+E` | Split horizontally |
-| `Ctrl+W` | Close pane / tab |
-| `Alt+T` / `Ctrl+T` | New tab |
+| `Alt+D` | Split vertically |
+| `Alt+E` | Split horizontally |
+| `Alt+W` | Close pane / tab |
+| `Alt+T` | New tab |
 | `Alt+1..9` | Jump to tab N |
 | `Alt+Left/Right` | Previous / next tab |
 | `Alt+R` | Rename tab (session only) |
 | `Alt+S` | Toggle status bar |
 | `Alt+P` | Insert the peer-enabled Claude Code launch command into the focused pane (see [`peer-messaging.md`](./peer-messaging.md)). Silently no-ops when the focused pane is in alt-screen mode (vim, less, lazygit, a running Claude / Codex TUI) or its title contains "claude" — by design, so the command bytes aren't injected as keystrokes into a running TUI. Switch focus to a shell-prompt pane and press again. |
-| `Ctrl+F` | Toggle file tree |
-| `Ctrl+P` | Swap preview/terminal layout |
-| `Ctrl+Right/Left` | Cycle focus (sidebar, preview, panes) |
+| `Alt+F` | Toggle file tree |
+| `Alt+O` | Swap preview/terminal layout |
+| `Alt+Up/Down` | Cycle focus (sidebar, preview, panes) |
 | `Ctrl+;` / `Alt+;` / `Alt+I` | Open IME composition overlay (centered multi-line — see [`ime.md`](./ime.md)). `Alt+;` and `Alt+I` are fallbacks for terminals that swallow `Ctrl+;` (WSL under Windows Terminal, VS Code terminal on Linux, some tmux configs). |
 | `Alt+M` / `Ctrl+Shift+M` | Enter keyboard copy mode on the focused pane (see [Copy mode](#copy-mode-after-altm)) |
-| `Ctrl+Q` | Quit |
+| `Alt+Q` | Quit |
 
 ## Copy mode (after `Alt+M`)
 
@@ -43,7 +45,7 @@ Keyboard-only text selection and copy, modeled on Windows Terminal's mark mode. 
 
 ## macOS: Option as Meta
 
-By default macOS terminals bind `Option+<key>` to Unicode input (`å`, `∫`, `π`, …), so renga's `Alt+T` / `Alt+P` / `Alt+R` / `Alt+S` / `Alt+1..9` / `Alt+Left/Right` shortcuts never reach the app. Flip Option to act as a Meta key — it's a one-line change in every modern terminal. If you're on plain **Terminal.app**, consider switching to one of the terminals below first; they all handle IME, ligatures, and the image preview panel better than Terminal.app anyway.
+By default macOS terminals bind `Option+<key>` to Unicode input (`å`, `∫`, `π`, …), so renga's `Alt`-based shortcuts — splits, tabs, quit, essentially the entire global keymap — never reach the app. Flip Option to act as a Meta key — it's a one-line change in every modern terminal. If you're on plain **Terminal.app**, consider switching to one of the terminals below first; they all handle IME, ligatures, and the image preview panel better than Terminal.app anyway.
 
 | Terminal | Setting |
 |---|---|
@@ -59,7 +61,7 @@ By default macOS terminals bind `Option+<key>` to Unicode input (`å`, `∫`, `�
 - Some macOS IMEs (Kotoeri's "Romaji" toggle, kana layouts, …) bind Option themselves. If flipping Option breaks IME for you, try the `OnlyLeft` / `OnlyRight` variants so one Option stays native to the OS.
 - `Alt+1..9` can collide with macOS Mission Control / Spaces shortcuts on some setups. If the OS swallows the number keys, `Alt+Left/Right` still cycles tabs.
 
-## File tree mode (after `Ctrl+F`)
+## File tree mode (after `Alt+F`)
 
 | Key | Action |
 |-----|--------|
@@ -78,7 +80,7 @@ By default macOS terminals bind `Option+<key>` to Unicode input (`å`, `∫`, `�
 |-----|--------|
 | `j` / `k` | Scroll vertically |
 | `h` / `l` | Scroll horizontally |
-| `Ctrl+W` | Close preview |
+| `Alt+W` | Close preview |
 | `Esc` | Return to pane |
 
 ## Mouse

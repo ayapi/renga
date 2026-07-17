@@ -10,17 +10,21 @@ impl App {
         // press a key twice (once to dismiss, once to do what they
         // wanted). Persists the marker file here so the banner never
         // reappears on the next launch, including when the next key
-        // is Ctrl+Q — otherwise a quit-while-banner-up would leave
+        // is Alt+Q — otherwise a quit-while-banner-up would leave
         // the marker unwritten and the tip would return next launch.
         if self.macos_tip_visible {
             self.dismiss_macos_tip();
         }
 
-        // Emergency escape hatch: Ctrl+Q must always quit renga, even
+        // Emergency escape hatch: Alt+Q must always quit renga, even
         // while the IME composition overlay is holding input. Checked
         // before overlay routing so the user can never get trapped in
-        // a wedged composition mode.
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('q') {
+        // a wedged composition mode. Alt (not Ctrl) so the key never
+        // shadows in-pane bindings — Ctrl+Q is XON / vim visual-block
+        // territory and now forwards to the PTY untouched.
+        if key.modifiers == KeyModifiers::ALT
+            && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+        {
             self.should_quit = true;
             return Ok(true);
         }
@@ -158,8 +162,10 @@ impl App {
             // open an overlay attached to a hidden target.
         }
 
-        // Ctrl+Q — quit
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('q') {
+        // Alt+Q — quit
+        if key.modifiers == KeyModifiers::ALT
+            && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+        {
             self.should_quit = true;
             return Ok(true);
         }
@@ -217,8 +223,10 @@ impl App {
             // No selection — fall through to forward Ctrl+C to PTY
         }
 
-        // Ctrl+T / Alt+T — new tab (Alt+T groups with Alt-based tab nav)
-        if (key.modifiers == KeyModifiers::CONTROL || key.modifiers == KeyModifiers::ALT)
+        // Alt+T — new tab (groups with Alt-based tab nav). The old
+        // Ctrl+T alias was dropped with the Ctrl→Alt migration so the
+        // byte reaches the PTY (readline transpose-chars, fzf, etc.).
+        if key.modifiers == KeyModifiers::ALT
             && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
         {
             let new_id = self.new_tab()?;
@@ -300,14 +308,15 @@ impl App {
             }
         }
 
-        // Ctrl+Right — next pane
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Right {
+        // Alt+Down — next pane (Alt+Left/Right is taken by tab nav,
+        // so focus cycling lives on the vertical arrows)
+        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Down {
             self.focus_next_pane();
             return Ok(true);
         }
 
-        // Ctrl+Left — previous pane
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Left {
+        // Alt+Up — previous pane
+        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Up {
             self.focus_prev_pane();
             return Ok(true);
         }
@@ -319,21 +328,28 @@ impl App {
 
         // File tree mode
         if self.ws().focus_target == FocusTarget::FileTree {
-            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('f') {
+            if key.modifiers == KeyModifiers::ALT
+                && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F'))
+            {
                 self.toggle_file_tree();
                 return Ok(true);
             }
             return self.handle_file_tree_key(key);
         }
 
-        // Ctrl+F — toggle file tree
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('f') {
+        // Alt+F — toggle file tree
+        if key.modifiers == KeyModifiers::ALT
+            && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F'))
+        {
             self.toggle_file_tree();
             return Ok(true);
         }
 
-        // Ctrl+P — swap preview and terminal positions
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('p') {
+        // Alt+O — swap preview and terminal positions (Alt+P is taken
+        // by the claude launch chord, so the swap sits next door on O)
+        if key.modifiers == KeyModifiers::ALT
+            && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
+        {
             self.layout_swapped = !self.layout_swapped;
             return Ok(true);
         }
@@ -342,19 +358,19 @@ impl App {
         let multi_tab = self.workspaces.len() > 1;
 
         match (key.modifiers, key.code) {
-            (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
+            (KeyModifiers::ALT, KeyCode::Char('d') | KeyCode::Char('D')) => {
                 if let Some(new_id) = self.split_focused_pane(SplitDirection::Vertical, None)? {
                     self.emit_pane_started(new_id);
                 }
                 Ok(true)
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
+            (KeyModifiers::ALT, KeyCode::Char('e') | KeyCode::Char('E')) => {
                 if let Some(new_id) = self.split_focused_pane(SplitDirection::Horizontal, None)? {
                     self.emit_pane_started(new_id);
                 }
                 Ok(true)
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
+            (KeyModifiers::ALT, KeyCode::Char('w') | KeyCode::Char('W')) => {
                 if self.ws().focus_target == FocusTarget::Preview {
                     // Close preview and return to pane
                     self.ws_mut().preview.close();
