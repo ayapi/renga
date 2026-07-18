@@ -77,7 +77,7 @@ impl LayoutNode {
     /// Split the leaf with id `target_id`, inserting a new leaf
     /// `new_id`. `new_pane_first` decides whether the new pane lands in
     /// the first (top/left) or second (bottom/right) child slot.
-    /// `Ctrl+D` / `Ctrl+E` go through `split_focused_pane` with
+    /// `Alt+D` / `Alt+E` go through `split_focused_pane` with
     /// `new_pane_first = false` to preserve the historical "new pane
     /// on the trailing side" placement; outer-edge double-clicks on
     /// the top/left edges pass `true` so the new pane appears on the

@@ -4,9 +4,9 @@
 
 Split your terminal into multiple independent panes, each running its own PTY shell.
 
-- `Ctrl+D` — Split vertically (left/right)
-- `Ctrl+E` — Split horizontally (top/bottom)
-- `Ctrl+W` — Close the focused pane
+- `Alt+D` — Split vertically (left/right)
+- `Alt+E` — Split horizontally (top/bottom)
+- `Alt+W` — Close the focused pane
 - **Mouse drag on pane borders** to resize
 
 Panes can be nested: split a pane, then split one of the halves again. Up to 16 panes.
@@ -21,11 +21,11 @@ import { Callout } from 'nextra/components'
 
 Each tab is an independent workspace with its own panes, file tree, and preview.
 
-- `Alt+T` / `Ctrl+T` — New tab
+- `Alt+T` — New tab
 - **Click a tab** to switch
 - **Double-click a tab** to rename
 - `Alt+R` — Rename tab (session only; submit empty to reset to auto name)
-- `Ctrl+W` — Close tab (when only one pane in the tab)
+- `Alt+W` — Close tab (when only one pane in the tab)
 
 The tab name automatically updates when you `cd` to a different directory. A custom name takes precedence over the auto-derived name.
 
@@ -39,7 +39,7 @@ The status bar at the bottom shows available shortcuts for the current mode. The
 
 A sidebar showing your project's file structure.
 
-- `Ctrl+F` — Toggle the file tree
+- `Alt+F` — Toggle the file tree
 - `j`/`k` — Navigate up/down
 - `Enter` — Expand directory / open file preview
 - `.` — Toggle hidden files (`.git` is always hidden)
@@ -70,8 +70,8 @@ Select a file in the file tree to see its contents with syntax highlighting.
 - Scroll vertically with mouse wheel, `j`/`k`, or `PageUp`/`PageDown`
 - Scroll horizontally with `h`/`l`, `Left`/`Right`, or `Home` (for long lines)
 - Line position indicator at the bottom (`42/156`)
-- `Ctrl+W` to close preview (when preview is focused)
-- `Ctrl+P` to swap preview and terminal positions
+- `Alt+W` to close preview (when preview is focused)
+- `Alt+O` to swap preview and terminal positions
 
 <Callout type="warning">
   Files larger than 10MB are not previewed. Binary files show a placeholder message.
@@ -177,8 +177,8 @@ The status bar always shows the shortcuts available in the current mode. A summa
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+Q` | Quit renga |
-| `Ctrl+Right` / `Ctrl+Left` | Cycle focus between panes / areas |
+| `Alt+Q` | Quit renga |
+| `Alt+Up` / `Alt+Down` | Cycle focus between panes / areas |
 | `Alt+Right` / `Alt+Left` | Switch tabs |
 | `Alt+1` — `Alt+9` | Jump to tab N |
 
@@ -186,24 +186,23 @@ The status bar always shows the shortcuts available in the current mode. A summa
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+D` / `Ctrl+E` | Split vertically / horizontally |
-| `Ctrl+W` | Close pane (close tab if only one pane) |
-| `Alt+T` / `Ctrl+T` | New tab |
+| `Alt+D` / `Alt+E` | Split vertically / horizontally |
+| `Alt+W` | Close pane (close tab if only one pane) |
+| `Alt+T` | New tab |
 | `Alt+R` | Rename tab (session only) |
 | `Alt+S` | Toggle status bar |
-| `Ctrl+F` | Focus file tree |
-| `Ctrl+P` | Swap preview / terminal layout |
+| `Alt+F` | Focus file tree |
+| `Alt+O` | Swap preview / terminal layout |
 | `Ctrl+;` | Open the IME overlay (when `mode = "hotkey"`) |
 | `Tab` / everything else | Forwarded to shell |
 
-### Key conflicts (not forwarded to shell)
+### Keys not forwarded to the shell
+
+All of renga's global chords live in the `Alt` namespace, so bare `Ctrl+<key>` combinations reach the program inside the pane untouched. The only claimed Ctrl chords are these two plus the `Ctrl+Shift+M` copy-mode alias:
 
 | Key | renga action | Shell workaround |
 |-----|--------------|------------------|
-| `Ctrl+D` | Vertical split | `exit` to log out |
-| `Ctrl+E` | Horizontal split | `End` key |
-| `Ctrl+F` | File tree | `/` for less/vim search |
-| `Ctrl+W` | Close (only when multiple panes) | works normally with a single pane |
+| `Ctrl+C` | Copy, only while a text selection exists | with no selection it arrives as a normal SIGINT |
 | `Ctrl+;` | IME overlay (when `mode = "hotkey"`) | `--ime off` swallows the keystroke |
 
 ## Small Terminal Handling

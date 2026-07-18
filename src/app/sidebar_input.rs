@@ -105,14 +105,22 @@ impl App {
 
     pub(crate) fn handle_preview_key(&mut self, key: KeyEvent) -> Result<bool> {
         match (key.modifiers, key.code) {
-            (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
+            (KeyModifiers::ALT, KeyCode::Char('w') | KeyCode::Char('W')) => {
                 self.clear_selection_if_preview();
                 self.ws_mut().preview.close();
                 self.ws_mut().focus_target = FocusTarget::Pane;
                 Ok(true)
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
+            (KeyModifiers::ALT, KeyCode::Char('o') | KeyCode::Char('O')) => {
                 self.layout_swapped = !self.layout_swapped;
+                Ok(true)
+            }
+            (KeyModifiers::ALT, KeyCode::Down) => {
+                self.focus_next_pane();
+                Ok(true)
+            }
+            (KeyModifiers::ALT, KeyCode::Up) => {
+                self.focus_prev_pane();
                 Ok(true)
             }
             (_, KeyCode::Char('j')) | (_, KeyCode::Down) => {
@@ -151,16 +159,8 @@ impl App {
                 self.ws_mut().focus_target = FocusTarget::Pane;
                 Ok(true)
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
+            (KeyModifiers::ALT, KeyCode::Char('q') | KeyCode::Char('Q')) => {
                 self.should_quit = true;
-                Ok(true)
-            }
-            (KeyModifiers::CONTROL, KeyCode::Right) => {
-                self.focus_next_pane();
-                Ok(true)
-            }
-            (KeyModifiers::CONTROL, KeyCode::Left) => {
-                self.focus_prev_pane();
                 Ok(true)
             }
             _ => Ok(true),

@@ -11,6 +11,22 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Changed
 
+- **All global Ctrl keybindings moved to the Alt namespace.** Bare
+  Ctrl chords used to be intercepted by renga and never reached the
+  program inside the pane, shadowing shell readline, vim, fzf and
+  friends (Ctrl+D EOF/scroll, Ctrl+W kill-word, Ctrl+Q XON /
+  visual-block, …). The new map: `Alt+D` / `Alt+E` split, `Alt+W`
+  close pane, `Alt+F` file tree, `Alt+O` swap preview/terminal
+  (Alt+P was taken), `Alt+Q` quit, `Alt+Up/Down` cycle focus
+  (Alt+Left/Right was taken by tab nav). The `Ctrl+T` new-tab alias
+  is gone — `Alt+T` was already the primary. The freed Ctrl keys now
+  pass through to the PTY untouched. `Ctrl+C`
+  (copy-only-with-selection) and `Ctrl+;` (IME overlay, with
+  existing `Alt+;` / `Alt+I` fallbacks) are unchanged. Status-bar
+  hints and docs updated. Frozen v1.0 API surface (MCP wire shape,
+  CLI flags, config keys, env vars) is unchanged — keybindings are
+  not part of the wire contract.
+
 - **Alt+P (and the equivalent `renga split --role claude` / MCP
   `spawn_pane` auto-upgrade for a bare `claude` command) now inserts
   `--permission-mode bypassPermissions` alongside the

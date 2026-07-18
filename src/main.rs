@@ -65,9 +65,7 @@ fn main() -> Result<()> {
     // vt100 parsers produces unreadable output and confuses the mouse.
     if std::env::var("RENGA").is_ok() {
         eprintln!("renga: already running inside a renga pane (nested instance not allowed).");
-        eprintln!(
-            "       Open a new tab with Alt+T (or Ctrl+T) or split with Ctrl+D / Ctrl+E instead."
-        );
+        eprintln!("       Open a new tab with Alt+T or split with Alt+D / Alt+E instead.");
         std::process::exit(1);
     }
 
