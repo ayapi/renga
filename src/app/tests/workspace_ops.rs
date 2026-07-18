@@ -752,3 +752,50 @@ fn handle_new_tab_emits_pane_started_with_attached_name_and_role() {
 
     app.shutdown();
 }
+
+#[test]
+fn apply_config_file_tree_false_hides_initial_workspace_tree() {
+    // The initial workspace is built inside App::new (hardcoded
+    // visible); apply_config must retrofit `[ui] file_tree = false`
+    // onto it, and record the default for later tabs.
+    let mut app = App::new(40, 80).expect("App::new");
+    assert!(
+        app.ws().file_tree_visible,
+        "precondition: Workspace::new starts with the tree visible"
+    );
+
+    let mut cfg = crate::config::Config::default();
+    cfg.ui.file_tree = false;
+    app.apply_config(&cfg);
+
+    assert!(!app.ws().file_tree_visible);
+    assert!(!app.file_tree_default_visible);
+    app.shutdown();
+}
+
+#[test]
+fn new_tab_honors_configured_file_tree_default() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let mut cfg = crate::config::Config::default();
+    cfg.ui.file_tree = false;
+    app.apply_config(&cfg);
+
+    app.new_tab().expect("new tab succeeds");
+    assert!(
+        !app.ws().file_tree_visible,
+        "a tab created after apply_config must start without the tree"
+    );
+
+    // Alt+F must still bring the tree back on that tab.
+    app.toggle_file_tree();
+    assert!(app.ws().file_tree_visible);
+
+    // And the default-true path keeps the historical behavior.
+    let mut app2 = App::new(40, 80).expect("App::new");
+    app2.apply_config(&crate::config::Config::default());
+    app2.new_tab().expect("new tab succeeds");
+    assert!(app2.ws().file_tree_visible);
+
+    app.shutdown();
+    app2.shutdown();
+}

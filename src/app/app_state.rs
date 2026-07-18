@@ -180,6 +180,12 @@ pub struct App {
     pub deferred_caret: Option<(u16, u16)>,
     // Shared settings
     pub file_tree_width: u16,
+    /// Starting visibility for the file tree sidebar of every newly
+    /// created workspace (initial tab and Alt+T tabs alike). Resolved
+    /// from `[ui] file_tree` + `--file-tree` / `--no-file-tree` in
+    /// [`App::apply_config`]. Alt+F keeps toggling per-tab afterwards;
+    /// this only seeds the initial state.
+    pub file_tree_default_visible: bool,
     pub preview_width: u16,
     // Layout: swap preview and terminal positions
     pub layout_swapped: bool,

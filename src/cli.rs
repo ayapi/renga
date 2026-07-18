@@ -83,6 +83,19 @@ pub struct Cli {
     #[arg(long, value_name = "FPS")]
     pub fps: Option<u16>,
 
+    /// Show the file tree sidebar at startup. Overrides `[ui]
+    /// file_tree` in config.toml — mainly useful to re-enable the
+    /// sidebar for one run when the config disables it. When both
+    /// this and `--no-file-tree` are given, the last one wins.
+    #[arg(long, overrides_with = "no_file_tree")]
+    pub file_tree: bool,
+
+    /// Hide the file tree sidebar at startup (the initial tab and
+    /// every new tab). Overrides `[ui] file_tree` in config.toml.
+    /// Alt+F still toggles the sidebar per-tab at runtime.
+    #[arg(long, overrides_with = "file_tree")]
+    pub no_file_tree: bool,
+
     /// Minimum columns each child pane must retain after a vertical
     /// split. Splits that would produce a narrower child are refused.
     /// A value of `0` is clamped to `1` at runtime to avoid degenerate
@@ -357,6 +370,21 @@ impl Cli {
             }
         }
         Ok(())
+    }
+
+    /// Collapse the `--file-tree` / `--no-file-tree` flag pair into the
+    /// `Option<bool>` shape `Config::apply_cli_overrides` expects:
+    /// `None` when neither flag was passed (config file decides).
+    /// clap's `overrides_with` guarantees at most one of the two is
+    /// set when both appear on the command line.
+    pub fn file_tree_override(&self) -> Option<bool> {
+        if self.file_tree {
+            Some(true)
+        } else if self.no_file_tree {
+            Some(false)
+        } else {
+            None
+        }
     }
 }
 
@@ -1027,6 +1055,34 @@ mod tests {
     fn fps_defaults_to_none() {
         let cli = Cli::try_parse_from(["renga"]).unwrap();
         assert_eq!(cli.fps, None);
+    }
+
+    #[test]
+    fn file_tree_flags_default_to_no_override() {
+        let cli = Cli::try_parse_from(["renga"]).unwrap();
+        assert_eq!(cli.file_tree_override(), None);
+    }
+
+    #[test]
+    fn no_file_tree_flag_overrides_to_false() {
+        let cli = Cli::try_parse_from(["renga", "--no-file-tree"]).unwrap();
+        assert_eq!(cli.file_tree_override(), Some(false));
+    }
+
+    #[test]
+    fn file_tree_flag_overrides_to_true() {
+        let cli = Cli::try_parse_from(["renga", "--file-tree"]).unwrap();
+        assert_eq!(cli.file_tree_override(), Some(true));
+    }
+
+    #[test]
+    fn file_tree_flag_pair_last_one_wins() {
+        // `overrides_with` semantics: contradictory flags don't error,
+        // the later occurrence wins — same UX as GNU-style toggles.
+        let cli = Cli::try_parse_from(["renga", "--file-tree", "--no-file-tree"]).unwrap();
+        assert_eq!(cli.file_tree_override(), Some(false));
+        let cli = Cli::try_parse_from(["renga", "--no-file-tree", "--file-tree"]).unwrap();
+        assert_eq!(cli.file_tree_override(), Some(true));
     }
 
     #[test]

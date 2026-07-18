@@ -39,6 +39,12 @@ pub struct UiConfig {
     /// wakeups. `0` is clamped to [`MIN_UI_FPS`] so a bad config or
     /// CLI override never turns into a busy-spin.
     pub fps: u16,
+    /// Whether the file tree sidebar is visible when a workspace is
+    /// created (the initial tab and every new tab). `true` (default)
+    /// preserves the historical always-on behavior; `false` starts
+    /// tabs without the sidebar. Alt+F still toggles it per-tab at
+    /// runtime either way — this only picks the starting state.
+    pub file_tree: bool,
 }
 
 impl Default for UiConfig {
@@ -46,6 +52,7 @@ impl Default for UiConfig {
         Self {
             lang: crate::i18n::UiLang::Auto,
             fps: DEFAULT_UI_FPS,
+            file_tree: true,
         }
     }
 }
@@ -227,6 +234,7 @@ impl Config {
         overlay_catchup_ms: Option<u64>,
         ui_lang: Option<crate::i18n::UiLang>,
         ui_fps: Option<u16>,
+        ui_file_tree: Option<bool>,
     ) {
         if let Some(mode) = ime_mode {
             self.ime.mode = mode;
@@ -242,6 +250,9 @@ impl Config {
         }
         if let Some(fps) = ui_fps {
             self.ui.fps = fps;
+        }
+        if let Some(file_tree) = ui_file_tree {
+            self.ui.file_tree = file_tree;
         }
         // Clamp any non-zero value regardless of origin so the main
         // loop never sees a sub-floor interval.
@@ -360,7 +371,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(Some(ImeMode::Off), None, None, None, None);
+        cfg.apply_cli_overrides(Some(ImeMode::Off), None, None, None, None, None);
         assert_eq!(cfg.ime.mode, ImeMode::Off);
     }
 
@@ -373,7 +384,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, None, None);
+        cfg.apply_cli_overrides(None, None, None, None, None, None);
         assert_eq!(cfg.ime.mode, ImeMode::Off);
     }
 
@@ -448,11 +459,11 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, Some(false), None, None, None);
+        cfg.apply_cli_overrides(None, Some(false), None, None, None, None);
         assert!(!cfg.ime.freeze_panes_on_overlay);
 
         let mut cfg2 = Config::default();
-        cfg2.apply_cli_overrides(None, Some(true), None, None, None);
+        cfg2.apply_cli_overrides(None, Some(true), None, None, None, None);
         assert!(cfg2.ime.freeze_panes_on_overlay);
     }
 
@@ -487,19 +498,19 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, Some(3000), None, None);
+        cfg.apply_cli_overrides(None, None, Some(3000), None, None, None);
         assert_eq!(cfg.ime.overlay_catchup_ms, 3000);
 
         let mut cfg2 = Config::default();
         // Non-zero sub-floor value must be clamped up.
-        cfg2.apply_cli_overrides(None, None, Some(10), None, None);
+        cfg2.apply_cli_overrides(None, None, Some(10), None, None, None);
         assert_eq!(cfg2.ime.overlay_catchup_ms, MIN_OVERLAY_CATCHUP_MS);
 
         // Zero must stay zero (means "disabled") even when the default
         // is a non-zero value — an explicit `--ime-overlay-catchup-ms 0`
         // must still give a pure freeze.
         let mut cfg3 = Config::default();
-        cfg3.apply_cli_overrides(None, None, Some(0), None, None);
+        cfg3.apply_cli_overrides(None, None, Some(0), None, None, None);
         assert_eq!(cfg3.ime.overlay_catchup_ms, 0);
     }
 
@@ -594,11 +605,11 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, None, Some(60));
+        cfg.apply_cli_overrides(None, None, None, None, Some(60), None);
         assert_eq!(cfg.ui.fps, 60);
 
         let mut cfg2 = Config::default();
-        cfg2.apply_cli_overrides(None, None, None, None, Some(0));
+        cfg2.apply_cli_overrides(None, None, None, None, Some(0), None);
         assert_eq!(cfg2.ui.fps, MIN_UI_FPS);
     }
 
@@ -629,7 +640,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, Some(crate::i18n::UiLang::En), None);
+        cfg.apply_cli_overrides(None, None, None, Some(crate::i18n::UiLang::En), None, None);
         assert_eq!(cfg.ui.lang, crate::i18n::UiLang::En);
     }
 
@@ -642,7 +653,61 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, None, None);
+        cfg.apply_cli_overrides(None, None, None, None, None, None);
         assert_eq!(cfg.ui.lang, crate::i18n::UiLang::En);
+    }
+
+    // ── [ui] file_tree ────────────────────────────────────
+
+    #[test]
+    fn ui_file_tree_defaults_to_true() {
+        // Historical behavior: the sidebar is always shown at startup.
+        // The new key must not change anything for users without it.
+        let cfg = Config::default();
+        assert!(cfg.ui.file_tree);
+    }
+
+    #[test]
+    fn parses_ui_file_tree_false_from_toml() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [ui]
+            file_tree = false
+            "#,
+        )
+        .unwrap();
+        assert!(!cfg.ui.file_tree);
+    }
+
+    #[test]
+    fn cli_file_tree_beats_file() {
+        // `--file-tree` must re-enable a sidebar the config disabled…
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [ui]
+            file_tree = false
+            "#,
+        )
+        .unwrap();
+        cfg.apply_cli_overrides(None, None, None, None, None, Some(true));
+        assert!(cfg.ui.file_tree);
+
+        // …and `--no-file-tree` must disable the default-on sidebar.
+        let mut cfg2 = Config::default();
+        cfg2.apply_cli_overrides(None, None, None, None, None, Some(false));
+        assert!(!cfg2.ui.file_tree);
+    }
+
+    #[test]
+    fn cli_file_tree_none_leaves_file_value() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [ui]
+            file_tree = false
+            "#,
+        )
+        .unwrap();
+        cfg.apply_cli_overrides(None, None, None, None, None, None);
+        assert!(!cfg.ui.file_tree);
     }
 }
