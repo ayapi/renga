@@ -62,6 +62,19 @@ file_tree = true
 - `fps` — CLI > 設定 > デフォルト（最後に `0`→`1` の clamp を適用）
 - `file_tree` — CLI > 設定 > デフォルト (`true`)
 
+## `[shell]` — ペインのシェル
+
+```toml
+[shell]
+program = "cmd"   # 例: "cmd", "powershell", "fish", フルパスも可
+```
+
+| キー | 型 | デフォルト | CLI フラグ | 説明 |
+|---|---|---|---|---|
+| `program` | string | *(未設定 — 自動検出)* | `--shell <PROGRAM>` | すべての新規ペイン (最初のペイン・分割・新規タブ) で起動するシェル。名前だけなら PATH で解決 (Windows は `where`、Unix は `which`)、フルパスはそのまま使用。未設定なら従来の自動検出: Windows は Git Bash → PATH の bash → PowerShell、Unix は `$SHELL` → `/bin/sh`。解決できない値は stderr に警告を出して自動検出にフォールバックするので、typo で起動不能にはならない。 |
+
+> 注意: 新規ペインの cwd 追従は bash / zsh にだけ注入する OSC 7 フックに依存しています。`cmd` や `powershell` をシェルにした場合、新規ペインやファイルツリーはペインの*起動時*ディレクトリでは開きますが、シェル内での `cd` 移動には追従しません。
+
 ## 関連ドキュメント
 
 - [`ime.ja.md`](./ime.ja.md) — IME overlay の挙動、推奨上書き、トラブルシュート

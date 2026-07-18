@@ -1362,7 +1362,64 @@ fn title_mentions_client(title: &str, needle: &str) -> bool {
 }
 
 /// Detect the appropriate shell to launch.
+/// Process-wide shell override installed from `[shell] program` /
+/// `--shell` at startup. `None` means auto-detect. A `Mutex` rather
+/// than a `OnceLock` so tests can set and reset it.
+fn shell_override_slot() -> &'static std::sync::Mutex<Option<PathBuf>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Install (or clear, with `None`) the user-configured shell for all
+/// panes spawned from now on. An unresolvable program is dropped with
+/// a stderr warning so a config typo degrades to auto-detection
+/// instead of failing every pane spawn. Called from startup before
+/// the first pane exists.
+pub fn set_shell_override_from_config(raw: Option<&str>) {
+    let resolved = raw.map(str::trim).filter(|s| !s.is_empty()).and_then(|s| {
+        let p = resolve_shell_program(s);
+        if p.is_none() {
+            eprintln!("renga: shell program {s:?} not found; falling back to auto-detection");
+        }
+        p
+    });
+    *shell_override_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = resolved;
+}
+
+/// Resolve a user-supplied shell program to an existing path. A value
+/// containing a path separator is checked directly; a bare name is
+/// looked up on PATH (`where` on Windows, `which` on Unix — the same
+/// probe `detect_shell_windows` already uses for bash).
+fn resolve_shell_program(raw: &str) -> Option<PathBuf> {
+    if raw.contains('/') || raw.contains('\\') {
+        let p = PathBuf::from(raw);
+        return p.exists().then_some(p);
+    }
+    let finder = if cfg!(windows) { "where" } else { "which" };
+    let output = std::process::Command::new(finder).arg(raw).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(line);
+    p.exists().then_some(p)
+}
+
 pub fn detect_shell() -> PathBuf {
+    if let Some(p) = shell_override_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return p;
+    }
     #[cfg(windows)]
     {
         detect_shell_windows()
@@ -1846,7 +1903,11 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn test_detect_shell_unix_uses_shell_env() {
-        let shell = detect_shell();
+        // Probe the auto-detection directly rather than through
+        // detect_shell(): the override round-trip test below briefly
+        // installs a global shell override, and reading the composed
+        // path here would race with it.
+        let shell = detect_shell_unix();
         if let Ok(env_shell) = std::env::var("SHELL") {
             assert_eq!(
                 shell,
@@ -1854,6 +1915,58 @@ mod tests {
                 "Should use $SHELL env var"
             );
         }
+    }
+
+    // -- shell override ([shell] program / --shell) ----------------------
+
+    /// One test rather than several because the override slot is
+    /// process-global and `cargo test` runs tests concurrently —
+    /// two tests mutating the slot would race each other.
+    #[test]
+    fn shell_override_lifecycle() {
+        // A nonexistent path must not install an override (warning +
+        // auto-detect fallback), and neither must whitespace.
+        set_shell_override_from_config(Some(r"C:\definitely\not\a\shell-xyz.exe"));
+        assert!(shell_override_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none());
+        set_shell_override_from_config(Some("   "));
+        assert!(shell_override_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none());
+
+        // Round trip. Use the auto-detected shell itself as the
+        // override value: it is guaranteed to exist on this machine,
+        // and concurrent tests reading detect_shell() observe the
+        // same path they would have gotten from auto-detection.
+        let real = detect_shell();
+        let raw = real.to_string_lossy().into_owned();
+        set_shell_override_from_config(Some(&raw));
+        assert_eq!(
+            detect_shell(),
+            real,
+            "an installed override must win over auto-detection"
+        );
+
+        set_shell_override_from_config(None);
+        assert!(
+            shell_override_slot()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "None must clear the override back to auto-detection"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_program_finds_bare_name_on_path() {
+        // A program guaranteed present on every platform's PATH.
+        let name = if cfg!(windows) { "cmd" } else { "sh" };
+        let p = resolve_shell_program(name).expect("PATH lookup must succeed");
+        assert!(p.exists());
+        assert!(resolve_shell_program("renga-no-such-shell-xyz").is_none());
     }
 
     // -- is_prompt_ready -------------------------------------------------

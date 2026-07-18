@@ -11,6 +11,15 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Added
 
+- **`[shell] program` config key and `--shell` CLI flag** to pick the
+  shell launched in every new pane (e.g. `cmd`, `powershell`, `fish`,
+  or a full path), instead of the built-in auto-detection (Git Bash →
+  bash in PATH → PowerShell on Windows, `$SHELL` → `/bin/sh` on Unix).
+  Bare names are resolved via PATH; an unresolvable program falls back
+  to auto-detection with a stderr warning so a typo never prevents
+  startup. Additive key on the frozen config surface — older binaries
+  ignore it.
+
 - **Direct keyboard scrolling for panes**: `Alt+PageUp` / `Alt+PageDown`
   scroll the focused pane half a page through scrollback history without
   entering copy mode; `Alt+Home` jumps to the top of scrollback and

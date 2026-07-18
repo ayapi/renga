@@ -18,6 +18,23 @@ use std::path::PathBuf;
 pub struct Config {
     pub ime: ImeConfig,
     pub ui: UiConfig,
+    pub shell: ShellConfig,
+}
+
+/// Shell selection for new panes. Additive key on the frozen v1.0
+/// config surface — older binaries ignore the whole section.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ShellConfig {
+    /// Shell program launched in every new pane (the initial pane,
+    /// splits, and new tabs). Accepts a bare program name resolved
+    /// via PATH (`"cmd"`, `"powershell"`, `"fish"`) or a full path.
+    /// `None` (default) keeps the historical auto-detection:
+    /// Git Bash → bash in PATH → PowerShell on Windows, `$SHELL` →
+    /// `/bin/sh` on Unix. A program that cannot be resolved falls
+    /// back to auto-detection with a stderr warning instead of
+    /// failing startup.
+    pub program: Option<String>,
 }
 
 /// Top-level UI settings. Currently only carries the language pick;
@@ -235,7 +252,11 @@ impl Config {
         ui_lang: Option<crate::i18n::UiLang>,
         ui_fps: Option<u16>,
         ui_file_tree: Option<bool>,
+        shell_program: Option<String>,
     ) {
+        if let Some(program) = shell_program {
+            self.shell.program = Some(program);
+        }
         if let Some(mode) = ime_mode {
             self.ime.mode = mode;
         }
@@ -371,7 +392,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(Some(ImeMode::Off), None, None, None, None, None);
+        cfg.apply_cli_overrides(Some(ImeMode::Off), None, None, None, None, None, None);
         assert_eq!(cfg.ime.mode, ImeMode::Off);
     }
 
@@ -384,7 +405,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, None, None, None);
+        cfg.apply_cli_overrides(None, None, None, None, None, None, None);
         assert_eq!(cfg.ime.mode, ImeMode::Off);
     }
 
@@ -459,11 +480,11 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, Some(false), None, None, None, None);
+        cfg.apply_cli_overrides(None, Some(false), None, None, None, None, None);
         assert!(!cfg.ime.freeze_panes_on_overlay);
 
         let mut cfg2 = Config::default();
-        cfg2.apply_cli_overrides(None, Some(true), None, None, None, None);
+        cfg2.apply_cli_overrides(None, Some(true), None, None, None, None, None);
         assert!(cfg2.ime.freeze_panes_on_overlay);
     }
 
@@ -498,19 +519,19 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, Some(3000), None, None, None);
+        cfg.apply_cli_overrides(None, None, Some(3000), None, None, None, None);
         assert_eq!(cfg.ime.overlay_catchup_ms, 3000);
 
         let mut cfg2 = Config::default();
         // Non-zero sub-floor value must be clamped up.
-        cfg2.apply_cli_overrides(None, None, Some(10), None, None, None);
+        cfg2.apply_cli_overrides(None, None, Some(10), None, None, None, None);
         assert_eq!(cfg2.ime.overlay_catchup_ms, MIN_OVERLAY_CATCHUP_MS);
 
         // Zero must stay zero (means "disabled") even when the default
         // is a non-zero value — an explicit `--ime-overlay-catchup-ms 0`
         // must still give a pure freeze.
         let mut cfg3 = Config::default();
-        cfg3.apply_cli_overrides(None, None, Some(0), None, None, None);
+        cfg3.apply_cli_overrides(None, None, Some(0), None, None, None, None);
         assert_eq!(cfg3.ime.overlay_catchup_ms, 0);
     }
 
@@ -605,11 +626,11 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, None, Some(60), None);
+        cfg.apply_cli_overrides(None, None, None, None, Some(60), None, None);
         assert_eq!(cfg.ui.fps, 60);
 
         let mut cfg2 = Config::default();
-        cfg2.apply_cli_overrides(None, None, None, None, Some(0), None);
+        cfg2.apply_cli_overrides(None, None, None, None, Some(0), None, None);
         assert_eq!(cfg2.ui.fps, MIN_UI_FPS);
     }
 
@@ -640,7 +661,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, Some(crate::i18n::UiLang::En), None, None);
+        cfg.apply_cli_overrides(
+            None,
+            None,
+            None,
+            Some(crate::i18n::UiLang::En),
+            None,
+            None,
+            None,
+        );
         assert_eq!(cfg.ui.lang, crate::i18n::UiLang::En);
     }
 
@@ -653,7 +682,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, None, None, None);
+        cfg.apply_cli_overrides(None, None, None, None, None, None, None);
         assert_eq!(cfg.ui.lang, crate::i18n::UiLang::En);
     }
 
@@ -689,13 +718,69 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, None, None, Some(true));
+        cfg.apply_cli_overrides(None, None, None, None, None, Some(true), None);
         assert!(cfg.ui.file_tree);
 
         // …and `--no-file-tree` must disable the default-on sidebar.
         let mut cfg2 = Config::default();
-        cfg2.apply_cli_overrides(None, None, None, None, None, Some(false));
+        cfg2.apply_cli_overrides(None, None, None, None, None, Some(false), None);
         assert!(!cfg2.ui.file_tree);
+    }
+
+    // ── [shell] program ───────────────────────────────────
+
+    #[test]
+    fn shell_program_defaults_to_none() {
+        // No config → auto-detection, exactly as before the key
+        // existed.
+        let cfg = Config::default();
+        assert!(cfg.shell.program.is_none());
+    }
+
+    #[test]
+    fn parses_shell_program_from_toml() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [shell]
+            program = "cmd"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.shell.program.as_deref(), Some("cmd"));
+    }
+
+    #[test]
+    fn cli_shell_beats_file() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [shell]
+            program = "cmd"
+            "#,
+        )
+        .unwrap();
+        cfg.apply_cli_overrides(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("powershell".to_string()),
+        );
+        assert_eq!(cfg.shell.program.as_deref(), Some("powershell"));
+    }
+
+    #[test]
+    fn cli_shell_none_leaves_file_value() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [shell]
+            program = "cmd"
+            "#,
+        )
+        .unwrap();
+        cfg.apply_cli_overrides(None, None, None, None, None, None, None);
+        assert_eq!(cfg.shell.program.as_deref(), Some("cmd"));
     }
 
     #[test]
@@ -707,7 +792,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, None, None, None);
+        cfg.apply_cli_overrides(None, None, None, None, None, None, None);
         assert!(!cfg.ui.file_tree);
     }
 }

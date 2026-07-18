@@ -96,6 +96,15 @@ pub struct Cli {
     #[arg(long, overrides_with = "file_tree")]
     pub no_file_tree: bool,
 
+    /// Shell program launched in every new pane (e.g. `cmd`,
+    /// `powershell`, `fish`, or a full path). Overrides `[shell]
+    /// program` in config.toml. Bare names are resolved via PATH; a
+    /// program that cannot be resolved falls back to the built-in
+    /// auto-detection with a stderr warning instead of failing
+    /// startup.
+    #[arg(long, value_name = "PROGRAM")]
+    pub shell: Option<String>,
+
     /// Minimum columns each child pane must retain after a vertical
     /// split. Splits that would produce a narrower child are refused.
     /// A value of `0` is clamped to `1` at runtime to avoid degenerate
@@ -1073,6 +1082,17 @@ mod tests {
     fn file_tree_flag_overrides_to_true() {
         let cli = Cli::try_parse_from(["renga", "--file-tree"]).unwrap();
         assert_eq!(cli.file_tree_override(), Some(true));
+    }
+
+    #[test]
+    fn shell_flag_defaults_to_none_and_parses() {
+        let cli = Cli::try_parse_from(["renga"]).unwrap();
+        assert_eq!(cli.shell, None);
+        let cli = Cli::try_parse_from(["renga", "--shell", "cmd"]).unwrap();
+        assert_eq!(cli.shell.as_deref(), Some("cmd"));
+        let cli =
+            Cli::try_parse_from(["renga", "--shell", r"C:\Windows\System32\cmd.exe"]).unwrap();
+        assert_eq!(cli.shell.as_deref(), Some(r"C:\Windows\System32\cmd.exe"));
     }
 
     #[test]
