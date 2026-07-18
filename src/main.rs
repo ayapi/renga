@@ -160,7 +160,12 @@ fn main() -> Result<()> {
         cli.lang,
         cli.fps,
         cli.file_tree_override(),
+        cli.shell.clone(),
     );
+    // Install the pane-shell override before the first pane spawns.
+    // Must come after the CLI merge so `--shell` beats `[shell]
+    // program`, and before App::new so the initial pane sees it.
+    pane::set_shell_override_from_config(user_config.shell.program.as_deref());
     let event_poll_timeout = Duration::from_secs_f64(1.0 / f64::from(user_config.ui.fps));
 
     // If a layout was requested and its root node is a single pane

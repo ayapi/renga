@@ -60,6 +60,19 @@ Precedence:
 - `fps` — CLI > config > default (with the `0`→`1` clamp applied last).
 - `file_tree` — CLI > config > default (`true`).
 
+## `[shell]` — pane shell
+
+```toml
+[shell]
+program = "cmd"   # e.g. "cmd", "powershell", "fish", or a full path
+```
+
+| Key | Type | Default | CLI flag | Notes |
+|---|---|---|---|---|
+| `program` | string | *(unset — auto-detect)* | `--shell <PROGRAM>` | Shell launched in every new pane (the initial pane, splits, and new tabs). Bare names are resolved via PATH (`where` on Windows, `which` on Unix); full paths are used as-is. Unset keeps the historical auto-detection: Git Bash → bash in PATH → PowerShell on Windows, `$SHELL` → `/bin/sh` on Unix. A program that cannot be resolved falls back to auto-detection with a stderr warning — a typo never prevents renga from starting. |
+
+> Note: renga's cwd tracking for new panes relies on an OSC 7 hook that is only injected for bash / zsh. With `cmd` or `powershell` as the pane shell, new panes and the file tree still open in the pane's *initial* directory, but they won't follow `cd` movements inside the shell.
+
 ## See also
 
 - [`ime.md`](./ime.md) — IME overlay behavior, recommended overrides, troubleshooting.

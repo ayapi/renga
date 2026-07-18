@@ -31,6 +31,7 @@ cargo run            # Run the app
 - PTY resize via both `master_pty.resize()` and `vt100_parser.set_size()`
 
 ## Shell Detection Priority
+- `[shell] program` in config.toml / `--shell` flag, when set (PATH-resolved; falls back to auto-detect on failure)
 - Windows: Git Bash → PowerShell
 - Unix: $SHELL → /bin/sh
 
