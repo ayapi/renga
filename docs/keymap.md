@@ -22,6 +22,8 @@ Every global renga chord lives in the `Alt` namespace. Bare `Ctrl+<key>` combina
 | `Alt+F` | Toggle file tree |
 | `Alt+O` | Swap preview/terminal layout |
 | `Alt+Up/Down` | Cycle focus (sidebar, preview, panes) |
+| `Alt+PageUp/PageDown` | Scroll the focused pane one page through scrollback history (no copy mode needed) |
+| `Alt+Home` / `Alt+End` | Jump to the top of scrollback / back to the live view |
 | `Ctrl+;` / `Alt+;` / `Alt+I` | Open IME composition overlay (centered multi-line — see [`ime.md`](./ime.md)). `Alt+;` and `Alt+I` are fallbacks for terminals that swallow `Ctrl+;` (WSL under Windows Terminal, VS Code terminal on Linux, some tmux configs). |
 | `Alt+M` / `Ctrl+Shift+M` | Enter keyboard copy mode on the focused pane (see [Copy mode](#copy-mode-after-altm)) |
 | `Alt+Q` | Quit |

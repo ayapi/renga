@@ -320,6 +320,15 @@ impl Pane {
         parser.screen_mut().set_scrollback(current + lines);
     }
 
+    /// Scroll the terminal view to the top of the scrollback history.
+    /// vt100's `set_scrollback` clamps to the actual scrollback
+    /// length, so passing `usize::MAX` lands exactly on the oldest
+    /// retained line.
+    pub fn scroll_to_top(&self) {
+        let mut parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        parser.screen_mut().set_scrollback(usize::MAX);
+    }
+
     /// Get scrollbar info: (current_offset, max_offset).
     /// max_offset is estimated by trying to scroll to a large value and checking.
     pub fn scrollbar_info(&self) -> (usize, usize) {

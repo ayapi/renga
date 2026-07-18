@@ -11,6 +11,13 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Added
 
+- **Direct keyboard scrolling for panes**: `Alt+PageUp` / `Alt+PageDown`
+  scroll the focused pane one page through scrollback history without
+  entering copy mode; `Alt+Home` jumps to the top of scrollback and
+  `Alt+End` returns to the live view. Only active while focus is on a
+  terminal pane (the file tree and preview keep their own scrolling),
+  and the bare (Alt-less) keys still pass through to the PTY untouched.
+
 - **`[ui] file_tree` config key and `--file-tree` / `--no-file-tree`
   CLI flags** to control whether the file tree sidebar is shown when
   a workspace is created (the initial tab and every new tab).
