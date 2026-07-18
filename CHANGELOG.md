@@ -12,7 +12,7 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 ### Added
 
 - **Direct keyboard scrolling for panes**: `Alt+PageUp` / `Alt+PageDown`
-  scroll the focused pane one page through scrollback history without
+  scroll the focused pane half a page through scrollback history without
   entering copy mode; `Alt+Home` jumps to the top of scrollback and
   `Alt+End` returns to the live view. Only active while focus is on a
   terminal pane (the file tree and preview keep their own scrolling),
