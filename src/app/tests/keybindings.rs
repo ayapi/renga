@@ -219,8 +219,8 @@ fn alt_page_home_end_scroll_the_focused_pane() {
     assert!(consumed, "Alt+PageUp must be consumed as pane scroll");
     assert_eq!(
         scroll_offset(&app, pane_id),
-        10,
-        "one page = pane content height"
+        5,
+        "one step = half the pane content height"
     );
 
     let consumed = app
@@ -235,7 +235,7 @@ fn alt_page_home_end_scroll_the_focused_pane() {
     assert!(consumed, "Alt+Home must be consumed as pane scroll");
     // 100 seeded lines minus the visible screen — the exact value
     // depends on the vt100 size (and any concurrent shell output),
-    // but it is always well past one page.
+    // but it is always well past one half-page step.
     assert!(
         scroll_offset(&app, pane_id) > 10,
         "Alt+Home must jump to the top of history"
