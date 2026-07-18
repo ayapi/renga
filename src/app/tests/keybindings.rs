@@ -168,6 +168,122 @@ fn freed_ctrl_keys_fall_through_to_the_pty() {
     );
 }
 
+// -- direct pane scrolling (Alt+PageUp/PageDown/Home/End) --------
+
+/// Seed the focused pane with a rendered rect and enough vt100
+/// scrollback to scroll through. Returns the pane id.
+fn seed_scrollback(app: &mut App) -> usize {
+    let pane_id = app.ws().focused_pane_id;
+    // 12-row frame → 10 content rows after the borders.
+    app.ws_mut().last_pane_rects = vec![(pane_id, ratatui::layout::Rect::new(0, 0, 40, 12))];
+    let pane = app.ws().panes.get(&pane_id).expect("focused pane");
+    // Let the real shell finish printing its startup banner/prompt
+    // first: vt100 auto-shifts a scrolled-back offset when new lines
+    // arrive, so late shell output between two assertions would skew
+    // the exact-offset checks below.
+    let start = std::time::Instant::now();
+    while !pane.prompt_seen.load(std::sync::atomic::Ordering::Relaxed)
+        && start.elapsed() < std::time::Duration::from_secs(5)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let mut parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+    for i in 0..100 {
+        parser.process(format!("line {i}\r\n").as_bytes());
+    }
+    pane_id
+}
+
+fn scroll_offset(app: &App, pane_id: usize) -> usize {
+    app.ws()
+        .panes
+        .get(&pane_id)
+        .expect("pane")
+        .parser
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .screen()
+        .scrollback()
+}
+
+#[test]
+fn alt_page_home_end_scroll_the_focused_pane() {
+    let mut app = App::new(40, 120).expect("App::new");
+    let pane_id = seed_scrollback(&mut app);
+    assert_eq!(scroll_offset(&app, pane_id), 0);
+
+    let consumed = app
+        .handle_key_event(key(KeyCode::PageUp, KeyModifiers::ALT))
+        .expect("Alt+PageUp");
+    assert!(consumed, "Alt+PageUp must be consumed as pane scroll");
+    assert_eq!(
+        scroll_offset(&app, pane_id),
+        10,
+        "one page = pane content height"
+    );
+
+    let consumed = app
+        .handle_key_event(key(KeyCode::PageDown, KeyModifiers::ALT))
+        .expect("Alt+PageDown");
+    assert!(consumed, "Alt+PageDown must be consumed as pane scroll");
+    assert_eq!(scroll_offset(&app, pane_id), 0);
+
+    let consumed = app
+        .handle_key_event(key(KeyCode::Home, KeyModifiers::ALT))
+        .expect("Alt+Home");
+    assert!(consumed, "Alt+Home must be consumed as pane scroll");
+    // 100 seeded lines minus the visible screen — the exact value
+    // depends on the vt100 size (and any concurrent shell output),
+    // but it is always well past one page.
+    assert!(
+        scroll_offset(&app, pane_id) > 10,
+        "Alt+Home must jump to the top of history"
+    );
+
+    let consumed = app
+        .handle_key_event(key(KeyCode::End, KeyModifiers::ALT))
+        .expect("Alt+End");
+    assert!(consumed, "Alt+End must be consumed as pane scroll");
+    assert_eq!(
+        scroll_offset(&app, pane_id),
+        0,
+        "Alt+End must return to the live view"
+    );
+
+    // Without Alt the keys must still fall through to the PTY.
+    for (code, name) in [
+        (KeyCode::PageUp, "PageUp"),
+        (KeyCode::PageDown, "PageDown"),
+        (KeyCode::Home, "Home"),
+        (KeyCode::End, "End"),
+    ] {
+        let consumed = app
+            .handle_key_event(key(code, KeyModifiers::NONE))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(!consumed, "bare {name} must reach the PTY");
+    }
+    assert_eq!(scroll_offset(&app, pane_id), 0);
+}
+
+#[test]
+fn alt_page_scroll_is_skipped_when_sidebar_has_focus() {
+    let mut app = App::new(40, 120).expect("App::new");
+    let pane_id = seed_scrollback(&mut app);
+
+    app.handle_key_event(key(KeyCode::Char('f'), KeyModifiers::ALT))
+        .expect("Alt+F");
+    assert_eq!(app.ws().focus_target, FocusTarget::FileTree);
+
+    app.handle_key_event(key(KeyCode::PageUp, KeyModifiers::ALT))
+        .expect("Alt+PageUp");
+    assert_eq!(
+        scroll_offset(&app, pane_id),
+        0,
+        "sidebar focus must not scroll the hidden pane"
+    );
+}
+
 #[test]
 fn ctrl_c_conditional_copy_is_unchanged() {
     // Out of scope for the migration: Ctrl+C with no selection must

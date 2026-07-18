@@ -321,6 +321,40 @@ impl App {
             return Ok(true);
         }
 
+        // Alt+PageUp / Alt+PageDown — scroll the focused pane's view a
+        // page through scrollback history without entering copy mode;
+        // Alt+Home / Alt+End jump to the top of history / back to the
+        // live view. Only while focus is on a terminal pane — the file
+        // tree and preview have their own scrolling. Always consumed
+        // there, even when there is nothing to scroll: falling through
+        // would strip the Alt modifier in `key_event_to_bytes` and leak
+        // a bare PageUp/Home escape into the PTY app.
+        if key.modifiers == KeyModifiers::ALT
+            && matches!(
+                key.code,
+                KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
+            )
+            && self.ws().focus_target == FocusTarget::Pane
+        {
+            let focused_id = self.ws().focused_pane_id;
+            // Page size = pane content height, same as copy mode's
+            // PageUp/PageDown. Falls back to one line when the pane
+            // hasn't been rendered yet (no rect on the first frame).
+            let page = self
+                .pane_content_rect(focused_id)
+                .map_or(1, |r| r.height as usize);
+            if let Some(pane) = self.ws().panes.get(&focused_id) {
+                match key.code {
+                    KeyCode::PageUp => pane.scroll_up(page),
+                    KeyCode::PageDown => pane.scroll_down(page),
+                    KeyCode::Home => pane.scroll_to_top(),
+                    _ => pane.scroll_reset(),
+                }
+                self.dirty = true;
+            }
+            return Ok(true);
+        }
+
         // Preview mode
         if self.ws().focus_target == FocusTarget::Preview {
             return self.handle_preview_key(key);

@@ -24,6 +24,8 @@ renga のグローバルキーはすべて `Alt` 名前空間にあります。�
 | `Alt+F` | ファイルツリー表示切替 |
 | `Alt+O` | プレビューとターミナルの位置を入れ替え |
 | `Alt+Up/Down` | サイドバー / プレビュー / ペイン間のフォーカス移動 |
+| `Alt+PageUp/PageDown` | フォーカス中のペインを 1 ページ分スクロールバック (コピーモード不要) |
+| `Alt+Home` / `Alt+End` | スクロールバック最上部へ / 最下部 (ライブ表示) へ戻る |
 | `Ctrl+;` / `Alt+;` / `Alt+I` | IME 合成 overlay を開く (中央に複数行入力ボックス — [`ime.ja.md`](./ime.ja.md) 参照)。`Alt+;` / `Alt+I` は `Ctrl+;` を奪うターミナル (WSL + Windows Terminal、Linux 上の VS Code ターミナル、一部の tmux 設定など) のフォールバック。 |
 | `Alt+M` / `Ctrl+Shift+M` | フォーカス中のペインでキーボードコピーモードに入る ([コピーモード](#コピーモード-altm-押下後) 参照) |
 | `Alt+Q` | renga 終了 |
