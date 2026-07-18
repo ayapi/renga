@@ -9,6 +9,17 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ## [Unreleased]
 
+### Added
+
+- **`[ui] file_tree` config key and `--file-tree` / `--no-file-tree`
+  CLI flags** to control whether the file tree sidebar is shown when
+  a workspace is created (the initial tab and every new tab).
+  Defaults to `true`, preserving the historical always-on behavior;
+  `file_tree = false` in config.toml (or `--no-file-tree` for one
+  run) starts tabs without the sidebar. `Alt+F` still toggles the
+  sidebar per-tab at runtime either way. Additive key on the frozen
+  config surface — older binaries ignore it.
+
 ### Changed
 
 - **All global Ctrl keybindings moved to the Alt namespace.** Bare

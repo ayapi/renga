@@ -49,6 +49,7 @@ impl App {
             last_term_size: (cols, rows),
             deferred_caret: None,
             file_tree_width: 20,
+            file_tree_default_visible: true,
             preview_width: 40,
             layout_swapped: true,
             status_bar_visible: true,
@@ -174,6 +175,15 @@ impl App {
             .lang
             .resolve(crate::i18n::current_os_locale().as_deref());
         self.ime_freeze_panes_on_overlay = cfg.ime.freeze_panes_on_overlay;
+        self.file_tree_default_visible = cfg.ui.file_tree;
+        // The initial workspace is constructed inside `App::new`,
+        // before `main` can hand over the resolved config, so retrofit
+        // the starting visibility onto whatever workspaces already
+        // exist. Safe because this runs before the first draw — no
+        // user Alt+F toggle can have happened yet.
+        for ws in &mut self.workspaces {
+            ws.file_tree_visible = cfg.ui.file_tree;
+        }
         // 0 means "catch-up disabled"; any non-zero value is floored
         // at MIN_OVERLAY_CATCHUP_MS so a fat-fingered `--…-catchup-ms 5`
         // can't turn freeze into a ~200 fps repaint storm.

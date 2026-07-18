@@ -159,6 +159,7 @@ fn main() -> Result<()> {
         cli.ime_overlay_catchup_ms,
         cli.lang,
         cli.fps,
+        cli.file_tree_override(),
     );
     let event_poll_timeout = Duration::from_secs_f64(1.0 / f64::from(user_config.ui.fps));
 

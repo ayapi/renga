@@ -45,17 +45,20 @@ overlay_catchup_ms = 3000
 [ui]
 lang = "auto"   # "auto" | "ja" | "en"
 fps = 30
+file_tree = true
 ```
 
 | Key | Type | Default | CLI flag | Notes |
 |---|---|---|---|---|
 | `lang` | `"auto" \| "ja" \| "en"` | `"auto"` | `--lang <auto\|ja\|en>` | Language for status bar hints and preview panel error messages. `auto` detects from the OS locale via `sys-locale` (wraps `nl_langinfo` on Unix and `GetUserDefaultLocaleName` on Windows). Locales starting with `ja` render in Japanese; everything else falls back to English. Values are case-insensitive in both CLI and TOML. |
 | `fps` | u16 | `30` | `--fps <FPS>` | Main event-loop target rate. Drives the crossterm poll timeout used while the TUI is idle; higher values reduce input latency and make animations smoother at the cost of more wakeups. `0` is clamped to `1` at runtime so a bad config or CLI override never turns into a busy-spin. |
+| `file_tree` | bool | `true` | `--file-tree` / `--no-file-tree` | Whether the file tree sidebar is visible when a workspace is created — the initial tab and every new tab. `false` starts tabs without the sidebar; `Alt+F` still toggles it per-tab at runtime either way. On the CLI, passing both flags lets the last one win. |
 
 Precedence:
 
 - `lang` — CLI > config > OS locale detection > English fallback.
 - `fps` — CLI > config > default (with the `0`→`1` clamp applied last).
+- `file_tree` — CLI > config > default (`true`).
 
 ## See also
 

@@ -12,7 +12,10 @@ impl App {
         let pane_id = self.next_pane_id;
         self.next_pane_id = self.next_pane_id.wrapping_add(1);
 
-        let ws = Workspace::new(name, cwd, pane_id, 10, 40, self.event_tx.clone())?;
+        let mut ws = Workspace::new(name, cwd, pane_id, 10, 40, self.event_tx.clone())?;
+        // Honor the configured startup visibility ([ui] file_tree /
+        // --no-file-tree) instead of Workspace::new's hardcoded `true`.
+        ws.file_tree_visible = self.file_tree_default_visible;
         self.workspaces.push(ws);
         self.active_tab = self.workspaces.len() - 1;
         self.suspend_overlay();

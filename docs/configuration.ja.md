@@ -47,17 +47,20 @@ overlay_catchup_ms = 3000
 [ui]
 lang = "auto"   # "auto" | "ja" | "en"
 fps = 30
+file_tree = true
 ```
 
 | キー | 型 | デフォルト | CLI フラグ | 説明 |
 |---|---|---|---|---|
 | `lang` | `"auto" \| "ja" \| "en"` | `"auto"` | `--lang <auto\|ja\|en>` | ステータスバー hint とプレビューのエラーメッセージの言語。`auto` は `sys-locale` (Unix は `nl_langinfo`、Windows は `GetUserDefaultLocaleName`) で OS ロケールを検出。`ja` 系で日本語、それ以外は英語にフォールバック。CLI でも TOML でも大小文字を区別しない。 |
 | `fps` | u16 | `30` | `--fps <FPS>` | メインイベントループの目標 rate。アイドル時の crossterm poll タイムアウトを決め、入力レイテンシとアニメーションの滑らかさを上げる代わりに wakeup を増やす。`0` は実行時に `1` に丸めるので、設定ミスでもビジーループにはならない。 |
+| `file_tree` | bool | `true` | `--file-tree` / `--no-file-tree` | workspace 作成時 (最初のタブと新規タブ) にファイルツリー sidebar を表示するかどうか。`false` で sidebar なしで起動する。どちらの設定でも `Alt+F` でタブごとに toggle できる。CLI で両方のフラグを渡した場合は後勝ち。 |
 
 優先順位:
 
 - `lang` — CLI > 設定 > OS ロケール検出 > 英語フォールバック
 - `fps` — CLI > 設定 > デフォルト（最後に `0`→`1` の clamp を適用）
+- `file_tree` — CLI > 設定 > デフォルト (`true`)
 
 ## 関連ドキュメント
 
