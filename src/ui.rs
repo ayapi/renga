@@ -14,7 +14,11 @@ const FOCUS_BORDER: Color = Color::LightBlue;
 const TEXT: Color = Color::Reset;
 const TEXT_DIM: Color = Color::DarkGray;
 const ACCENT_GREEN: Color = Color::Green;
-const ACCENT_BLUE: Color = Color::Blue;
+// BrightBlue, not base Blue: dark palettes' base Blue slot (e.g.
+// Campbell #0037DA) is nearly unreadable on black backgrounds, and
+// BrightBlue stays legible on light palettes too. Matches the blue
+// mapping in syntax_rgb_to_ansi_color and FOCUS_BORDER.
+const ACCENT_BLUE: Color = Color::LightBlue;
 const ACCENT_CLAUDE: Color = Color::Yellow;
 const ACCENT_CODEX: Color = Color::Cyan;
 const HEADER_BG: Color = Color::Reset;
