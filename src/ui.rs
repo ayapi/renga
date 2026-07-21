@@ -14,7 +14,11 @@ const FOCUS_BORDER: Color = Color::LightBlue;
 const TEXT: Color = Color::Reset;
 const TEXT_DIM: Color = Color::DarkGray;
 const ACCENT_GREEN: Color = Color::Green;
-const ACCENT_BLUE: Color = Color::Blue;
+// BrightBlue, not base Blue: dark palettes' base Blue slot (e.g.
+// Campbell #0037DA) is nearly unreadable on black backgrounds, and
+// BrightBlue stays legible on light palettes too. Matches the blue
+// mapping in syntax_rgb_to_ansi_color and FOCUS_BORDER.
+const ACCENT_BLUE: Color = Color::LightBlue;
 const ACCENT_CLAUDE: Color = Color::Yellow;
 const ACCENT_CODEX: Color = Color::Cyan;
 const HEADER_BG: Color = Color::Reset;
@@ -49,23 +53,30 @@ fn file_icon(name: &str) -> (&'static str, Color) {
     }
 }
 
+/// Map a syntect theme RGB to a base ANSI palette color so the
+/// terminal's own light/dark palette picks the final shade. Base
+/// slots are preferred: bright slots (LightYellow etc.) are often
+/// unreadable on white backgrounds (e.g. One Half Light's
+/// BrightYellow #ffff00), and Gray (ANSI 7) is near-invisible there —
+/// DarkGray (ANSI 8) is a mid-gray in both light and dark palettes,
+/// so all achromatic colors land on it regardless of luminance.
+/// Blue is the one deliberate exception in the other direction: the
+/// base Blue slot is a very dark navy in common dark palettes (e.g.
+/// Campbell #0037DA) and nearly unreadable on black, while BrightBlue
+/// stays legible on both light and dark palettes, so the blue family
+/// maps to LightBlue.
 fn syntax_rgb_to_ansi_color(r: u8, g: u8, b: u8) -> Color {
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     if max.saturating_sub(min) < 32 {
-        return if max < 96 {
-            Color::DarkGray
-        } else {
-            Color::Gray
-        };
+        return Color::DarkGray;
     }
 
-    let intense = max >= 192;
     let substantial = |channel: u8| (u16::from(channel) * 20) >= (u16::from(max) * 11);
     let close = |channel: u8| (u16::from(channel) * 4) > (u16::from(max) * 3);
     let low = |channel: u8| u16::from(channel) * 5 <= u16::from(max) * 3;
 
-    let color = if r == max && substantial(g) && low(b) {
+    if r == max && substantial(g) && low(b) {
         Color::Yellow
     } else if r == max && close(b) && g < b {
         Color::Magenta
@@ -76,21 +87,7 @@ fn syntax_rgb_to_ansi_color(r: u8, g: u8, b: u8) -> Color {
     } else if g == max {
         Color::Green
     } else {
-        Color::Blue
-    };
-
-    if intense {
-        match color {
-            Color::Red => Color::LightRed,
-            Color::Green => Color::LightGreen,
-            Color::Yellow => Color::LightYellow,
-            Color::Blue => Color::LightBlue,
-            Color::Magenta => Color::LightMagenta,
-            Color::Cyan => Color::LightCyan,
-            _ => color,
-        }
-    } else {
-        color
+        Color::LightBlue
     }
 }
 
@@ -1603,11 +1600,12 @@ fn render_preview(app: &mut App, frame: &mut Frame, area: Rect) {
                 let remaining = max_content - used_width;
                 let text = truncate_to_width(&visible_text, remaining);
                 used_width += unicode_width::UnicodeWidthStr::width(text.as_str());
-                let (r, g, b) = styled_span.fg;
-                spans.push(Span::styled(
-                    text,
-                    Style::default().fg(syntax_rgb_to_ansi_color(r, g, b)),
-                ));
+                let color = match styled_span.fg {
+                    Some((r, g, b)) => syntax_rgb_to_ansi_color(r, g, b),
+                    // Theme-default text: terminal default foreground.
+                    None => TEXT,
+                };
+                spans.push(Span::styled(text, Style::default().fg(color)));
             }
         } else {
             let plain = &ws.preview.lines[line_idx];
@@ -1946,11 +1944,12 @@ mod syntax_color_tests {
     }
 
     #[test]
-    fn maps_blue_family_to_ansi_blue() {
-        assert!(matches!(
-            syntax_rgb_to_ansi_color(0x66, 0x99, 0xcc),
-            Color::Blue | Color::LightBlue
-        ));
+    fn maps_blue_family_to_bright_blue() {
+        // Deliberately the bright slot, not base Blue: dark palettes'
+        // base Blue (e.g. Campbell #0037DA) is nearly unreadable on
+        // black backgrounds.
+        assert_eq!(syntax_rgb_to_ansi_color(0x66, 0x99, 0xcc), Color::LightBlue);
+        assert_eq!(syntax_rgb_to_ansi_color(0x00, 0x00, 0xff), Color::LightBlue);
     }
 
     #[test]
@@ -1991,6 +1990,48 @@ mod syntax_color_tests {
             syntax_rgb_to_ansi_color(0xb5, 0x89, 0x00),
             Color::Yellow | Color::LightYellow
         ));
+    }
+
+    #[test]
+    fn maps_achromatic_to_dark_gray_regardless_of_luminance() {
+        // Gray (ANSI 7) is near-invisible on white backgrounds, so both
+        // dim grays (base16-eighties comment #747369) and near-white
+        // grays (its old fallback #e6edf3) must land on DarkGray.
+        assert_eq!(syntax_rgb_to_ansi_color(0x74, 0x73, 0x69), Color::DarkGray);
+        assert_eq!(syntax_rgb_to_ansi_color(0xe6, 0xed, 0xf3), Color::DarkGray);
+        assert_eq!(syntax_rgb_to_ansi_color(0x20, 0x20, 0x20), Color::DarkGray);
+    }
+
+    #[test]
+    fn never_emits_bright_variants_or_gray() {
+        // Bright palette slots are unreadable on light backgrounds
+        // (e.g. One Half Light BrightYellow #ffff00). Pastel theme
+        // colors must stay on the base slots the terminal theme tunes
+        // for its own background. (Blue is the exception — tested
+        // separately in maps_blue_family_to_bright_blue.)
+        for (r, g, b) in [
+            (0xff, 0xcc, 0x66), // eighties yellow
+            (0x99, 0xcc, 0x99), // eighties green
+            (0x66, 0xcc, 0xcc), // eighties cyan
+            (0xf2, 0x77, 0x7a), // eighties red
+            (0xcc, 0x99, 0xcc), // eighties magenta
+            (0xff, 0xff, 0x00),
+            (0x00, 0xff, 0xff),
+        ] {
+            let c = syntax_rgb_to_ansi_color(r, g, b);
+            assert!(
+                !matches!(
+                    c,
+                    Color::Gray
+                        | Color::LightRed
+                        | Color::LightGreen
+                        | Color::LightYellow
+                        | Color::LightMagenta
+                        | Color::LightCyan
+                ),
+                "({r:#x},{g:#x},{b:#x}) mapped to {c:?}"
+            );
+        }
     }
 }
 
