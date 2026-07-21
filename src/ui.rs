@@ -50,12 +50,17 @@ fn file_icon(name: &str) -> (&'static str, Color) {
 }
 
 /// Map a syntect theme RGB to a base ANSI palette color so the
-/// terminal's own light/dark palette picks the final shade. Only the
-/// eight base slots are used: bright slots (LightYellow etc.) are
-/// often unreadable on white backgrounds (e.g. One Half Light's
+/// terminal's own light/dark palette picks the final shade. Base
+/// slots are preferred: bright slots (LightYellow etc.) are often
+/// unreadable on white backgrounds (e.g. One Half Light's
 /// BrightYellow #ffff00), and Gray (ANSI 7) is near-invisible there —
 /// DarkGray (ANSI 8) is a mid-gray in both light and dark palettes,
 /// so all achromatic colors land on it regardless of luminance.
+/// Blue is the one deliberate exception in the other direction: the
+/// base Blue slot is a very dark navy in common dark palettes (e.g.
+/// Campbell #0037DA) and nearly unreadable on black, while BrightBlue
+/// stays legible on both light and dark palettes, so the blue family
+/// maps to LightBlue.
 fn syntax_rgb_to_ansi_color(r: u8, g: u8, b: u8) -> Color {
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
@@ -78,7 +83,7 @@ fn syntax_rgb_to_ansi_color(r: u8, g: u8, b: u8) -> Color {
     } else if g == max {
         Color::Green
     } else {
-        Color::Blue
+        Color::LightBlue
     }
 }
 
@@ -1935,11 +1940,12 @@ mod syntax_color_tests {
     }
 
     #[test]
-    fn maps_blue_family_to_ansi_blue() {
-        assert!(matches!(
-            syntax_rgb_to_ansi_color(0x66, 0x99, 0xcc),
-            Color::Blue | Color::LightBlue
-        ));
+    fn maps_blue_family_to_bright_blue() {
+        // Deliberately the bright slot, not base Blue: dark palettes'
+        // base Blue (e.g. Campbell #0037DA) is nearly unreadable on
+        // black backgrounds.
+        assert_eq!(syntax_rgb_to_ansi_color(0x66, 0x99, 0xcc), Color::LightBlue);
+        assert_eq!(syntax_rgb_to_ansi_color(0x00, 0x00, 0xff), Color::LightBlue);
     }
 
     #[test]
@@ -1997,14 +2003,14 @@ mod syntax_color_tests {
         // Bright palette slots are unreadable on light backgrounds
         // (e.g. One Half Light BrightYellow #ffff00). Pastel theme
         // colors must stay on the base slots the terminal theme tunes
-        // for its own background.
+        // for its own background. (Blue is the exception — tested
+        // separately in maps_blue_family_to_bright_blue.)
         for (r, g, b) in [
             (0xff, 0xcc, 0x66), // eighties yellow
             (0x99, 0xcc, 0x99), // eighties green
             (0x66, 0xcc, 0xcc), // eighties cyan
             (0xf2, 0x77, 0x7a), // eighties red
             (0xcc, 0x99, 0xcc), // eighties magenta
-            (0x66, 0x99, 0xcc), // eighties blue
             (0xff, 0xff, 0x00),
             (0x00, 0xff, 0xff),
         ] {
@@ -2016,7 +2022,6 @@ mod syntax_color_tests {
                         | Color::LightRed
                         | Color::LightGreen
                         | Color::LightYellow
-                        | Color::LightBlue
                         | Color::LightMagenta
                         | Color::LightCyan
                 ),
