@@ -667,7 +667,18 @@ impl App {
 /// Extract text from a pane's vt100 screen within a selection range.
 pub(crate) fn extract_selected_text(pane: &Pane, sr: u32, sc: u32, er: u32, ec: u32) -> String {
     let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
-    let screen = parser.screen();
+    extract_screen_text(parser.screen(), sr, sc, er, ec)
+}
+
+/// Selection extraction against a bare vt100 screen (split out from
+/// [`extract_selected_text`] so tests don't need a live PTY).
+pub(crate) fn extract_screen_text(
+    screen: &vt100::Screen,
+    sr: u32,
+    sc: u32,
+    er: u32,
+    ec: u32,
+) -> String {
     let mut lines = Vec::new();
 
     for row in sr..=er {
@@ -677,6 +688,12 @@ pub(crate) fn extract_selected_text(pane: &Pane, sr: u32, sc: u32, er: u32, ec: 
 
         for col in col_start..=col_end {
             if let Some(cell) = screen.cell(row as u16, col as u16) {
+                // The second cell of a wide (CJK etc.) character has
+                // empty contents; unlike a genuinely blank cell it must
+                // not become a space.
+                if cell.is_wide_continuation() {
+                    continue;
+                }
                 let contents = cell.contents();
                 if contents.is_empty() {
                     line.push(' ');

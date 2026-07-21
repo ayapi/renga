@@ -186,3 +186,62 @@ fn zero_actual_scroll_leaves_anchor_untouched() {
     cm.shift_anchor_for_scroll(0, true, 9);
     assert_eq!(cm.anchor, Some((4, 2)));
 }
+
+// -- text extraction ---------------------------------------------
+
+use super::super::keyboard_input::extract_screen_text;
+
+fn screen_with(bytes: &[u8]) -> vt100::Parser {
+    let mut parser = vt100::Parser::new(10, 40, 0);
+    parser.process(bytes);
+    parser
+}
+
+#[test]
+fn extraction_does_not_insert_spaces_after_wide_chars() {
+    let parser = screen_with("こんにちは".as_bytes());
+    assert_eq!(
+        extract_screen_text(parser.screen(), 0, 0, 0, 9),
+        "こんにちは"
+    );
+}
+
+#[test]
+fn extraction_keeps_mixed_ascii_and_wide_text_intact() {
+    let parser = screen_with("ab日本cd".as_bytes());
+    assert_eq!(extract_screen_text(parser.screen(), 0, 0, 0, 7), "ab日本cd");
+}
+
+#[test]
+fn extraction_preserves_genuinely_blank_cells_as_spaces() {
+    // "a" at col 0, "b" at col 4 via cursor positioning: the untouched
+    // cells in between are real gaps and must stay spaces.
+    let parser = screen_with(b"a\x1b[1;5Hb");
+    assert_eq!(extract_screen_text(parser.screen(), 0, 0, 0, 4), "a   b");
+}
+
+#[test]
+fn extraction_spans_rows_with_wide_chars() {
+    let parser = screen_with("日本語\r\n第二行".as_bytes());
+    assert_eq!(
+        extract_screen_text(parser.screen(), 0, 0, 1, 5),
+        "日本語\n第二行"
+    );
+}
+
+#[test]
+fn extraction_edge_on_first_half_of_wide_char_includes_it() {
+    // "日本" occupies cols 0-3; ending on col 2 (first half of 本)
+    // includes the whole character.
+    let parser = screen_with("日本".as_bytes());
+    assert_eq!(extract_screen_text(parser.screen(), 0, 0, 0, 2), "日本");
+    assert_eq!(extract_screen_text(parser.screen(), 0, 0, 0, 1), "日");
+}
+
+#[test]
+fn extraction_start_on_continuation_cell_skips_the_half_char() {
+    // Selection starting on the second half of 日 (col 1) drops the
+    // partially-covered character instead of emitting a stray space.
+    let parser = screen_with("日本".as_bytes());
+    assert_eq!(extract_screen_text(parser.screen(), 0, 1, 0, 3), "本");
+}
