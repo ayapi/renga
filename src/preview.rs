@@ -17,7 +17,11 @@ const MAX_IMAGE_SIZE: u64 = 20 * 1024 * 1024; // 20MB for images
 #[derive(Debug, Clone)]
 pub struct StyledSpan {
     pub text: String,
-    pub fg: (u8, u8, u8),
+    /// Syntax color as RGB, or `None` for spans the theme leaves at its
+    /// default foreground. `None` renders with the terminal's own text
+    /// color, so plain code stays readable on light and dark terminal
+    /// backgrounds alike.
+    pub fg: Option<(u8, u8, u8)>,
 }
 
 /// File preview state.
@@ -166,7 +170,15 @@ impl Preview {
             .flatten()
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
 
+        // The theme is only a hue source: rendering maps each RGB to a
+        // base ANSI palette color (ui.rs `syntax_rgb_to_ansi_color`), so
+        // the terminal's own light/dark palette decides the final look.
+        // Spans left at the theme's default foreground carry no color at
+        // all (`fg: None`) and render in the terminal's default text
+        // color — a dark theme's near-white body text must not be baked
+        // in, or it vanishes on light backgrounds.
         let theme = &self.theme_set.themes["base16-eighties.dark"];
+        let default_fg = theme.settings.foreground.map(|c| (c.r, c.g, c.b));
         let mut highlighter = HighlightLines::new(syntax, theme);
 
         self.highlighted_lines.clear();
@@ -179,9 +191,10 @@ impl Preview {
                         .into_iter()
                         .map(|(style, text)| {
                             let fg = style.foreground;
+                            let fg = (fg.r, fg.g, fg.b);
                             StyledSpan {
                                 text: text.trim_end_matches('\n').to_string(),
-                                fg: (fg.r, fg.g, fg.b),
+                                fg: (Some(fg) != default_fg).then_some(fg),
                             }
                         })
                         .filter(|s| !s.text.is_empty())
@@ -189,10 +202,10 @@ impl Preview {
                     self.highlighted_lines.push(spans);
                 }
                 Err(_) => {
-                    // Fallback: plain text
+                    // Fallback: plain text in the terminal's default color
                     self.highlighted_lines.push(vec![StyledSpan {
                         text: line.clone(),
-                        fg: (0xe6, 0xed, 0xf3),
+                        fg: None,
                     }]);
                 }
             }
@@ -395,5 +408,19 @@ mod tests {
         // Highlighted lines should have colored spans
         let first = &preview.highlighted_lines[0];
         assert!(!first.is_empty());
+    }
+
+    #[test]
+    fn plain_text_spans_carry_no_baked_in_color() {
+        // Unhighlighted text resolves to the theme's default foreground,
+        // which must be stored as `None` so it renders in the terminal's
+        // own text color. Baking in the dark theme's near-white default
+        // made previews unreadable on light terminal backgrounds.
+        let mut preview = Preview::new();
+        preview.lines = vec!["just plain words".to_string()];
+        preview.highlight(Path::new("notes.unknown-extension"));
+        let spans = &preview.highlighted_lines[0];
+        assert!(!spans.is_empty());
+        assert!(spans.iter().all(|s| s.fg.is_none()));
     }
 }
