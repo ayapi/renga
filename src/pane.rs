@@ -693,8 +693,8 @@ impl Pane {
     }
 
     /// Queue a command to be written into the PTY once the shell prompt
-    /// is ready. A trailing carriage return is appended automatically,
-    /// matching the byte produced by the Enter key in a terminal.
+    /// is ready. Any trailing CR/LF bytes are normalized to one carriage
+    /// return, matching the byte produced by the Enter key in a terminal.
     pub fn queue_startup_command(&mut self, cmd: &str) {
         self.pending_startup = Some(startup_command_data(cmd));
     }
@@ -758,9 +758,10 @@ impl Pane {
 
 fn startup_command_data(cmd: &str) -> Vec<u8> {
     let mut data = cmd.as_bytes().to_vec();
-    if !data.ends_with(b"\r") && !data.ends_with(b"\n") {
-        data.push(b'\r');
+    while matches!(data.last(), Some(b'\r' | b'\n')) {
+        data.pop();
     }
+    data.push(b'\r');
     data
 }
 
@@ -1502,9 +1503,10 @@ mod tests {
 
     #[test]
     fn startup_command_uses_the_same_submit_byte_as_enter() {
-        assert_eq!(startup_command_data("echo ready"), b"echo ready\r");
-        assert_eq!(startup_command_data("echo ready\r"), b"echo ready\r");
-        assert_eq!(startup_command_data("echo ready\n"), b"echo ready\n");
+        assert_eq!(startup_command_data("cmd"), b"cmd\r");
+        assert_eq!(startup_command_data("cmd\r"), b"cmd\r");
+        assert_eq!(startup_command_data("cmd\n"), b"cmd\r");
+        assert_eq!(startup_command_data("cmd\r\n"), b"cmd\r");
     }
 
     #[test]
