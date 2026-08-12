@@ -109,6 +109,22 @@ pub fn subscribe_events<F>(endpoint: &EndpointName, mut on_event: F) -> Result<(
 where
     F: FnMut(Event) -> bool,
 {
+    subscribe_events_with_ready(endpoint, || {}, &mut on_event)
+}
+
+/// Like [`subscribe_events`], but invokes `on_ready` after the server
+/// acknowledges the subscription and before any events are read.
+/// The callback may safely publish client readiness: the server has
+/// already installed this subscriber before sending the acknowledgement.
+pub fn subscribe_events_with_ready<R, F>(
+    endpoint: &EndpointName,
+    on_ready: R,
+    mut on_event: F,
+) -> Result<()>
+where
+    R: FnOnce(),
+    F: FnMut(Event) -> bool,
+{
     let name = make_connection_name(endpoint)?;
     let conn =
         Stream::connect(name).with_context(|| format!("connect to {}", endpoint.as_str()))?;
@@ -136,7 +152,7 @@ where
     // Switch into event-stream mode.
     write_request_line(reader.get_mut(), &Request::Subscribe)?;
     match read_response_line(&mut reader)? {
-        Response::Subscribed => {}
+        Response::Subscribed => on_ready(),
         Response::Err { message, code } => {
             return Err(anyhow!("subscribe refused: {}", fmt_err(&message, &code)));
         }

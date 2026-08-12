@@ -69,8 +69,8 @@ pub enum AppCommand {
     },
     /// Route a peer message from `from_pane` to `target`, provided
     /// both live in the same workspace. Emits `Event::PeerInbox` on
-    /// the event bus so a subscribed MCP subprocess can push it out
-    /// as a `notifications/claude/channel` frame. Cross-tab targets
+    /// the event bus once the target MCP client has registered, so a
+    /// subscribed subprocess can receive it. Cross-tab targets
     /// are silently accepted and dropped (no-op success) — v1 does
     /// not expose cross-tab routing; callers cannot distinguish
     /// "dropped" from "unknown peer" on purpose.
@@ -248,6 +248,11 @@ pub struct App {
     /// Keyed by pane id so `list_peers` / `list_panes` can surface
     /// whether a pane is using Claude-style push or Codex-style poll.
     pub(crate) peer_client_kinds: HashMap<usize, PeerClientKind>,
+    /// Peer inbox messages sent before the target pane's MCP client
+    /// has registered. Registration happens only after its event
+    /// subscription is active, at which point these are emitted in
+    /// original send order.
+    pub(crate) pending_peer_inbox: HashMap<usize, VecDeque<PendingPeerInboxMessage>>,
     /// One-shot nudges waiting to be injected into Codex panes so the
     /// pane runs `check_messages` once it looks ready for PTY input.
     pub(crate) pending_codex_peer_messages: HashMap<usize, VecDeque<PendingCodexPeerDelivery>>,

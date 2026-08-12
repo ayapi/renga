@@ -137,6 +137,7 @@ impl App {
             ws.shutdown();
         }
         self.peer_client_kinds.clear();
+        self.pending_peer_inbox.clear();
         self.pending_codex_peer_messages.clear();
     }
 

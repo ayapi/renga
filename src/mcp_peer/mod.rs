@@ -14,7 +14,8 @@
 //!    `RENGA_TOKEN`) is inherited all the way down.
 //! 2. [`run`] negotiates the MCP `initialize` handshake, declares the
 //!    `claude/channel` experimental capability, and spawns a background
-//!    thread that subscribes to renga's event bus.
+//!    thread that subscribes to renga's event bus before registering the
+//!    pane as ready for peer delivery.
 //! 3. Inbound `Request::PeerSend` deliveries land on the event bus as
 //!    [`crate::ipc::Event::PeerInbox`]. The background thread filters
 //!    on `target_pane == our RENGA_PANE_ID` and pushes a
@@ -78,7 +79,6 @@ pub fn run() -> Result<()> {
                 "connected mode: pane_id={pane_id}, client_kind={:?}",
                 ctx.client_kind
             ));
-            register_client_kind(&ctx);
             spawn_inbox_subscriber(ctx.clone());
         }
         Mode::Detached { reason } => {
@@ -2467,10 +2467,14 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
     let sink = ctx.events.clone();
     let inbox = ctx.inbox.clone();
     let client_kind = ctx.client_kind;
+    let registration_ctx = ctx.clone();
     thread::Builder::new()
         .name("renga-mcp-peer-inbox".into())
         .spawn(move || {
-            let result = client::subscribe_events(&endpoint_clone, |event| {
+            let result = client::subscribe_events_with_ready(
+                &endpoint_clone,
+                || register_client_kind(&registration_ctx),
+                |event| {
                 // Buffer lifecycle events for `poll_events` before we
                 // consume `event` in the match below. Heartbeat is a
                 // wire-keepalive (not a lifecycle signal) and PeerInbox
@@ -2556,8 +2560,9 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                     // poll_events to surface.
                     _ => {}
                 }
-                true
-            });
+                    true
+                },
+            );
             match result {
                 Ok(()) => log_stderr("event stream closed"),
                 Err(e) => log_stderr(&format!("event subscription ended: {e}")),

@@ -161,9 +161,9 @@ pub enum Request {
     /// Deliver `body` to `target`'s peer inbox. Silently no-ops if
     /// `target` resolves to a pane outside `from_pane`'s workspace —
     /// cross-tab messaging is not exposed in v1. On success the server
-    /// emits an `Event::PeerInbox` on the event bus so any MCP peer
-    /// subprocess subscribed on behalf of the target can push it out
-    /// as a `notifications/claude/channel` frame.
+    /// emits an `Event::PeerInbox` on the event bus. If the target MCP
+    /// client has not registered yet, delivery is queued by pane id
+    /// and emitted in send order after registration.
     PeerSend {
         from_pane: usize,
         target: PaneRef,

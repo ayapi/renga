@@ -29,7 +29,10 @@ use self::codex_peer::{
     codex_prompt_allows_peer_nudge_on_screen, format_codex_peer_message, screen_tail_lines,
     PendingCodexPeerMessage,
 };
-use self::codex_peer::{write_input_to_pane, CodexPeerNotificationState, PendingCodexPeerDelivery};
+use self::codex_peer::{
+    write_input_to_pane, CodexPeerNotificationState, PendingCodexPeerDelivery,
+    PendingPeerInboxMessage,
+};
 pub(crate) use self::keyboard_input::key_event_to_bytes_pub;
 use self::keyboard_input::{extract_preview_selected_text, extract_selected_text};
 use self::layout_ops::{

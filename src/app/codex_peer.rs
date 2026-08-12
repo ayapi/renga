@@ -14,6 +14,15 @@ pub(crate) const CODEX_APPEND_ENTER_SNAPSHOT_LINES: usize = 8;
 pub(crate) const PEER_SEND_DEDUPE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingPeerInboxMessage {
+    pub(crate) from_pane: usize,
+    pub(crate) from_name: Option<String>,
+    pub(crate) from_kind: Option<PeerClientKind>,
+    pub(crate) body: String,
+    pub(crate) ts_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingCodexPeerMessage {
     pub(crate) from_pane: usize,
     pub(crate) from_name: Option<String>,
@@ -356,15 +365,33 @@ impl App {
                 self.push_pending_codex_peer_nudge(target_id, message);
             }
         }
-        self.event_bus.emit(ipc::Event::PeerInbox {
-            target_pane: target_id,
+        let message = PendingPeerInboxMessage {
             from_pane,
             from_name,
             from_kind,
             body,
             ts_ms: ipc::events::now_ms(),
-        });
+        };
+        if self.peer_client_kinds.contains_key(&target_id) {
+            self.emit_peer_inbox(target_id, message);
+        } else {
+            self.pending_peer_inbox
+                .entry(target_id)
+                .or_default()
+                .push_back(message);
+        }
         Ok(())
+    }
+
+    fn emit_peer_inbox(&self, target_pane: usize, message: PendingPeerInboxMessage) {
+        self.event_bus.emit(ipc::Event::PeerInbox {
+            target_pane,
+            from_pane: message.from_pane,
+            from_name: message.from_name,
+            from_kind: message.from_kind,
+            body: message.body,
+            ts_ms: message.ts_ms,
+        });
     }
 
     /// Return true when an identical (target, from, body) peer send
@@ -405,6 +432,11 @@ impl App {
                 )
             })?;
         self.peer_client_kinds.insert(pane_id, kind);
+        if let Some(messages) = self.pending_peer_inbox.remove(&pane_id) {
+            for message in messages {
+                self.emit_peer_inbox(pane_id, message);
+            }
+        }
         Ok(())
     }
 

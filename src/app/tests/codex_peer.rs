@@ -116,6 +116,8 @@ fn handle_peer_send_emits_peer_inbox_to_sibling_in_same_tab() {
             None,
         )
         .expect("split succeeds");
+    app.handle_peer_register_client(sibling_id, PeerClientKind::Claude)
+        .expect("peer registration");
     // Drain PaneStarted events from the split so the assertion below
     // only sees the PeerInbox we care about.
     while let Ok(ev) = rx.try_recv() {
@@ -150,6 +152,59 @@ fn handle_peer_send_emits_peer_inbox_to_sibling_in_same_tab() {
 }
 
 #[test]
+fn handle_peer_send_waits_for_target_peer_registration() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (_sub_id, rx) = app.event_bus.subscribe();
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    while rx.try_recv().is_ok() {}
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "queued before registration".to_string(),
+    )
+    .expect("peer send");
+
+    assert!(
+        rx.try_iter()
+            .all(|event| !matches!(event, ipc::Event::PeerInbox { .. })),
+        "an unregistered target has no subscriber yet"
+    );
+
+    app.handle_peer_register_client(sibling_id, PeerClientKind::Codex)
+        .expect("peer registration");
+
+    let event = rx
+        .try_iter()
+        .find(|event| matches!(event, ipc::Event::PeerInbox { .. }))
+        .expect("registration should release the queued message");
+    match event {
+        ipc::Event::PeerInbox {
+            target_pane,
+            from_pane,
+            body,
+            ..
+        } => {
+            assert_eq!(target_pane, sibling_id);
+            assert_eq!(from_pane, sender_id);
+            assert_eq!(body, "queued before registration");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+    app.shutdown();
+}
+
+#[test]
 fn handle_peer_send_loops_back_to_sender_pane() {
     // Regression for renga#215: when the resolved target is the
     // sender pane itself (e.g. claude-org-ja's peer_notify resolving
@@ -160,6 +215,8 @@ fn handle_peer_send_loops_back_to_sender_pane() {
     let mut app = App::new(40, 80).expect("App::new");
     let (_sub_id, rx) = app.event_bus.subscribe();
     let sender_id = app.ws().focused_pane_id;
+    app.handle_peer_register_client(sender_id, PeerClientKind::Claude)
+        .expect("peer registration");
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(
@@ -1259,6 +1316,8 @@ fn handle_peer_send_dedupes_identical_payload_within_window() {
             None,
         )
         .expect("split succeeds");
+    app.handle_peer_register_client(sibling_id, PeerClientKind::Claude)
+        .expect("peer registration");
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(sender_id, &ipc::PaneRef::Id(sibling_id), "ack".to_string())
@@ -1299,6 +1358,8 @@ fn handle_peer_send_distinct_bodies_are_not_deduped() {
             None,
         )
         .expect("split succeeds");
+    app.handle_peer_register_client(sibling_id, PeerClientKind::Claude)
+        .expect("peer registration");
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(
@@ -1352,6 +1413,8 @@ fn handle_peer_send_dedupe_does_not_collapse_distinct_senders() {
             None,
         )
         .expect("split succeeds (target)");
+    app.handle_peer_register_client(target, PeerClientKind::Claude)
+        .expect("peer registration");
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(sender_a, &ipc::PaneRef::Id(target), "ping".to_string())
