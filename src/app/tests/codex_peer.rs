@@ -236,7 +236,7 @@ fn handle_peer_send_refuses_when_pre_registration_queue_is_full() {
         )
         .expect("split succeeds");
 
-    for n in 0..PENDING_PEER_INBOX_MAX_MESSAGES {
+    for n in 0..crate::app::codex_peer::PENDING_PEER_INBOX_MAX_MESSAGES {
         assert_eq!(
             app.handle_peer_send(
                 sender_id,
