@@ -252,6 +252,122 @@ fn handle_peer_send_refuses_when_pre_registration_queue_is_full() {
 }
 
 #[test]
+fn pre_registration_queue_flushes_in_fifo_order() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (_sub_id, rx) = app.event_bus.subscribe();
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    while rx.try_recv().is_ok() {}
+
+    for body in ["first", "second", "third"] {
+        app.handle_peer_send(sender_id, &ipc::PaneRef::Id(sibling_id), body.to_string())
+            .expect("queued send");
+    }
+    app.handle_peer_register_client(sibling_id, PeerClientKind::Codex)
+        .expect("registration");
+    app.handle_peer_set_ready(sibling_id, true)
+        .expect("readiness");
+
+    let bodies: Vec<String> = rx
+        .try_iter()
+        .filter_map(|event| match event {
+            ipc::Event::PeerInbox { body, .. } => Some(body),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(bodies, ["first", "second", "third"]);
+    app.shutdown();
+}
+
+#[test]
+fn closing_pane_discards_its_pre_registration_queue() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "discard me".to_string(),
+    )
+    .expect("queued send");
+    assert!(app.pending_peer_inbox.contains_key(&sibling_id));
+
+    app.handle_close(&ipc::PaneRef::Id(sibling_id))
+        .expect("close sibling");
+    assert!(!app.pending_peer_inbox.contains_key(&sibling_id));
+    app.shutdown();
+}
+
+#[test]
+fn shutdown_discards_all_pre_registration_queues() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "discard on shutdown".to_string(),
+    )
+    .expect("queued send");
+    app.shutdown();
+    assert!(app.pending_peer_inbox.is_empty());
+}
+
+#[test]
+fn closing_tab_discards_its_pre_registration_queues() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.new_tab().expect("second tab");
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "discard with tab".to_string(),
+    )
+    .expect("queued send");
+
+    let closing_tab = app.active_tab;
+    app.close_tab(closing_tab);
+    assert!(!app.pending_peer_inbox.contains_key(&sibling_id));
+    app.shutdown();
+}
+
+#[test]
 fn handle_peer_send_loops_back_to_sender_pane() {
     // Regression for renga#215: when the resolved target is the
     // sender pane itself (e.g. claude-org-ja's peer_notify resolving
