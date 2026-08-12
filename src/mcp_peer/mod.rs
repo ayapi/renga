@@ -413,6 +413,10 @@ fn now_ts_string() -> String {
     format!("{}.{:09}", d.as_secs(), d.subsec_nanos())
 }
 
+fn ts_ms_to_string(ts_ms: u64) -> String {
+    format!("{}.{:09}", ts_ms / 1000, (ts_ms % 1000) * 1_000_000)
+}
+
 // ── MCP method handlers ───────────────────────────────────────
 
 fn instructions_blob(client_kind: PeerClientKind) -> String {
@@ -2572,7 +2576,7 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                         from_name,
                         from_kind,
                         body,
-                        ..
+                        ts_ms,
                     } if target_pane == pane_id => {
                         if client_kind.receive_mode() == ipc::PeerReceiveMode::Pull {
                             queue_pull_message(&inbox, QueuedPeerMessage {
@@ -2580,7 +2584,7 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                                 from_name: from_name.clone(),
                                 from_kind,
                                 body: body.clone(),
-                                sent_at: now_ts_string(),
+                                sent_at: ts_ms_to_string(ts_ms),
                             });
                         } else {
                             let note = channel_notification(
@@ -2654,6 +2658,11 @@ fn should_buffer_for_poll(event: &ipc::Event) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_event_timestamp_preserves_original_milliseconds() {
+        assert_eq!(ts_ms_to_string(1_725_000_123_456), "1725000123.456000000");
+    }
 
     #[test]
     fn parse_target_defaults_to_focused_on_none() {
