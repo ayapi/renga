@@ -757,7 +757,7 @@ impl Pane {
 
 fn startup_command_data(cmd: &str) -> Vec<u8> {
     let mut data = cmd.as_bytes().to_vec();
-    if !data.ends_with(b"\r") {
+    if !data.ends_with(b"\r") && !data.ends_with(b"\n") {
         data.push(b'\r');
     }
     data
@@ -1503,6 +1503,7 @@ mod tests {
     fn startup_command_uses_the_same_submit_byte_as_enter() {
         assert_eq!(startup_command_data("echo ready"), b"echo ready\r");
         assert_eq!(startup_command_data("echo ready\r"), b"echo ready\r");
+        assert_eq!(startup_command_data("echo ready\n"), b"echo ready\n");
     }
 
     #[test]
