@@ -2665,6 +2665,18 @@ mod tests {
     }
 
     #[test]
+    fn push_delivery_buffers_until_initialized_notification() {
+        let ctx = connected_ctx_with(new_event_sink());
+        let notification = channel_notification("queued", "2", Some("worker"));
+
+        deliver_push_frame(&ctx, notification.clone());
+
+        let state = ctx.push.lock().unwrap();
+        assert!(!state.initialized);
+        assert_eq!(state.pending.front(), Some(&notification));
+    }
+
+    #[test]
     fn parse_target_defaults_to_focused_on_none() {
         assert!(matches!(parse_target(None), PaneRef::Focused));
     }

@@ -194,6 +194,13 @@ fn handle_peer_send_waits_for_target_peer_registration() {
     app.handle_peer_set_ready(sibling_id, true)
         .expect("peer readiness");
 
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&sibling_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::Draft(_))
+    ));
+
     let event = rx
         .try_iter()
         .find(|event| matches!(event, ipc::Event::PeerInbox { .. }))
