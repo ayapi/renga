@@ -724,7 +724,8 @@ impl Pane {
         if self.pending_startup.is_none() {
             return Ok(false);
         }
-        if !self.prompt_seen.load(Ordering::Acquire) {
+        let prompt_seen = self.prompt_seen.load(Ordering::Acquire);
+        if !prompt_seen {
             // The reader thread detects prompts from raw PTY chunks, but a
             // trailing control sequence it does not strip can leave the
             // rendered prompt visible without setting the latch. Re-check
@@ -736,7 +737,7 @@ impl Pane {
                 .unwrap_or_else(|e| e.into_inner())
                 .screen()
                 .contents();
-            if !rendered_prompt_ready(&screen_contents) {
+            if !startup_prompt_ready(prompt_seen, &screen_contents) {
                 return Ok(false);
             }
             self.prompt_seen.store(true, Ordering::Release);
@@ -763,8 +764,8 @@ fn startup_command_data(cmd: &str) -> Vec<u8> {
     data
 }
 
-fn rendered_prompt_ready(screen_contents: &str) -> bool {
-    is_prompt_ready(screen_contents.as_bytes())
+fn startup_prompt_ready(prompt_seen: bool, screen_contents: &str) -> bool {
+    prompt_seen || is_prompt_ready(screen_contents.as_bytes())
 }
 
 impl Drop for Pane {
@@ -1507,15 +1508,23 @@ mod tests {
     }
 
     #[test]
-    fn rendered_cmd_prompt_recovers_a_missed_reader_latch() {
-        let screen = concat!(
-            "Microsoft Windows [Version 10.0.26200.8875]\n",
-            "(c) Microsoft Corporation. All rights reserved.\n",
-            "\n",
-            "C:\\Users\\color\\Develop\\gameocr-2u3>"
-        );
+    fn rendered_prompt_flushes_startup_after_reader_latch_is_missed() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut pane = Pane::new(9902, 24, 80, tx).expect("spawn pane");
+        {
+            let mut parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+            parser.process(b"\x1b[2J\x1b[HC:\\Users\\color\\Develop\\gameocr-2u3>");
+        }
 
-        assert!(rendered_prompt_ready(screen));
+        pane.prompt_seen.store(false, Ordering::Release);
+        pane.queue_startup_command("echo renga-startup-flush-regression");
+
+        assert!(
+            pane.try_flush_startup().expect("flush startup command"),
+            "rendered prompt should recover a missed reader latch"
+        );
+        assert!(pane.pending_startup.is_none());
+        pane.kill();
     }
 
     #[test]
