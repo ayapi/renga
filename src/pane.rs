@@ -693,14 +693,10 @@ impl Pane {
     }
 
     /// Queue a command to be written into the PTY once the shell prompt
-    /// is ready. A trailing newline is appended automatically so the
-    /// command is executed as soon as the shell sees it.
+    /// is ready. A trailing carriage return is appended automatically,
+    /// matching the byte produced by the Enter key in a terminal.
     pub fn queue_startup_command(&mut self, cmd: &str) {
-        let mut data = cmd.as_bytes().to_vec();
-        if !data.ends_with(b"\n") {
-            data.push(b'\n');
-        }
-        self.pending_startup = Some(data);
+        self.pending_startup = Some(startup_command_data(cmd));
     }
 
     /// Queue raw text to be inserted at the shell prompt without an
@@ -743,6 +739,14 @@ impl Pane {
         }
         Ok(false)
     }
+}
+
+fn startup_command_data(cmd: &str) -> Vec<u8> {
+    let mut data = cmd.as_bytes().to_vec();
+    if !data.ends_with(b"\r") {
+        data.push(b'\r');
+    }
+    data
 }
 
 impl Drop for Pane {
@@ -1476,6 +1480,12 @@ fn detect_shell_unix() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_command_uses_the_same_submit_byte_as_enter() {
+        assert_eq!(startup_command_data("echo ready"), b"echo ready\r");
+        assert_eq!(startup_command_data("echo ready\r"), b"echo ready\r");
+    }
 
     #[test]
     fn drain_osc52_copies_decodes_bel_terminated_payload() {

@@ -1640,6 +1640,17 @@ fn handle_spawn_codex_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     handle_spawn_codex_pane_with(id, args, ctx, install::verify_codex_renga_peers_install)
 }
 
+fn codex_spawn_queued_message(new_id: Option<u64>, command: &str) -> String {
+    match new_id {
+        Some(n) => format!(
+            "Created pane id={n}. Codex startup command queued (process start not yet confirmed): {command}"
+        ),
+        None => format!(
+            "Created pane (id not reported). Codex startup command queued (process start not yet confirmed): {command}"
+        ),
+    }
+}
+
 /// Inner form with an injectable verifier so unit tests can drive the
 /// `RENGA_PEER_CLIENT_KIND` check independently of the host machine's
 /// `~/.codex/config.toml`.
@@ -1707,10 +1718,7 @@ fn handle_spawn_codex_pane_with(
     ) {
         Ok(Response::Ok { data }) => {
             let new_id = data.get("id").and_then(|v| v.as_u64());
-            let msg = match new_id {
-                Some(n) => format!("Spawned Codex pane id={n}. Launch command: {command}"),
-                None => format!("Spawned Codex pane (id not reported). Launch command: {command}"),
-            };
+            let msg = codex_spawn_queued_message(new_id, &command);
             ok_response(id, tool_text_result(&msg))
         }
         Ok(Response::Err { message, code }) => err_response(
@@ -3369,6 +3377,16 @@ Commands:
             .and_then(|e| e.get("code"))
             .and_then(|c| c.as_i64());
         assert_eq!(err_code, Some(-32602), "resp={resp}");
+    }
+
+    #[test]
+    fn spawn_codex_pane_success_text_reports_queued_not_started() {
+        let msg = codex_spawn_queued_message(Some(8), "codex --yolo");
+
+        assert_eq!(
+            msg,
+            "Created pane id=8. Codex startup command queued (process start not yet confirmed): codex --yolo"
+        );
     }
 
     #[test]
