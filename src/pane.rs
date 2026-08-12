@@ -725,7 +725,21 @@ impl Pane {
             return Ok(false);
         }
         if !self.prompt_seen.load(Ordering::Acquire) {
-            return Ok(false);
+            // The reader thread detects prompts from raw PTY chunks, but a
+            // trailing control sequence it does not strip can leave the
+            // rendered prompt visible without setting the latch. Re-check
+            // the parsed screen so that false negatives do not strand the
+            // queued command forever when the idle shell emits no more data.
+            let screen_contents = self
+                .parser
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .screen()
+                .contents();
+            if !rendered_prompt_ready(&screen_contents) {
+                return Ok(false);
+            }
+            self.prompt_seen.store(true, Ordering::Release);
         }
         if let Some(data) = self.pending_startup.take() {
             // Mirror `write_input`: any write OR flush failure marks the
@@ -747,6 +761,10 @@ fn startup_command_data(cmd: &str) -> Vec<u8> {
         data.push(b'\r');
     }
     data
+}
+
+fn rendered_prompt_ready(screen_contents: &str) -> bool {
+    is_prompt_ready(screen_contents.as_bytes())
 }
 
 impl Drop for Pane {
@@ -1485,6 +1503,18 @@ mod tests {
     fn startup_command_uses_the_same_submit_byte_as_enter() {
         assert_eq!(startup_command_data("echo ready"), b"echo ready\r");
         assert_eq!(startup_command_data("echo ready\r"), b"echo ready\r");
+    }
+
+    #[test]
+    fn rendered_cmd_prompt_recovers_a_missed_reader_latch() {
+        let screen = concat!(
+            "Microsoft Windows [Version 10.0.26200.8875]\n",
+            "(c) Microsoft Corporation. All rights reserved.\n",
+            "\n",
+            "C:\\Users\\color\\Develop\\gameocr-2u3>"
+        );
+
+        assert!(rendered_prompt_ready(screen));
     }
 
     #[test]
