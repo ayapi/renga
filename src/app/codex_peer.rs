@@ -350,7 +350,9 @@ impl App {
             .find(|(_, id)| **id == from_pane)
             .map(|(n, _)| n.clone());
         let from_kind = self.peer_client_kinds.get(&from_pane).copied();
-        if self.pane_expects_codex_peer_delivery(target_ws, target_id) {
+        if self.peer_delivery_ready.contains(&target_id)
+            && self.pane_expects_codex_peer_delivery(target_ws, target_id)
+        {
             let message = PendingCodexPeerMessage {
                 from_pane,
                 from_name: from_name.clone(),
@@ -372,7 +374,7 @@ impl App {
             body,
             ts_ms: ipc::events::now_ms(),
         };
-        if self.peer_client_kinds.contains_key(&target_id) {
+        if self.peer_delivery_ready.contains(&target_id) {
             self.emit_peer_inbox(target_id, message);
         } else {
             self.pending_peer_inbox
@@ -432,7 +434,39 @@ impl App {
                 )
             })?;
         self.peer_client_kinds.insert(pane_id, kind);
+        Ok(())
+    }
+
+    pub(crate) fn handle_peer_set_ready(
+        &mut self,
+        pane_id: usize,
+        ready: bool,
+    ) -> std::result::Result<(), ipc::CodedError> {
+        self.resolve_pane_across_workspaces(&PaneRef::Id(pane_id))
+            .ok_or_else(|| {
+                ipc::CodedError::new(
+                    ipc::err_code::PANE_NOT_FOUND,
+                    format!("pane {pane_id} not found for peer readiness"),
+                )
+            })?;
+        if !ready {
+            self.peer_delivery_ready.remove(&pane_id);
+            return Ok(());
+        }
+        self.peer_delivery_ready.insert(pane_id);
         if let Some(messages) = self.pending_peer_inbox.remove(&pane_id) {
+            if self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex) {
+                if let Some(last) = messages.back() {
+                    self.push_pending_codex_peer_nudge(
+                        pane_id,
+                        PendingCodexPeerMessage {
+                            from_pane: last.from_pane,
+                            from_name: last.from_name.clone(),
+                            from_kind: last.from_kind,
+                        },
+                    );
+                }
+            }
             for message in messages {
                 self.emit_peer_inbox(pane_id, message);
             }

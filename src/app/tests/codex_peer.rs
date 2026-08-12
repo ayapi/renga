@@ -118,6 +118,8 @@ fn handle_peer_send_emits_peer_inbox_to_sibling_in_same_tab() {
         .expect("split succeeds");
     app.handle_peer_register_client(sibling_id, PeerClientKind::Claude)
         .expect("peer registration");
+    app.handle_peer_set_ready(sibling_id, true)
+        .expect("peer readiness");
     // Drain PaneStarted events from the split so the assertion below
     // only sees the PeerInbox we care about.
     while let Ok(ev) = rx.try_recv() {
@@ -184,6 +186,14 @@ fn handle_peer_send_waits_for_target_peer_registration() {
     app.handle_peer_register_client(sibling_id, PeerClientKind::Codex)
         .expect("peer registration");
 
+    assert!(
+        rx.try_iter()
+            .all(|event| !matches!(event, ipc::Event::PeerInbox { .. })),
+        "kind metadata alone must not flush before the subscriber is ready"
+    );
+    app.handle_peer_set_ready(sibling_id, true)
+        .expect("peer readiness");
+
     let event = rx
         .try_iter()
         .find(|event| matches!(event, ipc::Event::PeerInbox { .. }))
@@ -217,6 +227,8 @@ fn handle_peer_send_loops_back_to_sender_pane() {
     let sender_id = app.ws().focused_pane_id;
     app.handle_peer_register_client(sender_id, PeerClientKind::Claude)
         .expect("peer registration");
+    app.handle_peer_set_ready(sender_id, true)
+        .expect("peer readiness");
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(
@@ -297,6 +309,7 @@ fn handle_peer_send_queues_codex_nudge_and_emits_peer_inbox() {
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sender_id))
         .expect("refocus sender");
     while rx.try_recv().is_ok() {}
@@ -361,6 +374,7 @@ fn handle_peer_send_coalesces_codex_nudges_per_pane() {
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sender_id))
         .expect("refocus sender");
 
@@ -486,6 +500,7 @@ fn handle_peer_send_defers_codex_nudge_while_target_is_focused() {
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sibling_id))
         .expect("focus sibling");
     seed_codex_draft(&mut app, sibling_id);
@@ -587,6 +602,7 @@ fn handle_peer_send_coalesces_focused_codex_notifications() {
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sibling_id))
         .expect("focus sibling");
     seed_codex_draft(&mut app, sibling_id);
@@ -634,6 +650,7 @@ fn focused_codex_notification_esc_dismisses_without_queueing_nudge() {
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sibling_id))
         .expect("focus sibling");
     seed_codex_draft(&mut app, sibling_id);
@@ -671,6 +688,7 @@ fn focused_codex_notification_commit_clears_notification() {
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sibling_id))
         .expect("focus sibling");
     seed_codex_draft(&mut app, sibling_id);
@@ -708,6 +726,7 @@ fn flush_pending_codex_peer_messages_requires_ready_screen() {
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sender_id))
         .expect("refocus sender");
     {
@@ -771,6 +790,7 @@ fn flush_pending_codex_peer_messages_waits_for_non_blank_codex_screen() {
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sender_id))
         .expect("refocus sender");
     app.handle_peer_send(
@@ -856,6 +876,7 @@ fn flush_pending_codex_peer_messages_does_not_interrupt_existing_codex_draft() {
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sender_id))
         .expect("refocus sender");
     app.handle_peer_send(
@@ -921,6 +942,7 @@ fn focused_codex_without_draft_auto_submits_when_ready() {
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sibling_id))
         .expect("focus sibling");
     seed_codex_ready_placeholder(&mut app, sibling_id);
@@ -960,6 +982,7 @@ fn focused_codex_without_draft_queues_when_not_ready() {
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sibling_id))
         .expect("focus sibling");
 
@@ -996,6 +1019,7 @@ fn unfocused_codex_with_draft_stays_silent_and_queued() {
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sender_id))
         .expect("refocus sender");
     seed_codex_draft(&mut app, sibling_id);
@@ -1033,6 +1057,7 @@ fn refocusing_unfocused_codex_with_existing_draft_shows_pending_overlay() {
         )
         .expect("split succeeds");
     app.peer_client_kinds.insert(pane_a, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(pane_a);
     seed_codex_draft(&mut app, pane_a);
     assert_eq!(app.ws().focused_pane_id, pane_b);
 
@@ -1074,6 +1099,7 @@ fn focused_codex_pending_queue_auto_submits_after_draft_clears_to_unknown_placeh
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(codex_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(codex_id);
     app.handle_focus(&ipc::PaneRef::Id(codex_id))
         .expect("focus codex");
     seed_codex_draft(&mut app, codex_id);
@@ -1118,6 +1144,7 @@ fn focused_codex_pending_overlay_requeues_when_typing_then_auto_submits_after_dr
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(codex_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(codex_id);
     app.handle_focus(&ipc::PaneRef::Id(codex_id))
         .expect("focus codex");
     seed_pane_screen(
@@ -1170,6 +1197,7 @@ fn focus_transition_routes_pending_codex_by_draft_state() {
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(draft_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(draft_id);
     app.handle_focus(&ipc::PaneRef::Id(sender_id))
         .expect("refocus sender");
     seed_codex_draft(&mut app, draft_id);
@@ -1194,6 +1222,7 @@ fn focus_transition_routes_pending_codex_by_draft_state() {
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(ready_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(ready_id);
     app.handle_focus(&ipc::PaneRef::Id(sender_id))
         .expect("refocus sender");
     seed_codex_ready_placeholder(&mut app, ready_id);
@@ -1318,6 +1347,8 @@ fn handle_peer_send_dedupes_identical_payload_within_window() {
         .expect("split succeeds");
     app.handle_peer_register_client(sibling_id, PeerClientKind::Claude)
         .expect("peer registration");
+    app.handle_peer_set_ready(sibling_id, true)
+        .expect("peer readiness");
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(sender_id, &ipc::PaneRef::Id(sibling_id), "ack".to_string())
@@ -1360,6 +1391,8 @@ fn handle_peer_send_distinct_bodies_are_not_deduped() {
         .expect("split succeeds");
     app.handle_peer_register_client(sibling_id, PeerClientKind::Claude)
         .expect("peer registration");
+    app.handle_peer_set_ready(sibling_id, true)
+        .expect("peer readiness");
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(
@@ -1415,6 +1448,8 @@ fn handle_peer_send_dedupe_does_not_collapse_distinct_senders() {
         .expect("split succeeds (target)");
     app.handle_peer_register_client(target, PeerClientKind::Claude)
         .expect("peer registration");
+    app.handle_peer_set_ready(target, true)
+        .expect("peer readiness");
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(sender_a, &ipc::PaneRef::Id(target), "ping".to_string())

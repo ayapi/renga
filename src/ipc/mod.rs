@@ -176,6 +176,9 @@ pub enum Request {
         pane_id: usize,
         kind: PeerClientKind,
     },
+    /// Publish whether the pane's event subscriber is active and able
+    /// to receive peer inbox events.
+    PeerSetReady { pane_id: usize, ready: bool },
     /// Rename or (re)assign the stable `name` / `role` of an existing
     /// pane. Both fields use three-state semantics over the wire:
     ///

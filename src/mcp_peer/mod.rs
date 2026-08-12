@@ -79,6 +79,10 @@ pub fn run() -> Result<()> {
                 "connected mode: pane_id={pane_id}, client_kind={:?}",
                 ctx.client_kind
             ));
+            // Kind metadata is useful even if the event subscription is
+            // temporarily unavailable. Delivery readiness is published
+            // separately after the subscribe acknowledgement.
+            register_client_kind(&ctx);
             spawn_inbox_subscriber(ctx.clone());
         }
         Mode::Detached { reason } => {
@@ -106,6 +110,31 @@ fn register_client_kind(ctx: &PeerCtx) {
     }
 }
 
+fn set_client_ready(ctx: &PeerCtx, ready: bool) {
+    let Mode::Connected { pane_id, endpoint } = &ctx.mode else {
+        return;
+    };
+    match client::send_request(
+        endpoint,
+        &Request::PeerSetReady {
+            pane_id: *pane_id,
+            ready,
+        },
+    ) {
+        Ok(Response::Ok { .. }) => {}
+        Ok(other) => log_stderr(&format!("peer readiness update returned: {other:?}")),
+        Err(e) => log_stderr(&format!("peer readiness update failed: {e}")),
+    }
+}
+
+#[derive(Default)]
+struct PushState {
+    initialized: bool,
+    pending: VecDeque<Value>,
+}
+
+type PushSink = Arc<Mutex<PushState>>;
+
 /// Runtime context shared between the main stdio loop and the inbox
 /// subscriber thread. Cloneable because both halves read the same
 /// `(pane_id, endpoint)` pair to contact the renga server and the
@@ -116,6 +145,7 @@ struct PeerCtx {
     client_kind: PeerClientKind,
     events: EventSink,
     inbox: InboxSink,
+    push: PushSink,
 }
 
 /// Soft cap on the per-process lifecycle event buffer used by
@@ -204,6 +234,7 @@ impl PeerCtx {
     fn load() -> Self {
         let events = new_event_sink();
         let inbox = new_inbox_sink();
+        let push = Arc::new(Mutex::new(PushState::default()));
         let client_kind = std::env::var(ENV_CLIENT_KIND)
             .ok()
             .and_then(|s| parse_client_kind(&s))
@@ -218,6 +249,7 @@ impl PeerCtx {
                         },
                         events,
                         inbox,
+                        push,
                         client_kind,
                     };
                 }
@@ -231,6 +263,7 @@ impl PeerCtx {
                     },
                     events,
                     inbox,
+                    push,
                     client_kind,
                 };
             }
@@ -240,6 +273,7 @@ impl PeerCtx {
                 mode: Mode::Connected { pane_id, endpoint },
                 events,
                 inbox,
+                push,
                 client_kind,
             },
             Err(e) => PeerCtx {
@@ -248,6 +282,7 @@ impl PeerCtx {
                 },
                 events,
                 inbox,
+                push,
                 client_kind,
             },
         }
@@ -274,6 +309,31 @@ fn write_frame(value: &Value) -> Result<()> {
         .context("write frame to stdout")?;
     guard.flush().context("flush stdout")?;
     Ok(())
+}
+
+fn deliver_push_frame(ctx: &PeerCtx, value: Value) {
+    let mut state = ctx.push.lock().unwrap_or_else(|p| p.into_inner());
+    if !state.initialized {
+        state.pending.push_back(value);
+        return;
+    }
+    drop(state);
+    if let Err(e) = write_frame(&value) {
+        log_stderr(&format!("failed to push channel notification: {e}"));
+    }
+}
+
+fn mark_push_initialized(ctx: &PeerCtx) {
+    let pending = {
+        let mut state = ctx.push.lock().unwrap_or_else(|p| p.into_inner());
+        state.initialized = true;
+        state.pending.drain(..).collect::<Vec<_>>()
+    };
+    for value in pending {
+        if let Err(e) = write_frame(&value) {
+            log_stderr(&format!("failed to flush channel notification: {e}"));
+        }
+    }
 }
 
 fn ok_response(id: &Value, result: Value) -> Value {
@@ -2382,10 +2442,9 @@ fn dispatch(req: &Value, ctx: &PeerCtx) -> Result<Vec<Value>> {
     let params = req.get("params").cloned().unwrap_or(json!({}));
     if is_notification {
         // Lifecycle notifications are accepted silently; unknown ones logged.
-        if !matches!(
-            method,
-            "notifications/initialized" | "initialized" | "notifications/cancelled" | "$/cancel"
-        ) {
+        if matches!(method, "notifications/initialized" | "initialized") {
+            mark_push_initialized(ctx);
+        } else if !matches!(method, "notifications/cancelled" | "$/cancel") {
             log_stderr(&format!("ignored unknown notification: {method}"));
         }
         return Ok(Vec::new());
@@ -2471,9 +2530,13 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
     thread::Builder::new()
         .name("renga-mcp-peer-inbox".into())
         .spawn(move || {
-            let result = client::subscribe_events_with_ready(
+            loop {
+                let result = client::subscribe_events_with_ready(
                 &endpoint_clone,
-                || register_client_kind(&registration_ctx),
+                || {
+                    register_client_kind(&registration_ctx);
+                    set_client_ready(&registration_ctx, true);
+                },
                 |event| {
                 // Buffer lifecycle events for `poll_events` before we
                 // consume `event` in the match below. Heartbeat is a
@@ -2519,9 +2582,7 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                                 &from_pane.to_string(),
                                 from_name.as_deref(),
                             );
-                            if let Err(e) = write_frame(&note) {
-                                log_stderr(&format!("failed to push channel notification: {e}"));
-                            }
+                            deliver_push_frame(&registration_ctx, note);
                         }
                     }
                     // The EventBus bounds each subscriber at 256 events
@@ -2563,9 +2624,12 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                     true
                 },
             );
-            match result {
-                Ok(()) => log_stderr("event stream closed"),
-                Err(e) => log_stderr(&format!("event subscription ended: {e}")),
+                set_client_ready(&registration_ctx, false);
+                match result {
+                    Ok(()) => log_stderr("event stream closed; retrying"),
+                    Err(e) => log_stderr(&format!("event subscription ended: {e}; retrying")),
+                }
+                thread::sleep(Duration::from_millis(250));
             }
         })
         .expect("spawn inbox subscriber thread");
@@ -3922,6 +3986,7 @@ Commands:
             client_kind: PeerClientKind::Claude,
             events: new_event_sink(),
             inbox: new_inbox_sink(),
+            push: Arc::new(Mutex::new(PushState::default())),
         }
     }
 
@@ -3934,6 +3999,7 @@ Commands:
             client_kind,
             events,
             inbox: new_inbox_sink(),
+            push: Arc::new(Mutex::new(PushState::default())),
         }
     }
 

@@ -87,6 +87,11 @@ pub enum AppCommand {
         kind: PeerClientKind,
         reply: oneshot::Sender<std::result::Result<(), ipc::CodedError>>,
     },
+    PeerSetReady {
+        pane_id: usize,
+        ready: bool,
+        reply: oneshot::Sender<std::result::Result<(), ipc::CodedError>>,
+    },
     /// Rename or clear the `name` / `role` of an existing pane. See
     /// [`ipc::Request::SetPaneIdentity`] for the three-state semantics
     /// of each field. Success returns the pane's updated [`PaneInfo`]
@@ -248,6 +253,7 @@ pub struct App {
     /// Keyed by pane id so `list_peers` / `list_panes` can surface
     /// whether a pane is using Claude-style push or Codex-style poll.
     pub(crate) peer_client_kinds: HashMap<usize, PeerClientKind>,
+    pub(crate) peer_delivery_ready: HashSet<usize>,
     /// Peer inbox messages sent before the target pane's MCP client
     /// has registered. Registration happens only after its event
     /// subscription is active, at which point these are emitted in

@@ -555,6 +555,13 @@ fn dispatch_request(req: Request, command_tx: &Sender<AppCommand>) -> Response {
                 reply,
             })
         }
+        Request::PeerSetReady { pane_id, ready } => {
+            forward_unit(command_tx, |reply| AppCommand::PeerSetReady {
+                pane_id,
+                ready,
+                reply,
+            })
+        }
         Request::SetSummary { from_pane, summary } => {
             let (reply_tx, reply_rx) = oneshot::channel();
             if command_tx

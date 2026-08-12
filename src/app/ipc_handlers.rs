@@ -106,6 +106,14 @@ impl App {
                 let result = self.handle_peer_register_client(pane_id, kind);
                 let _ = reply.send(result);
             }
+            AppCommand::PeerSetReady {
+                pane_id,
+                ready,
+                reply,
+            } => {
+                let result = self.handle_peer_set_ready(pane_id, ready);
+                let _ = reply.send(result);
+            }
             AppCommand::SetPaneIdentity {
                 target,
                 name,
