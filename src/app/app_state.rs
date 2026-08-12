@@ -78,7 +78,7 @@ pub enum AppCommand {
         from_pane: usize,
         target: PaneRef,
         body: String,
-        reply: oneshot::Sender<std::result::Result<(), ipc::CodedError>>,
+        reply: oneshot::Sender<std::result::Result<ipc::PeerSendOutcome, ipc::CodedError>>,
     },
     /// Publish the MCP client kind currently attached to a pane so
     /// peer/pane listings can surface push-vs-pull receive behavior.

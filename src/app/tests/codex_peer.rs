@@ -215,6 +215,43 @@ fn handle_peer_send_waits_for_target_peer_registration() {
 }
 
 #[test]
+fn handle_peer_send_refuses_when_pre_registration_queue_is_full() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+
+    for n in 0..PENDING_PEER_INBOX_MAX_MESSAGES {
+        assert_eq!(
+            app.handle_peer_send(
+                sender_id,
+                &ipc::PaneRef::Id(sibling_id),
+                format!("queued-{n}"),
+            )
+            .expect("queue has capacity"),
+            ipc::PeerSendOutcome::Queued
+        );
+    }
+    let err = app
+        .handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(sibling_id),
+            "one-too-many".to_string(),
+        )
+        .expect_err("bounded queue must refuse overflow");
+    assert_eq!(err.code, Some(ipc::err_code::PEER_QUEUE_FULL));
+    app.shutdown();
+}
+
+#[test]
 fn handle_peer_send_loops_back_to_sender_pane() {
     // Regression for renga#215: when the resolved target is the
     // sender pane itself (e.g. claude-org-ja's peer_notify resolving

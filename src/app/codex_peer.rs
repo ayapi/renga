@@ -12,6 +12,12 @@ pub(crate) const CODEX_APPEND_ENTER_SNAPSHOT_LINES: usize = 8;
 /// can't double-paper the transcript with phantom user turns. See
 /// renga#221 acceptance criterion #2.
 pub(crate) const PEER_SEND_DEDUPE_TTL: Duration = Duration::from_secs(5);
+// Keep a pre-registration burst below the EventBus subscriber capacity
+// (256) and cap retained body storage. Refusing the newest send is
+// deliberate: the sender receives an actionable error instead of a
+// successful response for data that cannot be retained reliably.
+pub(crate) const PENDING_PEER_INBOX_MAX_MESSAGES: usize = 128;
+pub(crate) const PENDING_PEER_INBOX_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingPeerInboxMessage {
@@ -318,7 +324,7 @@ impl App {
         from_pane: usize,
         target: &PaneRef,
         body: String,
-    ) -> std::result::Result<(), ipc::CodedError> {
+    ) -> std::result::Result<ipc::PeerSendOutcome, ipc::CodedError> {
         let (sender_ws, _) = self
             .resolve_pane_across_workspaces(&PaneRef::Id(from_pane))
             .ok_or_else(|| {
@@ -329,10 +335,10 @@ impl App {
             })?;
         let (target_ws, target_id) = match self.resolve_pane_across_workspaces(target) {
             Some(pair) => pair,
-            None => return Ok(()),
+            None => return Ok(ipc::PeerSendOutcome::Delivered),
         };
         if sender_ws != target_ws {
-            return Ok(());
+            return Ok(ipc::PeerSendOutcome::Delivered);
         }
         if self.is_duplicate_peer_send(target_id, from_pane, &body) {
             // Same (target, from, body) within the dedupe window —
@@ -341,7 +347,7 @@ impl App {
             // transcript with phantom Human: turns. The sender
             // gets a successful Ok() reply so it can't probe the
             // dedupe state. (renga#221)
-            return Ok(());
+            return Ok(ipc::PeerSendOutcome::Delivered);
         }
         self.materialize_unfocused_codex_peer_notification();
         let from_name = self.workspaces[sender_ws]
@@ -376,13 +382,21 @@ impl App {
         };
         if self.peer_delivery_ready.contains(&target_id) {
             self.emit_peer_inbox(target_id, message);
+            Ok(ipc::PeerSendOutcome::Delivered)
         } else {
-            self.pending_peer_inbox
-                .entry(target_id)
-                .or_default()
-                .push_back(message);
+            let queue = self.pending_peer_inbox.entry(target_id).or_default();
+            let retained_bytes: usize = queue.iter().map(|item| item.body.len()).sum();
+            if queue.len() >= PENDING_PEER_INBOX_MAX_MESSAGES
+                || retained_bytes.saturating_add(message.body.len()) > PENDING_PEER_INBOX_MAX_BYTES
+            {
+                return Err(ipc::CodedError::new(
+                    ipc::err_code::PEER_QUEUE_FULL,
+                    format!("peer inbox queue for pane {target_id} is full"),
+                ));
+            }
+            queue.push_back(message);
+            Ok(ipc::PeerSendOutcome::Queued)
         }
-        Ok(())
     }
 
     fn emit_peer_inbox(&self, target_pane: usize, message: PendingPeerInboxMessage) {

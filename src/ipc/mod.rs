@@ -303,6 +303,13 @@ pub enum PeerReceiveMode {
     Pull,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerSendOutcome {
+    Delivered,
+    Queued,
+}
+
 /// One entry in the `PeerList` response payload. Describes a single
 /// Claude-or-shell pane as a peer of the requesting pane. Scoped to
 /// the same workspace as the caller (tab isolation is enforced by the
@@ -474,6 +481,9 @@ pub mod err_code {
     /// per-pane cap (256 Unicode scalar values). The caller should
     /// either truncate the summary or send an empty string to clear.
     pub const SUMMARY_TOO_LONG: &str = "summary_too_long";
+    /// The target is not ready and its bounded pre-registration peer
+    /// inbox cannot accept another message.
+    pub const PEER_QUEUE_FULL: &str = "peer_queue_full";
 }
 
 /// App-side error carrying a free-form message plus an optional

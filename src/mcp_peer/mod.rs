@@ -944,8 +944,14 @@ fn handle_send_message(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
             body: message.to_string(),
         },
     ) {
-        Ok(Response::Ok { .. }) => {
-            ok_response(id, tool_text_result(&format!("Delivered to {to_id}.")))
+        Ok(Response::Ok { data }) => {
+            let queued = data.get("delivery").and_then(Value::as_str) == Some("queued");
+            let text = if queued {
+                format!("Queued for {to_id} (peer client not registered yet).")
+            } else {
+                format!("Delivered to {to_id}.")
+            };
+            ok_response(id, tool_text_result(&text))
         }
         Ok(Response::Err { message, code }) => err_response(
             id,
