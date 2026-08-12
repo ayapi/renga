@@ -63,7 +63,14 @@ of the wire ABI.
 | `to_id` | string | yes | Recipient pane id (numeric string) or stable name. All-digit strings are interpreted as ids (see §6.1). |
 | `message` | string | yes | Body text. |
 
-Result on success: `"Delivered to <to_id>."`.
+Result on immediate success: `"Delivered to <to_id>."`. If the target pane
+exists in the same tab but its peer event subscriber is not ready, the result
+is `"Queued for <to_id> (peer client not registered yet)."`; delivery occurs
+after that subscriber reports readiness, in original send order.
+
+The pre-registration queue is per pane and bounded to 128 messages / 1 MiB of
+body text. A send that would exceed either cap fails with
+`peer_queue_full` instead of claiming successful retention.
 
 **Detached fallback (frozen prefix)**: `"(message dropped — renga not
 reachable: <reason>)"`.
@@ -452,7 +459,7 @@ hidden from cross-pane callers).
 | `pane_exited` | `id`, `name?`, `role?`, `ts_ms` | Exactly once per pane id. |
 | `events_dropped` | `count: u64`, `ts_ms` | Synthesized when a slow subscriber missed events. Per-subscriber. |
 | `heartbeat` | `ts_ms` | Periodic; only purpose is to detect half-closed connections. Buffer cap 256/subscriber. |
-| `peer_inbox` | `target_pane: usize`, `from_pane: usize`, `from_name?`, `from_kind?`, `body`, `ts_ms` | Always intra-tab by construction. Subscribers filter on `target_pane`. |
+| `peer_inbox` | `target_pane: usize`, `from_pane: usize`, `from_name?`, `from_kind?`, `body`, `ts_ms` | Always intra-tab by construction. Emitted at send time for a ready target, or when its subscriber becomes ready for a queued target. `ts_ms` remains the original send time. Subscribers filter on `target_pane`. |
 
 **`heartbeat` audience (Q10)**: emitted into the subscribe-stream
 (`renga events` / `Request::Subscribe`). The MCP-side `poll_events` consumes
