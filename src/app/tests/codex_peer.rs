@@ -255,6 +255,17 @@ fn handle_peer_send_refuses_when_pre_registration_queue_is_full() {
         )
         .expect_err("bounded queue must refuse overflow");
     assert_eq!(err.code, Some(ipc::err_code::PEER_QUEUE_FULL));
+
+    // A rejected send must not enter the dedupe window. Retrying the
+    // same body still has to report queue-full, never false success.
+    let retry = app
+        .handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(sibling_id),
+            "one-too-many".to_string(),
+        )
+        .expect_err("rejected body must remain retryable");
+    assert_eq!(retry.code, Some(ipc::err_code::PEER_QUEUE_FULL));
     app.shutdown();
 }
 

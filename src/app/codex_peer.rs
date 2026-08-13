@@ -389,6 +389,8 @@ impl App {
             if queue.len() >= PENDING_PEER_INBOX_MAX_MESSAGES
                 || retained_bytes.saturating_add(message.body.len()) > PENDING_PEER_INBOX_MAX_BYTES
             {
+                self.recent_peer_sends
+                    .remove(&(target_id, from_pane, message.body.clone()));
                 return Err(ipc::CodedError::new(
                     ipc::err_code::PEER_QUEUE_FULL,
                     format!("peer inbox queue for pane {target_id} is full"),
