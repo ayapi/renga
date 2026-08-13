@@ -108,10 +108,11 @@ impl App {
             }
             AppCommand::PeerSetReady {
                 pane_id,
+                kind,
                 ready,
                 reply,
             } => {
-                let result = self.handle_peer_set_ready(pane_id, ready);
+                let result = self.handle_peer_set_ready(pane_id, kind, ready);
                 let _ = reply.send(result);
             }
             AppCommand::SetPaneIdentity {

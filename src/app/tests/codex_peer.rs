@@ -118,7 +118,7 @@ fn handle_peer_send_emits_peer_inbox_to_sibling_in_same_tab() {
         .expect("split succeeds");
     app.handle_peer_register_client(sibling_id, PeerClientKind::Claude)
         .expect("peer registration");
-    app.handle_peer_set_ready(sibling_id, true)
+    app.handle_peer_set_ready(sibling_id, PeerClientKind::Claude, true)
         .expect("peer readiness");
     // Drain PaneStarted events from the split so the assertion below
     // only sees the PeerInbox we care about.
@@ -191,7 +191,7 @@ fn handle_peer_send_waits_for_target_peer_registration() {
             .all(|event| !matches!(event, ipc::Event::PeerInbox { .. })),
         "kind metadata alone must not flush before the subscriber is ready"
     );
-    app.handle_peer_set_ready(sibling_id, true)
+    app.handle_peer_set_ready(sibling_id, PeerClientKind::Codex, true)
         .expect("peer readiness");
 
     assert!(matches!(
@@ -292,7 +292,7 @@ fn pre_registration_queue_flushes_in_fifo_order() {
     }
     app.handle_peer_register_client(sibling_id, PeerClientKind::Codex)
         .expect("registration");
-    app.handle_peer_set_ready(sibling_id, true)
+    app.handle_peer_set_ready(sibling_id, PeerClientKind::Codex, true)
         .expect("readiness");
 
     let bodies: Vec<String> = rx
@@ -303,6 +303,46 @@ fn pre_registration_queue_flushes_in_fifo_order() {
         })
         .collect();
     assert_eq!(bodies, ["first", "second", "third"]);
+    app.shutdown();
+}
+
+#[test]
+fn codex_readiness_sets_kind_and_rearms_nudge_atomically() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("focus sender");
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "queued for codex".to_string(),
+    )
+    .expect("queued send");
+    assert!(!app.peer_client_kinds.contains_key(&sibling_id));
+
+    app.handle_peer_set_ready(sibling_id, PeerClientKind::Codex, true)
+        .expect("atomic readiness");
+
+    assert_eq!(
+        app.peer_client_kinds.get(&sibling_id),
+        Some(&PeerClientKind::Codex)
+    );
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&sibling_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::Draft(_))
+    ));
     app.shutdown();
 }
 
@@ -398,7 +438,7 @@ fn handle_peer_send_loops_back_to_sender_pane() {
     let sender_id = app.ws().focused_pane_id;
     app.handle_peer_register_client(sender_id, PeerClientKind::Claude)
         .expect("peer registration");
-    app.handle_peer_set_ready(sender_id, true)
+    app.handle_peer_set_ready(sender_id, PeerClientKind::Claude, true)
         .expect("peer readiness");
     while rx.try_recv().is_ok() {}
 
@@ -1518,7 +1558,7 @@ fn handle_peer_send_dedupes_identical_payload_within_window() {
         .expect("split succeeds");
     app.handle_peer_register_client(sibling_id, PeerClientKind::Claude)
         .expect("peer registration");
-    app.handle_peer_set_ready(sibling_id, true)
+    app.handle_peer_set_ready(sibling_id, PeerClientKind::Claude, true)
         .expect("peer readiness");
     while rx.try_recv().is_ok() {}
 
@@ -1562,7 +1602,7 @@ fn handle_peer_send_distinct_bodies_are_not_deduped() {
         .expect("split succeeds");
     app.handle_peer_register_client(sibling_id, PeerClientKind::Claude)
         .expect("peer registration");
-    app.handle_peer_set_ready(sibling_id, true)
+    app.handle_peer_set_ready(sibling_id, PeerClientKind::Claude, true)
         .expect("peer readiness");
     while rx.try_recv().is_ok() {}
 
@@ -1619,7 +1659,7 @@ fn handle_peer_send_dedupe_does_not_collapse_distinct_senders() {
         .expect("split succeeds (target)");
     app.handle_peer_register_client(target, PeerClientKind::Claude)
         .expect("peer registration");
-    app.handle_peer_set_ready(target, true)
+    app.handle_peer_set_ready(target, PeerClientKind::Claude, true)
         .expect("peer readiness");
     while rx.try_recv().is_ok() {}
 

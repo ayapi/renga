@@ -89,6 +89,7 @@ pub enum AppCommand {
     },
     PeerSetReady {
         pane_id: usize,
+        kind: PeerClientKind,
         ready: bool,
         reply: oneshot::Sender<std::result::Result<(), ipc::CodedError>>,
     },

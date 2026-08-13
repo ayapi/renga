@@ -118,6 +118,7 @@ fn set_client_ready(ctx: &PeerCtx, ready: bool) {
         endpoint,
         &Request::PeerSetReady {
             pane_id: *pane_id,
+            kind: ctx.client_kind,
             ready,
         },
     ) {

@@ -456,6 +456,7 @@ impl App {
     pub(crate) fn handle_peer_set_ready(
         &mut self,
         pane_id: usize,
+        kind: PeerClientKind,
         ready: bool,
     ) -> std::result::Result<(), ipc::CodedError> {
         self.resolve_pane_across_workspaces(&PaneRef::Id(pane_id))
@@ -469,6 +470,9 @@ impl App {
             self.peer_delivery_ready.remove(&pane_id);
             return Ok(());
         }
+        // Readiness and kind travel atomically so a failed earlier metadata
+        // registration cannot suppress Codex nudge setup.
+        self.peer_client_kinds.insert(pane_id, kind);
         self.peer_delivery_ready.insert(pane_id);
         if let Some(messages) = self.pending_peer_inbox.remove(&pane_id) {
             if self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex) {
