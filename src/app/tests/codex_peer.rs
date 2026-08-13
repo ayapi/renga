@@ -1610,6 +1610,38 @@ fn duplicate_for_unready_peer_still_reports_queued() {
 }
 
 #[test]
+fn delivered_duplicate_replays_delivered_after_disconnect() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.handle_peer_set_ready(sibling_id, PeerClientKind::Claude, true)
+        .expect("ready target");
+
+    let first = app
+        .handle_peer_send(sender_id, &ipc::PaneRef::Id(sibling_id), "same".to_string())
+        .expect("first send");
+    app.handle_peer_set_ready(sibling_id, PeerClientKind::Claude, false)
+        .expect("disconnect target");
+    let duplicate = app
+        .handle_peer_send(sender_id, &ipc::PaneRef::Id(sibling_id), "same".to_string())
+        .expect("duplicate send");
+
+    assert_eq!(first, ipc::PeerSendOutcome::Delivered);
+    assert_eq!(duplicate, ipc::PeerSendOutcome::Delivered);
+    assert!(!app.pending_peer_inbox.contains_key(&sibling_id));
+    app.shutdown();
+}
+
+#[test]
 fn handle_peer_send_distinct_bodies_are_not_deduped() {
     // Sanity check: dedupe is keyed on body, so two genuinely
     // distinct messages must both go through. Without this, the

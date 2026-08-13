@@ -340,18 +340,14 @@ impl App {
         if sender_ws != target_ws {
             return Ok(ipc::PeerSendOutcome::Delivered);
         }
-        if self.is_duplicate_peer_send(target_id, from_pane, &body) {
+        if let Some(outcome) = self.duplicate_peer_send_outcome(target_id, from_pane, &body) {
             // Same (target, from, body) within the dedupe window —
             // treat as a no-op so duplicate dispatcher acks /
             // worker false-fires don't paper the receiver's
             // transcript with phantom Human: turns. The sender
             // gets a successful Ok() reply so it can't probe the
             // dedupe state. (renga#221)
-            return Ok(if self.peer_delivery_ready.contains(&target_id) {
-                ipc::PeerSendOutcome::Delivered
-            } else {
-                ipc::PeerSendOutcome::Queued
-            });
+            return Ok(outcome);
         }
         self.materialize_unfocused_codex_peer_notification();
         let from_name = self.workspaces[sender_ws]
@@ -372,11 +368,7 @@ impl App {
                 && self.workspaces[target_ws].focus_target == FocusTarget::Pane
                 && self.workspaces[target_ws].focused_pane_id == target_id;
             if target_is_focused {
-                if let Err(err) = self.route_focused_codex_peer_message(target_id, message) {
-                    self.recent_peer_sends
-                        .remove(&(target_id, from_pane, body.clone()));
-                    return Err(err);
-                }
+                self.route_focused_codex_peer_message(target_id, message)?;
             } else {
                 self.push_pending_codex_peer_nudge(target_id, message);
             }
@@ -385,27 +377,29 @@ impl App {
             from_pane,
             from_name,
             from_kind,
-            body,
+            body: body.clone(),
             ts_ms: ipc::events::now_ms(),
         };
         if self.peer_delivery_ready.contains(&target_id) {
             self.emit_peer_inbox(target_id, message);
-            Ok(ipc::PeerSendOutcome::Delivered)
+            let outcome = ipc::PeerSendOutcome::Delivered;
+            self.record_peer_send(target_id, from_pane, &body, outcome);
+            Ok(outcome)
         } else {
             let queue = self.pending_peer_inbox.entry(target_id).or_default();
             let retained_bytes: usize = queue.iter().map(|item| item.body.len()).sum();
             if queue.len() >= PENDING_PEER_INBOX_MAX_MESSAGES
                 || retained_bytes.saturating_add(message.body.len()) > PENDING_PEER_INBOX_MAX_BYTES
             {
-                self.recent_peer_sends
-                    .remove(&(target_id, from_pane, message.body.clone()));
                 return Err(ipc::CodedError::new(
                     ipc::err_code::PEER_QUEUE_FULL,
                     format!("peer inbox queue for pane {target_id} is full"),
                 ));
             }
             queue.push_back(message);
-            Ok(ipc::PeerSendOutcome::Queued)
+            let outcome = ipc::PeerSendOutcome::Queued;
+            self.record_peer_send(target_id, from_pane, &body, outcome);
+            Ok(outcome)
         }
     }
 
@@ -420,29 +414,41 @@ impl App {
         });
     }
 
-    /// Return true when an identical (target, from, body) peer send
-    /// arrived within [`PEER_SEND_DEDUPE_TTL`]. A side effect
-    /// records the new send so future calls compare against it,
+    /// Return the original outcome when an identical (target, from, body)
+    /// peer send arrived within [`PEER_SEND_DEDUPE_TTL`].
     /// and stale entries (older than the TTL) are evicted on every
     /// call so the map can't grow unbounded under heavy traffic.
-    fn is_duplicate_peer_send(&mut self, target: usize, from: usize, body: &str) -> bool {
+    fn duplicate_peer_send_outcome(
+        &mut self,
+        target: usize,
+        from: usize,
+        body: &str,
+    ) -> Option<ipc::PeerSendOutcome> {
         let now = Instant::now();
         self.recent_peer_sends
-            .retain(|_, ts| now.duration_since(*ts) < PEER_SEND_DEDUPE_TTL);
+            .retain(|_, (ts, _)| now.duration_since(*ts) < PEER_SEND_DEDUPE_TTL);
         let key = (target, from, body.to_string());
         match self.recent_peer_sends.get(&key).copied() {
-            Some(prev) if now.duration_since(prev) < PEER_SEND_DEDUPE_TTL => {
+            Some((prev, outcome)) if now.duration_since(prev) < PEER_SEND_DEDUPE_TTL => {
                 // Refresh the timestamp so a chatty sender keeps
                 // getting its retries collapsed instead of slipping
                 // a duplicate through right at the TTL boundary.
-                self.recent_peer_sends.insert(key, now);
-                true
+                self.recent_peer_sends.insert(key, (now, outcome));
+                Some(outcome)
             }
-            _ => {
-                self.recent_peer_sends.insert(key, now);
-                false
-            }
+            _ => None,
         }
+    }
+
+    fn record_peer_send(
+        &mut self,
+        target: usize,
+        from: usize,
+        body: &str,
+        outcome: ipc::PeerSendOutcome,
+    ) {
+        self.recent_peer_sends
+            .insert((target, from, body.to_string()), (Instant::now(), outcome));
     }
 
     pub(crate) fn handle_peer_register_client(
