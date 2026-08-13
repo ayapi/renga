@@ -133,6 +133,8 @@ struct PushState {
     pending: VecDeque<Value>,
 }
 
+const PUSH_PENDING_CAP: usize = 256;
+
 type PushSink = Arc<Mutex<PushState>>;
 
 /// Runtime context shared between the main stdio loop and the inbox
@@ -321,6 +323,13 @@ where
 {
     let mut state = ctx.push.lock().unwrap_or_else(|p| p.into_inner());
     if !state.initialized {
+        if state.pending.len() >= PUSH_PENDING_CAP {
+            // PeerInbox delivery stays queued in the App until push
+            // initialization, so this cap normally only affects repeated
+            // diagnostic notices such as EventsDropped before initialization.
+            log_stderr("push notification buffer full before initialized; dropping newest notice");
+            return;
+        }
         state.pending.push_back(value);
         return;
     }
@@ -2466,6 +2475,9 @@ fn dispatch(req: &Value, ctx: &PeerCtx) -> Result<Vec<Value>> {
         // Lifecycle notifications are accepted silently; unknown ones logged.
         if matches!(method, "notifications/initialized" | "initialized") {
             mark_push_initialized(ctx);
+            if ctx.client_kind.receive_mode() == ipc::PeerReceiveMode::Push {
+                set_client_ready(ctx, true);
+            }
         } else if !matches!(method, "notifications/cancelled" | "$/cancel") {
             log_stderr(&format!("ignored unknown notification: {method}"));
         }
@@ -2562,7 +2574,9 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                 || {
                     subscribed_on_ready.store(true, std::sync::atomic::Ordering::Release);
                     register_client_kind(&registration_ctx);
-                    set_client_ready(&registration_ctx, true);
+                    if registration_ctx.client_kind.receive_mode() == ipc::PeerReceiveMode::Pull {
+                        set_client_ready(&registration_ctx, true);
+                    }
                 },
                 |event| {
                 // Buffer lifecycle events for `poll_events` before we
@@ -2730,6 +2744,21 @@ mod tests {
         let state = ctx.push.lock().unwrap();
         assert!(state.initialized);
         assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn pre_initialized_push_buffer_is_bounded() {
+        let ctx = connected_ctx_with(new_event_sink());
+        for n in 0..(PUSH_PENDING_CAP + 1) {
+            deliver_push_frame_with(&ctx, json!({ "sequence": n }), |_| Ok(()));
+        }
+        let state = ctx.push.lock().unwrap();
+        assert_eq!(state.pending.len(), PUSH_PENDING_CAP);
+        assert_eq!(state.pending.front(), Some(&json!({ "sequence": 0 })));
+        assert_eq!(
+            state.pending.back(),
+            Some(&json!({ "sequence": PUSH_PENDING_CAP - 1 }))
+        );
     }
 
     #[test]
