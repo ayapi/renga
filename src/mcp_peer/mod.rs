@@ -312,25 +312,37 @@ fn write_frame(value: &Value) -> Result<()> {
 }
 
 fn deliver_push_frame(ctx: &PeerCtx, value: Value) {
+    deliver_push_frame_with(ctx, value, write_frame);
+}
+
+fn deliver_push_frame_with<F>(ctx: &PeerCtx, value: Value, mut emit: F)
+where
+    F: FnMut(&Value) -> Result<()>,
+{
     let mut state = ctx.push.lock().unwrap_or_else(|p| p.into_inner());
     if !state.initialized {
         state.pending.push_back(value);
         return;
     }
-    drop(state);
-    if let Err(e) = write_frame(&value) {
+    // Keep the push lock through the write so a concurrent initialized
+    // flush cannot be overtaken by a newly arrived notification.
+    if let Err(e) = emit(&value) {
         log_stderr(&format!("failed to push channel notification: {e}"));
     }
 }
 
 fn mark_push_initialized(ctx: &PeerCtx) {
-    let pending = {
-        let mut state = ctx.push.lock().unwrap_or_else(|p| p.into_inner());
-        state.initialized = true;
-        state.pending.drain(..).collect::<Vec<_>>()
-    };
-    for value in pending {
-        if let Err(e) = write_frame(&value) {
+    mark_push_initialized_with(ctx, write_frame);
+}
+
+fn mark_push_initialized_with<F>(ctx: &PeerCtx, mut emit: F)
+where
+    F: FnMut(&Value) -> Result<()>,
+{
+    let mut state = ctx.push.lock().unwrap_or_else(|p| p.into_inner());
+    state.initialized = true;
+    while let Some(value) = state.pending.pop_front() {
+        if let Err(e) = emit(&value) {
             log_stderr(&format!("failed to flush channel notification: {e}"));
         }
     }
@@ -2698,6 +2710,26 @@ mod tests {
         let state = ctx.push.lock().unwrap();
         assert!(!state.initialized);
         assert_eq!(state.pending.front(), Some(&notification));
+    }
+
+    #[test]
+    fn initialized_flush_preserves_buffered_fifo_order() {
+        let ctx = connected_ctx_with(new_event_sink());
+        let first = channel_notification("first", "2", None);
+        let second = channel_notification("second", "2", None);
+        deliver_push_frame(&ctx, first.clone());
+        deliver_push_frame(&ctx, second.clone());
+
+        let mut emitted = Vec::new();
+        mark_push_initialized_with(&ctx, |value| {
+            emitted.push(value.clone());
+            Ok(())
+        });
+
+        assert_eq!(emitted, vec![first, second]);
+        let state = ctx.push.lock().unwrap();
+        assert!(state.initialized);
+        assert!(state.pending.is_empty());
     }
 
     #[test]
