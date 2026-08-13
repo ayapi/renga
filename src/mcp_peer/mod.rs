@@ -2576,6 +2576,7 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
             let mut consecutive_failures = 0u32;
             let mut retry_delay = Duration::from_millis(250);
             loop {
+                let attempt_started = Instant::now();
                 let subscribed = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let subscribed_on_ready = subscribed.clone();
                 let result = client::subscribe_events_with_ready(
@@ -2680,6 +2681,12 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                 },
             );
                 let was_subscribed = subscribed.load(std::sync::atomic::Ordering::Acquire);
+                (consecutive_failures, retry_delay) = subscription_retry_state_after_attempt(
+                    consecutive_failures,
+                    retry_delay,
+                    was_subscribed,
+                    attempt_started.elapsed(),
+                );
                 if was_subscribed {
                     if registration_ctx.client_kind.receive_mode() == ipc::PeerReceiveMode::Push {
                         mark_push_subscribed(&registration_ctx, false);
@@ -2723,6 +2730,19 @@ fn should_buffer_for_poll(event: &ipc::Event) -> bool {
 
 fn next_subscription_retry_delay(current: Duration) -> Duration {
     (current * 2).min(Duration::from_secs(30))
+}
+
+fn subscription_retry_state_after_attempt(
+    consecutive_failures: u32,
+    retry_delay: Duration,
+    was_subscribed: bool,
+    lifetime: Duration,
+) -> (u32, Duration) {
+    if was_subscribed && lifetime >= Duration::from_secs(30) {
+        (0, Duration::from_millis(250))
+    } else {
+        (consecutive_failures, retry_delay)
+    }
 }
 
 #[cfg(test)]
@@ -2807,6 +2827,28 @@ mod tests {
         assert_eq!(
             next_subscription_retry_delay(Duration::from_secs(30)),
             Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn healthy_subscription_resets_retry_state() {
+        assert_eq!(
+            subscription_retry_state_after_attempt(
+                9,
+                Duration::from_secs(30),
+                true,
+                Duration::from_secs(30),
+            ),
+            (0, Duration::from_millis(250))
+        );
+        assert_eq!(
+            subscription_retry_state_after_attempt(
+                9,
+                Duration::from_secs(30),
+                true,
+                Duration::from_secs(29),
+            ),
+            (9, Duration::from_secs(30))
         );
     }
 
