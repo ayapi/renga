@@ -2540,10 +2540,15 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
     thread::Builder::new()
         .name("renga-mcp-peer-inbox".into())
         .spawn(move || {
+            let mut consecutive_failures = 0u32;
+            let mut retry_delay = Duration::from_millis(250);
             loop {
+                let subscribed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let subscribed_on_ready = subscribed.clone();
                 let result = client::subscribe_events_with_ready(
                 &endpoint_clone,
                 || {
+                    subscribed_on_ready.store(true, std::sync::atomic::Ordering::Release);
                     register_client_kind(&registration_ctx);
                     set_client_ready(&registration_ctx, true);
                 },
@@ -2634,12 +2639,29 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                     true
                 },
             );
-                set_client_ready(&registration_ctx, false);
-                match result {
-                    Ok(()) => log_stderr("event stream closed; retrying"),
-                    Err(e) => log_stderr(&format!("event subscription ended: {e}; retrying")),
+                let was_subscribed = subscribed.load(std::sync::atomic::Ordering::Acquire);
+                if was_subscribed {
+                    set_client_ready(&registration_ctx, false);
+                    consecutive_failures = 0;
+                    retry_delay = Duration::from_millis(250);
+                    log_stderr("event stream closed; retrying");
+                } else {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures.is_power_of_two() {
+                        match &result {
+                            Ok(()) => log_stderr(&format!(
+                                "event subscription closed before ready; retry {consecutive_failures} in {retry_delay:?}"
+                            )),
+                            Err(e) => log_stderr(&format!(
+                                "event subscription unavailable: {e}; retry {consecutive_failures} in {retry_delay:?}"
+                            )),
+                        }
+                    }
                 }
-                thread::sleep(Duration::from_millis(250));
+                thread::sleep(retry_delay);
+                if !was_subscribed {
+                    retry_delay = next_subscription_retry_delay(retry_delay);
+                }
             }
         })
         .expect("spawn inbox subscriber thread");
@@ -2653,6 +2675,10 @@ fn should_buffer_for_poll(event: &ipc::Event) -> bool {
         event,
         ipc::Event::Heartbeat { .. } | ipc::Event::PeerInbox { .. }
     )
+}
+
+fn next_subscription_retry_delay(current: Duration) -> Duration {
+    (current * 2).min(Duration::from_secs(30))
 }
 
 #[cfg(test)]
@@ -2674,6 +2700,22 @@ mod tests {
         let state = ctx.push.lock().unwrap();
         assert!(!state.initialized);
         assert_eq!(state.pending.front(), Some(&notification));
+    }
+
+    #[test]
+    fn subscription_retry_backoff_doubles_and_caps() {
+        assert_eq!(
+            next_subscription_retry_delay(Duration::from_millis(250)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            next_subscription_retry_delay(Duration::from_secs(20)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            next_subscription_retry_delay(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]
