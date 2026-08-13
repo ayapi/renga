@@ -71,6 +71,9 @@ after that subscriber reports readiness, in original send order.
 The pre-registration queue is per pane and bounded to 128 messages / 1 MiB of
 body text. A send that would exceed either cap fails with
 `peer_queue_full` instead of claiming successful retention.
+The 1 MiB cap intentionally applies only while the target is not ready,
+because queued bodies consume App memory; an immediately delivered body is
+not retained there and therefore does not consume that queue budget.
 
 **Detached fallback (frozen prefix)**: `"(message dropped — renga not
 reachable: <reason>)"`.
@@ -424,8 +427,9 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | `subscribe` | — | Switches to event-stream mode after ack. |
 | `inspect` | `target: PaneRef`, `lines?`, `include_cursor: bool` (default false) | |
 | `peer_list` | `from_pane: usize` | |
-| `peer_send` | `from_pane: usize`, `target: PaneRef`, `body: string` | Cross-tab silently no-ops (Q5). |
+| `peer_send` | `from_pane: usize`, `target: PaneRef`, `body: string` | Cross-tab silently no-ops (Q5). Ok data is `{ "delivery": "delivered"\|"queued" }`. |
 | `peer_register_client` | `pane_id: usize`, `kind: claude\|codex` | Posted by `renga mcp-peer` on startup. |
+| `peer_set_ready` | `pane_id: usize`, `kind: claude\|codex`, `ready: bool` | Internal peer lifecycle update. `ready=true` means the event subscriber can receive; for push clients this is sent only after MCP initialization. Kind is repeated atomically with readiness. |
 | `set_pane_identity` | `target: PaneRef`, `name?`, `role?` (three-state: missing / null / value) | Uses serde `double_option`. |
 | `set_summary` | `from_pane: usize`, `summary: string` | Empty `summary` clears. >256 `chars` rejected with `summary_too_long`. |
 
@@ -441,6 +445,10 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | `hello` | `server_pid: u32`, `session_token: string` | Reply to `Hello` only. |
 | `subscribed` | — | Ack of `Subscribe`; event lines follow on same connection. |
 | `err` | `message: string`, `code?: string` | Failure. `code` is `Option<String>` with `skip_serializing_if = "Option::is_none"`. |
+
+Request-specific `ok.data` shapes include
+`peer_send: { "delivery": "delivered" | "queued" }`; lifecycle setters such
+as `peer_register_client` and `peer_set_ready` return `null`.
 
 `PaneInfo` payload (used by `list` data, `set_pane_identity` ok data, embedded
 in `peer_list` data):
