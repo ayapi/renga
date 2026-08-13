@@ -84,10 +84,12 @@ deferred to a future minor release.
 
 **Same-payload dedupe (post-1.1)**: identical `(target, sender, body)` triples
 arriving within a small dedupe window (~5s) are collapsed server-side to a
-single delivery. The repeat call still returns `"Delivered to …"` so the
-sender cannot probe the dedupe state; only one `Event::PeerInbox` reaches
-the receiver. Two distinct senders sending the same body still both
-deliver. See renga#221 for context.
+single delivery. A repeat call returns the same outcome as the original call:
+`"Delivered to …"` for an immediately delivered message, or `"Queued for …"`
+for a message accepted into the peer's pending queue. This prevents the sender
+from probing the dedupe state; only one `Event::PeerInbox` reaches the receiver.
+Two distinct senders sending the same body still both deliver. See renga#221
+for context.
 
 **Push-mode body banner (post-1.1)**: for Claude (push) recipients renga
 prepends a `📡 PEER MESSAGE — from {name} (id={id}) — NOT FROM USER` line
