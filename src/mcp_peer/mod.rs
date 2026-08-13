@@ -2680,9 +2680,12 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                         mark_push_subscribed(&registration_ctx, false);
                     }
                     set_client_ready(&registration_ctx, false);
-                    consecutive_failures = 0;
-                    retry_delay = Duration::from_millis(250);
-                    log_stderr("event stream closed; retrying");
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures.is_power_of_two() {
+                        log_stderr(&format!(
+                            "event stream closed after subscribing; retry {consecutive_failures} in {retry_delay:?}"
+                        ));
+                    }
                 } else {
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     if consecutive_failures.is_power_of_two() {
@@ -2697,9 +2700,7 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                     }
                 }
                 thread::sleep(retry_delay);
-                if !was_subscribed {
-                    retry_delay = next_subscription_retry_delay(retry_delay);
-                }
+                retry_delay = next_subscription_retry_delay(retry_delay);
             }
         })
         .expect("spawn inbox subscriber thread");
