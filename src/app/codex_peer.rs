@@ -368,7 +368,11 @@ impl App {
                 && self.workspaces[target_ws].focus_target == FocusTarget::Pane
                 && self.workspaces[target_ws].focused_pane_id == target_id;
             if target_is_focused {
-                self.route_focused_codex_peer_message(target_id, message)?;
+                if let Err(err) = self.route_focused_codex_peer_message(target_id, message) {
+                    self.recent_peer_sends
+                        .remove(&(target_id, from_pane, body.clone()));
+                    return Err(err);
+                }
             } else {
                 self.push_pending_codex_peer_nudge(target_id, message);
             }
