@@ -2583,9 +2583,14 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                 || {
                     subscribed_on_ready.store(true, std::sync::atomic::Ordering::Release);
                     register_client_kind(&registration_ctx);
-                    if registration_ctx.client_kind.receive_mode() == ipc::PeerReceiveMode::Pull {
-                        set_client_ready(&registration_ctx, true);
-                    } else if mark_push_subscribed(&registration_ctx, true) {
+                    let ready = if registration_ctx.client_kind.receive_mode()
+                        == ipc::PeerReceiveMode::Pull
+                    {
+                        true
+                    } else {
+                        mark_push_subscribed(&registration_ctx, true)
+                    };
+                    if ready {
                         set_client_ready(&registration_ctx, true);
                     }
                 },
