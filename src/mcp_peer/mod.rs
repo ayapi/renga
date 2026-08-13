@@ -2624,9 +2624,7 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                             });
                         } else {
                             let note = channel_notification(&body, "renga", Some("renga runtime"));
-                            if let Err(e) = write_frame(&note) {
-                                log_stderr(&format!("failed to push drop notice: {e}"));
-                            }
+                            deliver_push_frame(&registration_ctx, note);
                         }
                     }
                     // PaneStarted / PaneExited / Heartbeat / other
