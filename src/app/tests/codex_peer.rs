@@ -1582,6 +1582,34 @@ fn handle_peer_send_dedupes_identical_payload_within_window() {
 }
 
 #[test]
+fn duplicate_for_unready_peer_still_reports_queued() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+
+    let first = app
+        .handle_peer_send(sender_id, &ipc::PaneRef::Id(sibling_id), "same".to_string())
+        .expect("first send");
+    let duplicate = app
+        .handle_peer_send(sender_id, &ipc::PaneRef::Id(sibling_id), "same".to_string())
+        .expect("duplicate send");
+
+    assert_eq!(first, ipc::PeerSendOutcome::Queued);
+    assert_eq!(duplicate, ipc::PeerSendOutcome::Queued);
+    assert_eq!(app.pending_peer_inbox[&sibling_id].len(), 1);
+    app.shutdown();
+}
+
+#[test]
 fn handle_peer_send_distinct_bodies_are_not_deduped() {
     // Sanity check: dedupe is keyed on body, so two genuinely
     // distinct messages must both go through. Without this, the

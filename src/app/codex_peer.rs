@@ -347,7 +347,11 @@ impl App {
             // transcript with phantom Human: turns. The sender
             // gets a successful Ok() reply so it can't probe the
             // dedupe state. (renga#221)
-            return Ok(ipc::PeerSendOutcome::Delivered);
+            return Ok(if self.peer_delivery_ready.contains(&target_id) {
+                ipc::PeerSendOutcome::Delivered
+            } else {
+                ipc::PeerSendOutcome::Queued
+            });
         }
         self.materialize_unfocused_codex_peer_notification();
         let from_name = self.workspaces[sender_ws]
