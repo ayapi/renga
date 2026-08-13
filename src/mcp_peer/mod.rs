@@ -131,6 +131,7 @@ fn set_client_ready(ctx: &PeerCtx, ready: bool) {
 #[derive(Default)]
 struct PushState {
     initialized: bool,
+    subscribed: bool,
     pending: VecDeque<Value>,
 }
 
@@ -341,11 +342,11 @@ where
     }
 }
 
-fn mark_push_initialized(ctx: &PeerCtx) {
-    mark_push_initialized_with(ctx, write_frame);
+fn mark_push_initialized(ctx: &PeerCtx) -> bool {
+    mark_push_initialized_with(ctx, write_frame)
 }
 
-fn mark_push_initialized_with<F>(ctx: &PeerCtx, mut emit: F)
+fn mark_push_initialized_with<F>(ctx: &PeerCtx, mut emit: F) -> bool
 where
     F: FnMut(&Value) -> Result<()>,
 {
@@ -356,6 +357,13 @@ where
             log_stderr(&format!("failed to flush channel notification: {e}"));
         }
     }
+    state.subscribed
+}
+
+fn mark_push_subscribed(ctx: &PeerCtx, subscribed: bool) -> bool {
+    let mut state = ctx.push.lock().unwrap_or_else(|p| p.into_inner());
+    state.subscribed = subscribed;
+    state.initialized && state.subscribed
 }
 
 fn ok_response(id: &Value, result: Value) -> Value {
@@ -2475,8 +2483,8 @@ fn dispatch(req: &Value, ctx: &PeerCtx) -> Result<Vec<Value>> {
     if is_notification {
         // Lifecycle notifications are accepted silently; unknown ones logged.
         if matches!(method, "notifications/initialized" | "initialized") {
-            mark_push_initialized(ctx);
-            if ctx.client_kind.receive_mode() == ipc::PeerReceiveMode::Push {
+            let subscribed = mark_push_initialized(ctx);
+            if ctx.client_kind.receive_mode() == ipc::PeerReceiveMode::Push && subscribed {
                 set_client_ready(ctx, true);
             }
         } else if !matches!(method, "notifications/cancelled" | "$/cancel") {
@@ -2577,6 +2585,8 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                     register_client_kind(&registration_ctx);
                     if registration_ctx.client_kind.receive_mode() == ipc::PeerReceiveMode::Pull {
                         set_client_ready(&registration_ctx, true);
+                    } else if mark_push_subscribed(&registration_ctx, true) {
+                        set_client_ready(&registration_ctx, true);
                     }
                 },
                 |event| {
@@ -2666,6 +2676,9 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
             );
                 let was_subscribed = subscribed.load(std::sync::atomic::Ordering::Acquire);
                 if was_subscribed {
+                    if registration_ctx.client_kind.receive_mode() == ipc::PeerReceiveMode::Push {
+                        mark_push_subscribed(&registration_ctx, false);
+                    }
                     set_client_ready(&registration_ctx, false);
                     consecutive_failures = 0;
                     retry_delay = Duration::from_millis(250);
@@ -2736,15 +2749,28 @@ mod tests {
         deliver_push_frame(&ctx, second.clone());
 
         let mut emitted = Vec::new();
-        mark_push_initialized_with(&ctx, |value| {
+        let ready = mark_push_initialized_with(&ctx, |value| {
             emitted.push(value.clone());
             Ok(())
         });
 
+        assert!(!ready, "initialization alone is not delivery readiness");
         assert_eq!(emitted, vec![first, second]);
         let state = ctx.push.lock().unwrap();
         assert!(state.initialized);
         assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn push_readiness_requires_initialized_and_subscribed_in_either_order() {
+        let initialized_first = connected_ctx_with(new_event_sink());
+        assert!(!mark_push_initialized_with(&initialized_first, |_| Ok(())));
+        assert!(mark_push_subscribed(&initialized_first, true));
+
+        let subscribed_first = connected_ctx_with(new_event_sink());
+        assert!(!mark_push_subscribed(&subscribed_first, true));
+        assert!(mark_push_initialized_with(&subscribed_first, |_| Ok(())));
+        assert!(!mark_push_subscribed(&subscribed_first, false));
     }
 
     #[test]
