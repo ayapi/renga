@@ -197,6 +197,33 @@ impl App {
         Some(Rect::new(min_x, min_y, max_x - min_x, max_y - min_y))
     }
 
+    /// Return the pane scrollbar under this cell. Scrollbars live on a
+    /// pane's right border, so they must be classified before shared-divider
+    /// and outer-edge gestures that use the same cell. This keeps scrolling
+    /// usable on the left side of a vertical split and prevents a repeated
+    /// scrollbar click from being interpreted as a split gesture.
+    fn pane_scrollbar_at(&self, col: u16, row: u16) -> Option<(usize, Rect)> {
+        self.ws()
+            .last_pane_rects
+            .iter()
+            .copied()
+            .find_map(|(pane_id, rect)| {
+                let inner = Rect::new(
+                    rect.x.saturating_add(1),
+                    rect.y.saturating_add(1),
+                    rect.width.saturating_sub(2),
+                    rect.height.saturating_sub(2),
+                );
+                let scrollbar_col = inner.x.saturating_add(inner.width);
+                (inner.width > 0
+                    && inner.height > 0
+                    && col == scrollbar_col
+                    && row >= inner.y
+                    && row < inner.y.saturating_add(inner.height))
+                .then_some((pane_id, inner))
+            })
+    }
+
     /// If `(col, row)` lands on a shared internal split divider, return
     /// the [`DragTarget::PaneSplit`] that would resize it. Honors each
     /// divider's perpendicular span so a nested divider only claims the
@@ -360,6 +387,20 @@ impl App {
                 }
                 if self.is_on_preview_border(col) {
                     self.dragging = Some(DragTarget::PreviewBorder);
+                    self.last_edge_click = None;
+                    self.last_boundary_click = None;
+                    return;
+                }
+
+                // The scrollbar shares the pane's right-border cell with
+                // split-resize and outer-edge gestures. When present, its
+                // direct manipulation takes precedence over those gestures.
+                if let Some((pane_id, inner)) = self.pane_scrollbar_at(col, row) {
+                    self.ws_mut().focused_pane_id = pane_id;
+                    self.ws_mut().focus_target = FocusTarget::Pane;
+                    self.flush_pending_codex_peer_messages();
+                    self.scroll_pane_to_click(pane_id, row, &inner);
+                    self.dragging = Some(DragTarget::Scrollbar(pane_id, inner));
                     self.last_edge_click = None;
                     self.last_boundary_click = None;
                     return;
@@ -533,19 +574,6 @@ impl App {
                             return;
                         }
 
-                        // The scrollbar is painted over the right border so
-                        // the final terminal content column remains usable.
-                        let scrollbar_col = rect.x + rect.width - 1;
-                        if col == scrollbar_col {
-                            let inner = Rect::new(
-                                rect.x + 1,
-                                rect.y + 1,
-                                rect.width.saturating_sub(2),
-                                rect.height.saturating_sub(2),
-                            );
-                            self.scroll_pane_to_click(pane_id, row, &inner);
-                            self.dragging = Some(DragTarget::Scrollbar(pane_id, inner));
-                        }
                         return;
                     }
                 }
