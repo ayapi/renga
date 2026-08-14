@@ -335,18 +335,21 @@ fn normalize_codex_composer_expected(text: &str) -> String {
 
 fn normalized_screen_rows(screen: &vt100::Screen, start: u16, end: u16) -> String {
     let (_, cols) = screen.size();
-    let mut text = String::new();
-    for row in start..end {
-        for col in 0..cols {
-            if let Some(cell) = screen.cell(row, col) {
-                text.push_str(cell.contents());
+    (start..end)
+        .map(|row| {
+            let mut text = String::new();
+            for col in 0..cols {
+                if let Some(cell) = screen.cell(row, col) {
+                    text.push_str(cell.contents());
+                }
             }
-        }
-    }
-    text.chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase()
+            text.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn codex_peer_screen_snapshot(screen: &vt100::Screen) -> CodexPeerScreenSnapshot {

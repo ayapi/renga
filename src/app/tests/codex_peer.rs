@@ -1452,6 +1452,32 @@ fn busy_codex_uses_positioned_interrupt_hint_without_working_label() {
 }
 
 #[test]
+fn split_transcript_words_do_not_form_busy_signal_across_rows() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[HTo stop a run you press Esc to\x1b[2;1Hinterrupt it, then retry.\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[4;3H",
+    );
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "row separator".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt(_))
+    ));
+    app.shutdown();
+}
+
+#[test]
 fn busy_codex_nudge_submits_if_turn_finishes_before_tab() {
     let mut app = App::new(40, 160).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
