@@ -179,6 +179,26 @@ fn looks_like_codex_placeholder(text: &str) -> bool {
         || normalized.eq_ignore_ascii_case("Ask Codex anything")
 }
 
+fn screen_row_has_visible_text(screen: &vt100::Screen, row: u16, cols: u16) -> bool {
+    (0..cols).any(|col| {
+        screen
+            .cell(row, col)
+            .is_some_and(|cell| !cell.contents().trim().is_empty())
+    })
+}
+
+fn cursor_is_on_codex_footer(
+    screen: &vt100::Screen,
+    prompt_row: u16,
+    cursor_row: u16,
+    cols: u16,
+) -> bool {
+    cursor_row > prompt_row.saturating_add(1)
+        && screen_row_has_visible_text(screen, cursor_row, cols)
+        && (prompt_row.saturating_add(1)..cursor_row)
+            .all(|row| !screen_row_has_visible_text(screen, row, cols))
+}
+
 pub(crate) fn codex_composer_has_draft_on_screen(screen: &vt100::Screen) -> Option<bool> {
     let (rows, cols) = screen.size();
     let (cursor_row, cursor_col) = screen.cursor_position();
@@ -223,7 +243,7 @@ pub(crate) fn codex_composer_has_draft_on_screen(screen: &vt100::Screen) -> Opti
         } else {
             input_start
         };
-        if cursor_row > row {
+        if cursor_row > row && !cursor_is_on_codex_footer(screen, row, cursor_row, cols) {
             return Some(true);
         }
         if cursor_row == row {

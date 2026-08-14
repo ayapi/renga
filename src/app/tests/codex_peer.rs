@@ -33,7 +33,7 @@ fn seed_codex_busy_placeholder(app: &mut App, pane_id: usize) {
     seed_pane_screen(
         app,
         pane_id,
-        b"\x1b[?25h\x1b[2J\x1b[HWorking (1m 03s - esc to interrupt; tab to queue message)\x1b[4;1H\xE2\x80\xBA Improve documentation in @filename\x1b[6;1H  gpt-5.6 high\x1b[4;3H",
+        b"\x1b[?25h\x1b[2J\x1b[HWorking (1m 03s - esc to interrupt; tab to queue message)\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6 high\x1b[6;20H",
     );
 }
 
@@ -1617,6 +1617,32 @@ fn codex_composer_draft_uses_cursor_position_on_prompt_row() {
 fn codex_composer_draft_uses_cursor_position_below_prompt_row() {
     let mut parser = vt100::Parser::new(40, 80, 0);
     parser.process(b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA \nsecond line\x1b[2;12H");
+
+    assert_eq!(
+        codex_composer_has_draft_on_screen(parser.screen()),
+        Some(true)
+    );
+}
+
+#[test]
+fn codex_empty_composer_ignores_cursor_parked_on_footer() {
+    let mut parser = vt100::Parser::new(40, 80, 0);
+    parser.process(
+        b"\x1b[?25h\x1b[2J\x1b[HWorking (8s - tab to queue message)\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6 high\x1b[6;20H",
+    );
+
+    assert_eq!(
+        codex_composer_has_draft_on_screen(parser.screen()),
+        Some(false)
+    );
+}
+
+#[test]
+fn codex_real_draft_remains_protected_with_cursor_parked_on_footer() {
+    let mut parser = vt100::Parser::new(40, 80, 0);
+    parser.process(
+        b"\x1b[?25h\x1b[2J\x1b[HWorking (8s - tab to queue message)\x1b[4;1H\xE2\x80\xBA keep my draft\x1b[6;1H  gpt-5.6 high\x1b[6;20H",
+    );
 
     assert_eq!(
         codex_composer_has_draft_on_screen(parser.screen()),
