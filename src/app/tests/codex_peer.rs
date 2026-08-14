@@ -1787,9 +1787,6 @@ fn native_queue_commit_does_not_send_changed_user_draft() {
 
     app.flush_pending_codex_peer_messages();
 
-    // With enough wrapped rows to move the footer outside its measured range,
-    // the exact-composer snapshot is also unavailable. Both checks therefore
-    // degrade to a pending QueueAt instead of ever selecting Enter.
     assert!(app
         .ws()
         .panes
@@ -1838,6 +1835,14 @@ fn queue_hint_outside_footer_range_never_falls_through_to_enter() {
         "\x1b[{footer_row};1H  tab to queue message  51% context left\x1b[4;3H"
     ));
     seed_pane_screen(&mut app, codex_id, screen.as_bytes());
+    {
+        let pane = app.ws().panes.get(&codex_id).expect("pane");
+        let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            normalized_codex_composer_text(parser.screen()),
+            Some(expected.chars().filter(|ch| !ch.is_whitespace()).collect())
+        );
+    }
     app.ws_mut()
         .panes
         .get_mut(&codex_id)
@@ -1847,6 +1852,8 @@ fn queue_hint_outside_footer_range_never_falls_through_to_enter() {
 
     app.flush_pending_codex_peer_messages();
 
+    // The composer matches exactly, so remaining pending here specifically
+    // verifies that a footer outside the measured range cannot select a key.
     assert!(app
         .ws()
         .panes
