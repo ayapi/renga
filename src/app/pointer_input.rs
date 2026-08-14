@@ -391,24 +391,22 @@ impl App {
                     self.last_boundary_click = None;
                     return;
                 }
+                if self.is_on_preview_border(col) {
+                    self.dragging = Some(DragTarget::PreviewBorder);
+                    self.last_edge_click = None;
+                    self.last_boundary_click = None;
+                    return;
+                }
 
                 // The scrollbar shares the pane's right-border cell with
-                // split-resize, outer-edge, and a right-side preview's resize
-                // hit area. When present, its direct manipulation takes
-                // precedence; the preview's own border cell remains free.
+                // split-resize and outer-edge gestures. When present, its
+                // direct manipulation takes precedence over those gestures.
                 if let Some((pane_id, inner)) = self.pane_scrollbar_at(col, row) {
                     self.ws_mut().focused_pane_id = pane_id;
                     self.ws_mut().focus_target = FocusTarget::Pane;
                     self.flush_pending_codex_peer_messages();
                     self.scroll_pane_to_click(pane_id, row, &inner);
                     self.dragging = Some(DragTarget::Scrollbar(pane_id, inner));
-                    self.last_edge_click = None;
-                    self.last_boundary_click = None;
-                    return;
-                }
-
-                if self.is_on_preview_border(col) {
-                    self.dragging = Some(DragTarget::PreviewBorder);
                     self.last_edge_click = None;
                     self.last_boundary_click = None;
                     return;
@@ -839,12 +837,12 @@ impl App {
                 let old_hover = self.hover_border.clone();
                 if self.is_on_file_tree_border(col) {
                     self.hover_border = Some(DragTarget::FileTreeBorder);
+                } else if self.is_on_preview_border(col) {
+                    self.hover_border = Some(DragTarget::PreviewBorder);
                 } else if let Some((pane_id, inner)) = self.pane_scrollbar_at(col, row) {
                     // Match the press priority: do not advertise split resize
                     // on a cell whose click manipulates the scrollbar.
                     self.hover_border = Some(DragTarget::Scrollbar(pane_id, inner));
-                } else if self.is_on_preview_border(col) {
-                    self.hover_border = Some(DragTarget::PreviewBorder);
                 } else {
                     // Tint the shared internal divider under the cursor
                     // so it reads as draggable / double-clickable, the
