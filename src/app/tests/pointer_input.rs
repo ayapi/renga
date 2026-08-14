@@ -621,6 +621,43 @@ fn visible_scrollbar_hover_does_not_advertise_split_resize() {
 }
 
 #[test]
+fn visible_scrollbar_wins_over_right_side_preview_resize_hit_area() {
+    let (mut app, _a_id, b_id) = two_pane_vertical_app();
+    make_scrollbar_visible(&app, b_id);
+    app.layout_swapped = false;
+    app.ws_mut().last_preview_rect = Some(Rect::new(100, 0, 30, 40));
+
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        99,
+        20,
+    ));
+
+    assert!(matches!(
+        app.dragging,
+        Some(DragTarget::Scrollbar(id, _)) if id == b_id
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn right_side_preview_own_border_still_starts_resize() {
+    let (mut app, _a_id, b_id) = two_pane_vertical_app();
+    make_scrollbar_visible(&app, b_id);
+    app.layout_swapped = false;
+    app.ws_mut().last_preview_rect = Some(Rect::new(100, 0, 30, 40));
+
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        100,
+        20,
+    ));
+
+    assert!(matches!(app.dragging, Some(DragTarget::PreviewBorder)));
+    app.shutdown();
+}
+
+#[test]
 fn boundary_double_click_splits_between_siblings() {
     let (mut app, a_id, b_id) = two_pane_vertical_app();
     assert_eq!(app.ws().layout.pane_count(), 2);
