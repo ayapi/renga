@@ -1610,6 +1610,43 @@ fn duplicate_for_unready_peer_still_reports_queued() {
 }
 
 #[test]
+fn spawned_codex_command_without_peer_registration_reports_queued() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let target_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            Some("codex".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+
+    let peers = app.handle_peer_list(sender_id).expect("peer list succeeds");
+    let target = peers
+        .iter()
+        .find(|peer| peer.id == target_id)
+        .expect("spawned pane is listed");
+    assert_eq!(target.kind, None);
+    assert_eq!(target.receive_mode, None);
+    assert!(!app.peer_delivery_ready.contains(&target_id));
+
+    let outcome = app
+        .handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(target_id),
+            "test message".to_string(),
+        )
+        .expect("send succeeds");
+
+    assert_eq!(outcome, ipc::PeerSendOutcome::Queued);
+    assert_eq!(app.pending_peer_inbox[&target_id].len(), 1);
+    app.shutdown();
+}
+
+#[test]
 fn delivered_duplicate_replays_delivered_after_disconnect() {
     let mut app = App::new(40, 80).expect("App::new");
     let sender_id = app.ws().focused_pane_id;

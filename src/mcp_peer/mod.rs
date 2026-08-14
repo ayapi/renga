@@ -949,6 +949,20 @@ fn receive_mode_label(mode: ipc::PeerReceiveMode) -> &'static str {
     }
 }
 
+fn peer_send_result_text(to_id: &str, data: &Value) -> String {
+    match data.get("delivery").and_then(Value::as_str) {
+        Some("delivered") => format!("Delivered to {to_id}."),
+        Some("queued") => format!("Queued for {to_id} (peer client not registered yet)."),
+        // Older renga servers return a successful response without the
+        // delivery field and may have dropped an unregistered peer send.
+        // Unknown future values are equally unverified, so only the explicit
+        // delivered value may produce a Delivered claim.
+        _ => format!(
+            "Message sent to {to_id}; delivery state unconfirmed (renga server may predate queued delivery)."
+        ),
+    }
+}
+
 fn handle_send_message(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     let to_id = args.get("to_id").and_then(|v| v.as_str()).unwrap_or("");
     let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
@@ -979,13 +993,7 @@ fn handle_send_message(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
         },
     ) {
         Ok(Response::Ok { data }) => {
-            let queued = data.get("delivery").and_then(Value::as_str) == Some("queued");
-            let text = if queued {
-                format!("Queued for {to_id} (peer client not registered yet).")
-            } else {
-                format!("Delivered to {to_id}.")
-            };
-            ok_response(id, tool_text_result(&text))
+            ok_response(id, tool_text_result(&peer_send_result_text(to_id, &data)))
         }
         Ok(Response::Err { message, code }) => err_response(
             id,
@@ -2748,6 +2756,24 @@ fn subscription_retry_state_after_attempt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_send_result_only_claims_delivered_for_explicit_outcome() {
+        assert_eq!(
+            peer_send_result_text("2", &json!({ "delivery": "delivered" })),
+            "Delivered to 2."
+        );
+        assert_eq!(
+            peer_send_result_text("2", &json!({ "delivery": "queued" })),
+            "Queued for 2 (peer client not registered yet)."
+        );
+
+        for data in [json!({}), json!({ "delivery": "future_value" })] {
+            let text = peer_send_result_text("2", &data);
+            assert!(text.contains("delivery state unconfirmed"), "{text}");
+            assert!(!text.contains("Delivered"), "{text}");
+        }
+    }
 
     #[test]
     fn peer_event_timestamp_preserves_original_milliseconds() {
