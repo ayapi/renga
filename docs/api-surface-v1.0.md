@@ -67,6 +67,8 @@ Result on immediate success: `"Delivered to <to_id>."`. If the target pane
 exists in the same tab but its peer event subscriber is not ready, the result
 is `"Queued for <to_id> (peer client not registered yet)."`; delivery occurs
 after that subscriber reports readiness, in original send order.
+If the server omits `delivery` or returns an unknown value, the result is
+`"Message sent to <to_id>; delivery state unconfirmed (renga server may predate queued delivery)."`.
 
 The pre-registration queue is per pane and bounded to 128 messages / 1 MiB of
 body text. A send that would exceed either cap fails with
