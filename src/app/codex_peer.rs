@@ -375,9 +375,13 @@ fn codex_peer_screen_snapshot(screen: &vt100::Screen) -> CodexPeerScreenSnapshot
     let can_queue_message = !screen.hide_cursor() && has_draft == Some(false) && busy;
     let can_submit_message =
         !busy && (footer.contains("entertosend") || footer.contains("readyforinput"));
+    let ready_without_prompt = prompt_row.is_none() && {
+        let screen_text = normalized_screen_rows(screen, 0, rows);
+        screen_text.contains("entertosend") || screen_text.contains("readyforinput")
+    };
     let ready_for_nudge = !busy
         && screen_has_visible_text(screen)
-        && (codex_prompt_allows_peer_nudge_on_screen(screen).unwrap_or(can_submit_message));
+        && (codex_prompt_allows_peer_nudge_on_screen(screen).unwrap_or(ready_without_prompt));
     CodexPeerScreenSnapshot {
         has_draft,
         composer,
