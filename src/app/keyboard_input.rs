@@ -543,15 +543,10 @@ impl App {
             .iter()
             .copied()
             .find(|&(id, _)| id == pane_id)?;
-        if rect.width < 3 || rect.height < 3 {
+        if rect.width < 4 || rect.height < 3 {
             return None;
         }
-        Some(Rect::new(
-            rect.x + 1,
-            rect.y + 1,
-            rect.width - 2,
-            rect.height - 2,
-        ))
+        Some(super::pane_content_rect(rect))
     }
 
     /// Modal key handler while copy mode is active. Every key is

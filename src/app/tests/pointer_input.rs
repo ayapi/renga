@@ -18,11 +18,12 @@ fn pane_local_coords_rejects_border_clicks() {
 #[test]
 fn pane_local_coords_translates_to_content_0_origin() {
     // Pane outer at (2, 3), content starts at (3, 4). A click at
-    // screen (3, 4) must land on content (0, 0); (10, 6) maps
-    // to (7, 2).
+    // screen (3, 4) must land on content (0, 0); (9, 6) maps
+    // to the final terminal cell (6, 2). Column 10 is the scrollbar.
     let rect = Rect::new(2, 3, 10, 5);
     assert_eq!(pane_local_coords(rect, 3, 4), Some((0, 0)));
-    assert_eq!(pane_local_coords(rect, 10, 6), Some((7, 2)));
+    assert_eq!(pane_local_coords(rect, 9, 6), Some((6, 2)));
+    assert_eq!(pane_local_coords(rect, 10, 6), None);
 }
 
 #[test]
@@ -31,8 +32,8 @@ fn pane_local_coords_clamped_stays_inside_content() {
     // pane. Ensure clamp never produces an out-of-bounds cell.
     let rect = Rect::new(2, 3, 10, 5);
     // Cursor well to the right of the pane — should pin to the
-    // last content column (width - 2 = 8 inner cells, 0..=7).
-    assert_eq!(pane_local_coords_clamped(rect, 50, 50), (7, 2));
+    // last content column (width - 3 = 7 terminal cells, 0..=6).
+    assert_eq!(pane_local_coords_clamped(rect, 50, 50), (6, 2));
     // Cursor above/left of the pane — should pin to (0, 0).
     assert_eq!(pane_local_coords_clamped(rect, 0, 0), (0, 0));
     // Cursor inside — untouched.
@@ -41,11 +42,11 @@ fn pane_local_coords_clamped_stays_inside_content() {
 
 #[test]
 fn pane_local_coords_rejects_rects_too_small_for_content() {
-    // A 2×2 or narrower rect has no interior after stripping the
-    // 1-cell border. Codex review flagged that the pre-fix version
+    // A 3-cell or narrower rect has no terminal content after stripping
+    // both borders and the scrollbar. Codex review flagged that the pre-fix version
     // underflowed with `rect.width == 1`; the guard keeps such a
     // press from ever reaching the forward path.
-    for (w, h) in [(0, 5), (1, 5), (2, 5), (5, 0), (5, 1), (5, 2)] {
+    for (w, h) in [(0, 5), (1, 5), (2, 5), (3, 5), (5, 0), (5, 1), (5, 2)] {
         let rect = Rect::new(2, 3, w, h);
         assert!(
             pane_local_coords(rect, 3, 4).is_none(),
@@ -501,6 +502,17 @@ fn make_scrollbar_visible(app: &App, pane_id: usize) {
         .store(1_000, std::sync::atomic::Ordering::Relaxed);
 }
 
+fn seed_real_scrollback(app: &App, pane_id: usize) {
+    let pane = app.ws().panes.get(&pane_id).expect("pane exists");
+    let mut parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+    for i in 0..100 {
+        parser.process(format!("line {i}\r\n").as_bytes());
+    }
+    drop(parser);
+    pane.total_scrollback
+        .store(100, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn pane_rect(app: &App, pane_id: usize) -> Rect {
     app.ws()
         .last_pane_rects
@@ -510,11 +522,11 @@ fn pane_rect(app: &App, pane_id: usize) -> Rect {
 }
 
 #[test]
-fn visible_scrollbar_on_left_split_wins_over_resize_gesture() {
+fn dedicated_scrollbar_column_is_separate_from_split_resize() {
     let (mut app, a_id, _b_id) = two_pane_vertical_app();
     make_scrollbar_visible(&app, a_id);
     let rect = pane_rect(&app, a_id);
-    let scrollbar_col = rect.x + rect.width - 1;
+    let scrollbar_col = rect.x + rect.width - 2;
 
     app.handle_mouse_event(boundary_mouse(
         MouseEventKind::Down(MouseButton::Left),
@@ -527,6 +539,13 @@ fn visible_scrollbar_on_left_split_wins_over_resize_gesture() {
         Some(DragTarget::Scrollbar(id, _)) if id == a_id
     ));
     assert_eq!(app.ws().layout.pane_count(), 2);
+
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        rect.x + rect.width - 1,
+        20,
+    ));
+    assert!(matches!(app.dragging, Some(DragTarget::PaneSplit(..))));
     app.shutdown();
 }
 
@@ -535,7 +554,7 @@ fn repeated_visible_scrollbar_click_does_not_split_outer_edge() {
     let (mut app, _a_id, b_id) = two_pane_vertical_app();
     make_scrollbar_visible(&app, b_id);
     let rect = pane_rect(&app, b_id);
-    let scrollbar_col = rect.x + rect.width - 1;
+    let scrollbar_col = rect.x + rect.width - 2;
 
     app.handle_mouse_event(boundary_mouse(
         MouseEventKind::Down(MouseButton::Left),
@@ -562,6 +581,110 @@ fn repeated_visible_scrollbar_click_does_not_split_outer_edge() {
 }
 
 #[test]
+fn dedicated_scrollbar_click_and_drag_change_scrollback() {
+    let (mut app, a_id, _b_id) = two_pane_vertical_app();
+    seed_real_scrollback(&app, a_id);
+    let rect = pane_rect(&app, a_id);
+    let scrollbar_col = rect.x + rect.width - 2;
+
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        scrollbar_col,
+        2,
+    ));
+    let after_click = app
+        .ws()
+        .panes
+        .get(&a_id)
+        .unwrap()
+        .parser
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .screen()
+        .scrollback();
+    assert!(after_click > 0, "track click should enter scrollback");
+
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        scrollbar_col,
+        38,
+    ));
+    let after_drag = app
+        .ws()
+        .panes
+        .get(&a_id)
+        .unwrap()
+        .parser
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .screen()
+        .scrollback();
+    assert!(
+        after_drag < after_click,
+        "dragging down should approach live output"
+    );
+    app.shutdown();
+}
+
+#[test]
+fn right_border_double_click_splits_with_visible_scrollbar() {
+    let (mut app, _a_id, b_id) = two_pane_vertical_app();
+    make_scrollbar_visible(&app, b_id);
+    let rect = pane_rect(&app, b_id);
+    let right_border_col = rect.x + rect.width - 1;
+
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        right_border_col,
+        20,
+    ));
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        right_border_col,
+        20,
+    ));
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        right_border_col,
+        20,
+    ));
+
+    assert_eq!(app.ws().layout.pane_count(), 3);
+    app.shutdown();
+}
+
+#[test]
+fn dedicated_scrollbar_does_not_compete_with_right_side_preview_resize() {
+    let (mut app, _a_id, b_id) = two_pane_vertical_app();
+    make_scrollbar_visible(&app, b_id);
+    app.layout_swapped = false;
+    app.ws_mut().last_preview_rect = Some(Rect::new(100, 0, 30, 40));
+
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        98,
+        20,
+    ));
+    assert!(matches!(
+        app.dragging,
+        Some(DragTarget::Scrollbar(id, _)) if id == b_id
+    ));
+
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        98,
+        20,
+    ));
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        99,
+        20,
+    ));
+    assert!(matches!(app.dragging, Some(DragTarget::PreviewBorder)));
+    app.shutdown();
+}
+
+#[test]
 fn hidden_scrollbar_does_not_claim_right_border_click() {
     let (mut app, _a_id, b_id) = two_pane_vertical_app();
     app.ws()
@@ -571,16 +694,16 @@ fn hidden_scrollbar_does_not_claim_right_border_click() {
         .total_scrollback
         .store(0, std::sync::atomic::Ordering::Relaxed);
     let rect = pane_rect(&app, b_id);
-    let right_border_col = rect.x + rect.width - 1;
+    let scrollbar_col = rect.x + rect.width - 2;
 
     app.handle_mouse_event(boundary_mouse(
         MouseEventKind::Down(MouseButton::Left),
-        right_border_col,
+        scrollbar_col,
         20,
     ));
 
     assert!(!matches!(app.dragging, Some(DragTarget::Scrollbar(..))));
-    assert!(app.last_edge_click.is_some());
+    assert!(app.last_edge_click.is_none());
     assert_eq!(app.ws().layout.pane_count(), 2);
     app.shutdown();
 }
@@ -591,32 +714,29 @@ fn exited_pane_does_not_claim_invisible_scrollbar() {
     make_scrollbar_visible(&app, a_id);
     app.ws_mut().panes.get_mut(&a_id).unwrap().exited = true;
     let rect = pane_rect(&app, a_id);
-    let right_border_col = rect.x + rect.width - 1;
+    let scrollbar_col = rect.x + rect.width - 2;
 
     app.handle_mouse_event(boundary_mouse(
         MouseEventKind::Down(MouseButton::Left),
-        right_border_col,
+        scrollbar_col,
         20,
     ));
 
     assert!(!matches!(app.dragging, Some(DragTarget::Scrollbar(..))));
-    assert!(matches!(app.dragging, Some(DragTarget::PaneSplit(..))));
+    assert!(!matches!(app.dragging, Some(DragTarget::PaneSplit(..))));
     app.shutdown();
 }
 
 #[test]
-fn visible_scrollbar_hover_does_not_advertise_split_resize() {
+fn dedicated_scrollbar_hover_does_not_advertise_split_resize() {
     let (mut app, a_id, _b_id) = two_pane_vertical_app();
     make_scrollbar_visible(&app, a_id);
     let rect = pane_rect(&app, a_id);
-    let scrollbar_col = rect.x + rect.width - 1;
+    let scrollbar_col = rect.x + rect.width - 2;
 
     app.handle_mouse_event(boundary_mouse(MouseEventKind::Moved, scrollbar_col, 20));
 
-    assert!(matches!(
-        app.hover_border,
-        Some(DragTarget::Scrollbar(id, _)) if id == a_id
-    ));
+    assert!(app.hover_border.is_none());
     app.shutdown();
 }
 

@@ -149,7 +149,7 @@ impl App {
         });
 
         // Seed the new PTY with the geometry it will actually get after the
-        // split, minus the 1-cell border on each side. Falling back to a
+        // split, minus both borders and the dedicated scrollbar column. Falling back to a
         // fixed 10x40 (the old behavior) forced every fresh pane through a
         // startup resize/reflow once `render_panes` corrected the size, a
         // contributing factor to caret desync on plain PTY panes. The next
@@ -161,7 +161,7 @@ impl App {
                     SplitDirection::Vertical => (rect.width / 2, rect.height),
                     SplitDirection::Horizontal => (rect.width, rect.height / 2),
                 };
-                (h.saturating_sub(2).max(1), w.saturating_sub(2).max(1))
+                (h.saturating_sub(2).max(1), w.saturating_sub(3).max(1))
             }
             None => (10, 40),
         };

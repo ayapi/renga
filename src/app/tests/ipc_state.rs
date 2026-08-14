@@ -425,6 +425,19 @@ fn relayout_panes_caches_rect_origin_accounting_for_sidebar() {
         "pane origin must sit past the file-tree sidebar"
     );
     assert_eq!(rect.y, 1, "pane origin must sit below the tab strip");
+    let parser = app
+        .ws()
+        .panes
+        .get(&pane_id)
+        .unwrap()
+        .parser
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(
+        parser.screen().size().1,
+        rect.width.saturating_sub(3),
+        "PTY width must reserve borders plus one scrollbar column"
+    );
 }
 
 #[test]

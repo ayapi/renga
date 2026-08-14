@@ -197,24 +197,17 @@ impl App {
         Some(Rect::new(min_x, min_y, max_x - min_x, max_y - min_y))
     }
 
-    /// Return the pane scrollbar under this cell. Scrollbars live on a
-    /// pane's right border, so they must be classified before shared-divider
-    /// and outer-edge gestures that use the same cell. This keeps scrolling
-    /// usable on the left side of a vertical split and prevents a repeated
-    /// scrollbar click from being interpreted as a split gesture.
+    /// Return the visible pane scrollbar under this cell. Its permanently
+    /// reserved column is between the vt100 content and the right border, so
+    /// it does not compete with pane or sidebar resize gestures.
     fn pane_scrollbar_at(&self, col: u16, row: u16) -> Option<(usize, Rect)> {
         self.ws()
             .last_pane_rects
             .iter()
             .copied()
             .find_map(|(pane_id, rect)| {
-                let inner = Rect::new(
-                    rect.x.saturating_add(1),
-                    rect.y.saturating_add(1),
-                    rect.width.saturating_sub(2),
-                    rect.height.saturating_sub(2),
-                );
-                let scrollbar_col = inner.x.saturating_add(inner.width);
+                let inner = pane_content_rect(rect);
+                let scrollbar_col = pane_scrollbar_col(rect)?;
                 let hits_scrollbar = inner.width > 0
                     && inner.height > 0
                     && col == scrollbar_col
@@ -398,20 +391,6 @@ impl App {
                     return;
                 }
 
-                // The scrollbar shares the pane's right-border cell with
-                // split-resize and outer-edge gestures. When present, its
-                // direct manipulation takes precedence over those gestures.
-                if let Some((pane_id, inner)) = self.pane_scrollbar_at(col, row) {
-                    self.ws_mut().focused_pane_id = pane_id;
-                    self.ws_mut().focus_target = FocusTarget::Pane;
-                    self.flush_pending_codex_peer_messages();
-                    self.scroll_pane_to_click(pane_id, row, &inner);
-                    self.dragging = Some(DragTarget::Scrollbar(pane_id, inner));
-                    self.last_edge_click = None;
-                    self.last_boundary_click = None;
-                    return;
-                }
-
                 if let Some(pane_area) = self.pane_area() {
                     let active_tab = self.active_tab;
 
@@ -567,6 +546,15 @@ impl App {
                         self.ws_mut().focus_target = FocusTarget::Pane;
                         self.flush_pending_codex_peer_messages();
 
+                        match self.pane_scrollbar_at(col, row) {
+                            Some((scrollbar_id, inner)) if scrollbar_id == pane_id => {
+                                self.scroll_pane_to_click(pane_id, row, &inner);
+                                self.dragging = Some(DragTarget::Scrollbar(pane_id, inner));
+                                return;
+                            }
+                            _ => {}
+                        }
+
                         if !mouse.modifiers.contains(KeyModifiers::SHIFT)
                             && !mouse_forward_disabled()
                             && self.try_forward_pane_press(
@@ -712,12 +700,7 @@ impl App {
                             && row >= rect.y
                             && row < rect.y + rect.height
                         {
-                            let inner = Rect::new(
-                                rect.x + 1,
-                                rect.y + 1,
-                                rect.width.saturating_sub(2),
-                                rect.height.saturating_sub(2),
-                            );
+                            let inner = pane_content_rect(rect);
                             let cell_col = col.saturating_sub(inner.x) as u32;
                             let cell_row = row.saturating_sub(inner.y) as u32;
                             self.selection = Some(TextSelection {
@@ -839,10 +822,6 @@ impl App {
                     self.hover_border = Some(DragTarget::FileTreeBorder);
                 } else if self.is_on_preview_border(col) {
                     self.hover_border = Some(DragTarget::PreviewBorder);
-                } else if let Some((pane_id, inner)) = self.pane_scrollbar_at(col, row) {
-                    // Match the press priority: do not advertise split resize
-                    // on a cell whose click manipulates the scrollbar.
-                    self.hover_border = Some(DragTarget::Scrollbar(pane_id, inner));
                 } else {
                     // Tint the shared internal divider under the cursor
                     // so it reads as draggable / double-clickable, the
@@ -1007,28 +986,25 @@ pub(crate) fn mouse_forward_disabled() -> bool {
 }
 
 pub(crate) fn pane_local_coords(rect: Rect, col: u16, row: u16) -> Option<(u16, u16)> {
-    if rect.width < 3 || rect.height < 3 {
+    if rect.width < 4 || rect.height < 3 {
         return None;
     }
-    let right = rect.x.saturating_add(rect.width);
-    let bottom = rect.y.saturating_add(rect.height);
-    if col <= rect.x || col.saturating_add(1) >= right {
+    let content = pane_content_rect(rect);
+    if col < content.x
+        || col >= content.x.saturating_add(content.width)
+        || row < content.y
+        || row >= content.y.saturating_add(content.height)
+    {
         return None;
     }
-    if row <= rect.y || row.saturating_add(1) >= bottom {
-        return None;
-    }
-    Some((col - rect.x - 1, row - rect.y - 1))
+    Some((col - content.x, row - content.y))
 }
 
 pub(crate) fn pane_local_coords_clamped(rect: Rect, col: u16, row: u16) -> (u16, u16) {
-    let inner_x = rect.x.saturating_add(1);
-    let inner_y = rect.y.saturating_add(1);
-    let inner_w = rect.width.saturating_sub(2);
-    let inner_h = rect.height.saturating_sub(2);
-    let max_col = inner_w.saturating_sub(1);
-    let max_row = inner_h.saturating_sub(1);
-    let local_col = col.saturating_sub(inner_x).min(max_col);
-    let local_row = row.saturating_sub(inner_y).min(max_row);
+    let content = pane_content_rect(rect);
+    let max_col = content.width.saturating_sub(1);
+    let max_row = content.height.saturating_sub(1);
+    let local_col = col.saturating_sub(content.x).min(max_col);
+    let local_row = row.saturating_sub(content.y).min(max_row);
     (local_col, local_row)
 }

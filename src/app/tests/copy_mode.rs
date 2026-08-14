@@ -248,9 +248,9 @@ fn extraction_start_on_continuation_cell_skips_the_half_char() {
 
 #[test]
 fn extraction_includes_ascii_in_final_screen_column() {
-    let mut parser = vt100::Parser::new(2, 115, 0);
-    let line = format!("{}X", ".".repeat(114));
+    let mut parser = vt100::Parser::new(2, 114, 0);
+    let line = format!("{}X", ".".repeat(113));
     parser.process(line.as_bytes());
 
-    assert_eq!(extract_screen_text(parser.screen(), 0, 0, 0, 114), line);
+    assert_eq!(extract_screen_text(parser.screen(), 0, 0, 0, 113), line);
 }

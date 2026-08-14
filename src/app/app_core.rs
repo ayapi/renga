@@ -15,7 +15,7 @@ impl App {
         let (command_tx, command_rx) = mpsc::channel();
 
         let pane_rows = rows.saturating_sub(5); // title + tab bar + status + borders
-        let pane_cols = cols.saturating_sub(2);
+        let pane_cols = cols.saturating_sub(3);
 
         let cwd = initial_cwd
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -395,7 +395,7 @@ impl App {
         for (pane_id, rect) in &rects {
             if let Some(pane) = self.ws_mut().panes.get_mut(pane_id) {
                 let inner_rows = rect.height.saturating_sub(2);
-                let inner_cols = rect.width.saturating_sub(2);
+                let inner_cols = pane_content_rect(*rect).width;
                 if pane.resize(inner_rows, inner_cols).unwrap_or(false) {
                     any_changed = true;
                 }

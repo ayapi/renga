@@ -1,5 +1,21 @@
 use super::*;
 
+/// Terminal cells inside a pane. One horizontal cell is permanently reserved
+/// for the scrollbar between the vt100 grid and the right block border.
+pub(crate) fn pane_content_rect(rect: Rect) -> Rect {
+    Rect::new(
+        rect.x.saturating_add(1),
+        rect.y.saturating_add(1),
+        rect.width.saturating_sub(3),
+        rect.height.saturating_sub(2),
+    )
+}
+
+/// Dedicated scrollbar column immediately after the terminal content.
+pub(crate) fn pane_scrollbar_col(rect: Rect) -> Option<u16> {
+    (rect.width >= 3).then(|| rect.x.saturating_add(rect.width).saturating_sub(2))
+}
+
 /// Which area has focus.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FocusTarget {

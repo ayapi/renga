@@ -47,6 +47,7 @@ use self::pointer_input::{
 pub use self::selection::{CopyModeScroll, CopyModeState, SelectionTarget, TextSelection};
 #[cfg(test)]
 use self::workspace_state::resolve_pane_ref_impl;
+pub(crate) use self::workspace_state::{pane_content_rect, pane_scrollbar_col};
 pub use self::workspace_state::{DragTarget, FocusTarget, Workspace};
 use crate::filetree::FileTree;
 use crate::ipc::{self, PaneInfo, PaneRef, PeerClientKind, PeerInfo};
