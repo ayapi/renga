@@ -33,13 +33,13 @@ fn seed_codex_busy_placeholder(app: &mut App, pane_id: usize) {
     seed_pane_screen(
         app,
         pane_id,
-        b"\x1b[?25h\x1b[2J\x1b[HWorking (1m 03s - esc to interrupt; tab to queue message)\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6 high\x1b[6;20H",
+        b"\x1b[?25h\x1b[2J\x1b[HWorking (1m 03s - esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6 high\x1b[6;20H",
     );
 }
 
 fn seed_codex_busy_composer(app: &mut App, pane_id: usize, text: &str) {
     let screen = format!(
-        "\x1b[?25h\x1b[2J\x1b[3;1HWorking (1m 03s - esc to interrupt; tab to queue message)\x1b[5;1H\u{203a} {text}\x1b[10;1H  gpt-5.6 high\x1b[7;20H"
+        "\x1b[?25h\x1b[2J\x1b[3;1HWorking (1m 03s - esc to interrupt)\x1b[5;1H\u{203a} {text}\x1b[10;1H  tab to queue message  51% context left\x1b[7;20H"
     );
     seed_pane_screen(app, pane_id, screen.as_bytes());
 }
@@ -1362,7 +1362,8 @@ fn unfocused_busy_codex_without_draft_queues_nudge_natively() {
         let tail = screen_tail_lines(parser.screen())
             .join("\n")
             .to_ascii_lowercase();
-        assert!(tail.contains("tab to queue message"), "{tail:?}");
+        assert!(tail.contains("esc to interrupt"), "{tail:?}");
+        assert!(!tail.contains("tab to queue message"), "{tail:?}");
     }
 
     app.handle_peer_send(
@@ -1719,7 +1720,7 @@ fn unfocused_busy_codex_with_draft_does_not_inject_nudge() {
     seed_pane_screen(
         &mut app,
         sibling_id,
-        b"\x1b[?25h\x1b[2J\x1b[HWorking (1m 03s - esc to interrupt; tab to queue message)\x1b[4;1H\xE2\x80\xBA keep my draft\x1b[6;1H  gpt-5.6 high\x1b[4;16H",
+        b"\x1b[?25h\x1b[2J\x1b[HWorking (1m 03s - esc to interrupt)\x1b[4;1H\xE2\x80\xBA keep my draft\x1b[6;1H  gpt-5.6 high\x1b[4;16H",
     );
 
     app.handle_peer_send(

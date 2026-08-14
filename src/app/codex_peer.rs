@@ -326,20 +326,55 @@ fn normalize_codex_composer_expected(text: &str) -> String {
     text.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
+fn normalized_screen_rows(screen: &vt100::Screen, start: u16, end: u16) -> String {
+    let (_, cols) = screen.size();
+    let mut text = String::new();
+    for row in start..end {
+        for col in 0..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                text.push_str(cell.contents());
+            }
+        }
+    }
+    text.chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
 fn codex_peer_screen_snapshot(screen: &vt100::Screen) -> CodexPeerScreenSnapshot {
     let has_draft = codex_composer_has_draft_on_screen(screen);
     let composer = normalized_codex_composer_text(screen);
-    let tail = screen_tail_lines(screen).join("\n").to_ascii_lowercase();
-    let normalized_tail: String = tail.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let (rows, cols) = screen.size();
+    let prompt_row = (0..rows).rev().find(|row| {
+        (0..cols).any(|col| {
+            screen
+                .cell(*row, col)
+                .is_some_and(|cell| cell.contents() == "\u{203a}")
+        })
+    });
+    let (status, footer) = prompt_row.map_or_else(
+        || (String::new(), String::new()),
+        |prompt_row| {
+            (
+                normalized_screen_rows(screen, prompt_row.saturating_sub(4), prompt_row),
+                normalized_screen_rows(
+                    screen,
+                    prompt_row.saturating_add(1),
+                    prompt_row.saturating_add(8).min(rows),
+                ),
+            )
+        },
+    );
     // Positive detection controls whether renga may inject and press Tab, so
-    // require Codex's live Working status plus both advertised busy actions.
+    // anchor the busy signal above the composer and the queue action below it.
     // Transcript mentions and unknown future UI safely remain pending.
-    let busy = normalized_tail.contains("working(") && normalized_tail.contains("esctointerrupt");
+    let busy = status.contains("working(") && status.contains("esctointerrupt");
     let busy_queue_available =
-        !screen.hide_cursor() && busy && normalized_tail.contains("tabtoqueuemessage");
-    let can_queue_message = has_draft == Some(false) && busy_queue_available;
-    let can_submit_message = !busy
-        && (normalized_tail.contains("entertosend") || normalized_tail.contains("readyforinput"));
+        !screen.hide_cursor() && busy && footer.contains("tabtoqueuemessage");
+    let can_queue_message = !screen.hide_cursor() && has_draft == Some(false) && busy;
+    let can_submit_message =
+        !busy && (footer.contains("entertosend") || footer.contains("readyforinput"));
     let ready_for_nudge = !busy
         && screen_has_visible_text(screen)
         && (codex_prompt_allows_peer_nudge_on_screen(screen).unwrap_or(can_submit_message));
