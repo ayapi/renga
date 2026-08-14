@@ -1585,7 +1585,7 @@ fn distant_transcript_interrupt_hint_does_not_mark_prompt_busy() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[HDuring a turn Codex prints esc to interrupt in its status row.\x1b[8;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[10;1Hgpt-5.6-sol medium - cwd\x1b[8;3H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (12s - esc to interrupt)\x1b[8;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[10;1Hgpt-5.6-sol medium - cwd\x1b[8;3H",
     );
 
     app.handle_peer_send(
