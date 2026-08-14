@@ -263,7 +263,7 @@ fn handle_peer_send_waits_for_target_peer_registration() {
         app.pending_codex_peer_messages
             .get(&sibling_id)
             .and_then(|queue| queue.front()),
-        Some(PendingCodexPeerDelivery::Draft(_))
+        Some(PendingCodexPeerDelivery::Draft { .. })
     ));
 
     let event = rx
@@ -406,7 +406,7 @@ fn codex_readiness_sets_kind_and_rearms_nudge_atomically() {
         app.pending_codex_peer_messages
             .get(&sibling_id)
             .and_then(|queue| queue.front()),
-        Some(PendingCodexPeerDelivery::Draft(_))
+        Some(PendingCodexPeerDelivery::Draft { .. })
     ));
     app.shutdown();
 }
@@ -624,7 +624,7 @@ fn handle_peer_send_queues_codex_nudge_and_emits_peer_inbox() {
         .expect("queued codex peer message");
     assert_eq!(queued.len(), 1);
     match &queued[0] {
-        PendingCodexPeerDelivery::Draft(msg) => {
+        PendingCodexPeerDelivery::Draft { message: msg, .. } => {
             assert_eq!(msg.from_pane, sender_id);
             assert_eq!(msg.from_name.as_deref(), None);
             assert_eq!(msg.from_kind, None);
@@ -1287,7 +1287,7 @@ fn focused_codex_without_draft_queues_when_not_ready() {
         app.pending_codex_peer_messages
             .get(&sibling_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::Draft(_))
+        Some(PendingCodexPeerDelivery::Draft { .. })
     ));
     app.shutdown();
 }
@@ -1326,7 +1326,7 @@ fn unfocused_codex_with_draft_stays_silent_and_queued() {
         app.pending_codex_peer_messages
             .get(&sibling_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::Draft(_))
+        Some(PendingCodexPeerDelivery::Draft { .. })
     ));
     app.shutdown();
 }
@@ -1665,8 +1665,109 @@ fn native_queue_commit_times_out_to_pending_on_unknown_screen() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::Draft(_))
+        Some(PendingCodexPeerDelivery::Draft { .. })
     ));
+    app.shutdown();
+}
+
+#[test]
+fn native_queue_commit_stops_after_one_retry_and_waits_for_focus() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_codex_busy_placeholder(&mut app, codex_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "bounded retry".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    let message = PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: None,
+        from_kind: None,
+    };
+    let expected = format_codex_peer_message(&message);
+    seed_codex_busy_composer(&mut app, codex_id, &expected);
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    expire_codex_native_queue(&mut app, codex_id);
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::Draft {
+            retries_remaining: 0,
+            ..
+        })
+    ));
+
+    seed_codex_busy_placeholder(&mut app, codex_id);
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::QueueAt {
+            retries_remaining: 0,
+            ..
+        })
+    ));
+
+    seed_codex_busy_composer(&mut app, codex_id, &expected);
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    expire_codex_native_queue(&mut app, codex_id);
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(
+        app.ws().panes.get(&codex_id).expect("pane").test_input(),
+        b"\x15"
+    );
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::AwaitFocus(_))
+    ));
+
+    seed_codex_busy_placeholder(&mut app, codex_id);
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    for _ in 0..3 {
+        app.flush_pending_codex_peer_messages();
+    }
+    assert!(app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::AwaitFocus(_))
+    ));
+
+    app.handle_focus(&ipc::PaneRef::Id(codex_id))
+        .expect("focus codex");
+    assert!(app.visible_codex_peer_notification().is_some());
     app.shutdown();
 }
 
@@ -1765,7 +1866,7 @@ fn unfocused_busy_codex_with_draft_does_not_inject_nudge() {
         app.pending_codex_peer_messages
             .get(&sibling_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::Draft(_))
+        Some(PendingCodexPeerDelivery::Draft { .. })
     ));
     app.shutdown();
 }
@@ -1796,7 +1897,7 @@ fn refocusing_unfocused_codex_with_existing_draft_shows_pending_overlay() {
         app.pending_codex_peer_messages
             .get(&pane_a)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::Draft(_))
+        Some(PendingCodexPeerDelivery::Draft { .. })
     ));
 
     app.handle_focus(&ipc::PaneRef::Id(pane_a))
@@ -1896,7 +1997,7 @@ fn focused_codex_pending_overlay_requeues_when_typing_then_auto_submits_after_dr
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::Draft(_))
+        Some(PendingCodexPeerDelivery::Draft { .. })
     ));
 
     seed_codex_ready_placeholder(&mut app, codex_id);

@@ -3,6 +3,7 @@ use super::*;
 pub(crate) const CODEX_APPEND_ENTER_DELAY: Duration = Duration::from_millis(75);
 pub(crate) const CODEX_PEER_NUDGE_COMMIT_DELAY: Duration = Duration::from_millis(1000);
 pub(crate) const CODEX_PEER_NUDGE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CODEX_PEER_NUDGE_MAX_RETRIES: u8 = 1;
 pub(crate) const CODEX_APPEND_ENTER_SNAPSHOT_LINES: usize = 8;
 
 /// Window during which a `(target, from, body)` triple is treated as
@@ -52,14 +53,19 @@ impl CodexPeerNotificationState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PendingCodexPeerDelivery {
-    Draft(PendingCodexPeerMessage),
+    Draft {
+        message: PendingCodexPeerMessage,
+        retries_remaining: u8,
+    },
     SubmitAt(Instant),
     QueueAt {
         ready_at: Instant,
         expires_at: Instant,
         message: PendingCodexPeerMessage,
         expected_composer: String,
+        retries_remaining: u8,
     },
+    AwaitFocus(PendingCodexPeerMessage),
 }
 
 #[derive(Debug)]
@@ -650,7 +656,10 @@ impl App {
     fn push_pending_codex_peer_nudge(&mut self, pane_id: usize, message: PendingCodexPeerMessage) {
         let queue = self.pending_codex_peer_messages.entry(pane_id).or_default();
         if queue.is_empty() {
-            queue.push_back(PendingCodexPeerDelivery::Draft(message));
+            queue.push_back(PendingCodexPeerDelivery::Draft {
+                message,
+                retries_remaining: CODEX_PEER_NUDGE_MAX_RETRIES,
+            });
         }
     }
 
@@ -860,7 +869,10 @@ impl App {
                         self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex);
                     let screen = Self::codex_peer_screen_snapshot(registered_codex, pane);
                     match delivery {
-                        PendingCodexPeerDelivery::Draft(message) => {
+                        PendingCodexPeerDelivery::Draft {
+                            message,
+                            retries_remaining,
+                        } => {
                             if screen.as_ref().and_then(|state| state.has_draft) == Some(true) {
                                 if pane_is_focused {
                                     queue.pop_front();
@@ -890,6 +902,7 @@ impl App {
                                         expected_composer: normalize_codex_composer_expected(
                                             &payload_text,
                                         ),
+                                        retries_remaining,
                                     });
                                     self.dirty = true;
                                 }
@@ -928,6 +941,7 @@ impl App {
                             expires_at,
                             message,
                             expected_composer,
+                            retries_remaining,
                         } => {
                             let composer_matches =
                                 screen.as_ref().and_then(|state| state.composer.as_ref())
@@ -946,7 +960,14 @@ impl App {
                                     let _ = write_input_to_pane(pane, b"\x15", false);
                                 }
                                 queue.pop_front();
-                                queue.push_front(PendingCodexPeerDelivery::Draft(message));
+                                if retries_remaining > 0 {
+                                    queue.push_front(PendingCodexPeerDelivery::Draft {
+                                        message,
+                                        retries_remaining: retries_remaining - 1,
+                                    });
+                                } else {
+                                    queue.push_front(PendingCodexPeerDelivery::AwaitFocus(message));
+                                }
                                 self.dirty = true;
                                 continue;
                             }
@@ -968,6 +989,13 @@ impl App {
                             };
                             if write_input_to_pane(pane, payload, false).is_ok() {
                                 queue.pop_front();
+                                self.dirty = true;
+                            }
+                        }
+                        PendingCodexPeerDelivery::AwaitFocus(message) => {
+                            if pane_is_focused {
+                                queue.pop_front();
+                                focused_notifications.push((pane_id, message));
                                 self.dirty = true;
                             }
                         }
