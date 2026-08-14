@@ -1226,6 +1226,21 @@ fn transcript_prompt_before_unknown_modal_does_not_accept_nudge() {
 }
 
 #[test]
+fn transcript_prompt_separated_from_unknown_output_is_not_live() {
+    let mut parser = vt100::Parser::new(40, 120, 0);
+    parser.process(
+        b"\x1b[?25h\x1b[2J\x1b[4;1H\xE2\x80\xBA old request\x1b[7;1Hstreamed tool output\x1b[4;3H",
+    );
+
+    assert_eq!(codex_composer_has_draft_on_screen(parser.screen()), None);
+    assert_eq!(normalized_codex_composer_text(parser.screen()), None);
+    assert_eq!(
+        codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+        None
+    );
+}
+
+#[test]
 fn live_idle_prompt_with_distant_footer_accepts_nudge() {
     let mut app = App::new(40, 160).expect("App::new");
     let sender_id = app.ws().focused_pane_id;

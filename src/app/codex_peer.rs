@@ -177,7 +177,9 @@ fn codex_live_composer_position(screen: &vt100::Screen) -> Option<(u16, u16)> {
     }
 
     let footer_seen = looks_like_codex_footer_rows(&footer_rows);
-    if footer_seen || (!content_before_separator && cursor_row == prompt_row) {
+    if footer_seen
+        || (footer_rows.is_empty() && !content_before_separator && cursor_row == prompt_row)
+    {
         return Some((prompt_row, prompt_col));
     }
     (footer_rows.is_empty()
