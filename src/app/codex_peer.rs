@@ -2,6 +2,7 @@ use super::*;
 
 pub(crate) const CODEX_APPEND_ENTER_DELAY: Duration = Duration::from_millis(75);
 pub(crate) const CODEX_PEER_NUDGE_SUBMIT_DELAY: Duration = Duration::from_millis(1000);
+pub(crate) const CODEX_PEER_NUDGE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const CODEX_APPEND_ENTER_SNAPSHOT_LINES: usize = 8;
 
 /// Window during which a `(target, from, body)` triple is treated as
@@ -55,6 +56,7 @@ pub(crate) enum PendingCodexPeerDelivery {
     SubmitAt(Instant),
     QueueAt {
         ready_at: Instant,
+        expires_at: Instant,
         message: PendingCodexPeerMessage,
         expected_composer: String,
     },
@@ -865,6 +867,7 @@ impl App {
                                     queue.pop_front();
                                     queue.push_front(PendingCodexPeerDelivery::QueueAt {
                                         ready_at: now + CODEX_PEER_NUDGE_SUBMIT_DELAY,
+                                        expires_at: now + CODEX_PEER_NUDGE_COMMIT_TIMEOUT,
                                         message,
                                         expected_composer: normalize_codex_composer_expected(
                                             &payload_text,
@@ -904,6 +907,7 @@ impl App {
                         }
                         PendingCodexPeerDelivery::QueueAt {
                             ready_at,
+                            expires_at,
                             message,
                             expected_composer,
                         } => {
@@ -916,6 +920,15 @@ impl App {
                                 }
                                 queue.pop_front();
                                 focused_notifications.push((pane_id, message));
+                                self.dirty = true;
+                                continue;
+                            }
+                            if now >= expires_at {
+                                if composer_matches {
+                                    let _ = write_input_to_pane(pane, b"\x15", false);
+                                }
+                                queue.pop_front();
+                                queue.push_front(PendingCodexPeerDelivery::Draft(message));
                                 self.dirty = true;
                                 continue;
                             }

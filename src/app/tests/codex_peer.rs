@@ -55,6 +55,24 @@ fn make_codex_native_queue_ready(app: &mut App, pane_id: usize) {
     }
 }
 
+fn expire_codex_native_queue(app: &mut App, pane_id: usize) {
+    let queue = app
+        .pending_codex_peer_messages
+        .get_mut(&pane_id)
+        .expect("pending nudge");
+    match queue.front_mut().expect("pending delivery") {
+        PendingCodexPeerDelivery::QueueAt {
+            ready_at,
+            expires_at,
+            ..
+        } => {
+            *ready_at = Instant::now();
+            *expires_at = Instant::now();
+        }
+        other => panic!("expected native queue stage, got {other:?}"),
+    }
+}
+
 fn setup_unfocused_registered_codex() -> (App, usize, usize) {
     let mut app = App::new(40, 160).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
@@ -1564,6 +1582,47 @@ fn native_queue_commit_does_not_send_changed_user_draft() {
             .get(&codex_id)
             .and_then(|q| q.front()),
         Some(PendingCodexPeerDelivery::QueueAt { .. })
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn native_queue_commit_times_out_to_pending_on_unknown_screen() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_codex_busy_placeholder(&mut app, codex_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "wait through approval".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[HAllow command `cargo publish`?\x1b[3;1HYes / No\x1b[3;1H",
+    );
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    expire_codex_native_queue(&mut app, codex_id);
+
+    app.flush_pending_codex_peer_messages();
+
+    assert!(app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::Draft(_))
     ));
     app.shutdown();
 }
