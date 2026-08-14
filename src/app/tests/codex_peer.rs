@@ -1839,6 +1839,12 @@ fn second_message_does_not_discard_in_flight_native_queue_commit() {
     app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "first".to_string())
         .expect("first send");
     app.flush_pending_codex_peer_messages();
+    let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: None,
+        from_kind: None,
+    });
+    seed_codex_busy_composer(&mut app, codex_id, &expected);
     app.ws_mut().focused_pane_id = codex_id;
 
     app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "second".to_string())
