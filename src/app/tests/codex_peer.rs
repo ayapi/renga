@@ -1926,6 +1926,61 @@ fn native_queue_commit_stops_after_one_retry_and_waits_for_focus() {
 }
 
 #[test]
+fn await_focus_nudge_resumes_when_unfocused_pane_becomes_idle() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    app.pending_codex_peer_messages.insert(
+        codex_id,
+        VecDeque::from([PendingCodexPeerDelivery::AwaitFocus(
+            PendingCodexPeerMessage {
+                from_pane: sender_id,
+                from_name: None,
+                from_kind: None,
+            },
+        )]),
+    );
+    seed_codex_ready_placeholder(&mut app, codex_id);
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::Draft {
+            retries_remaining: 0,
+            ..
+        })
+    ));
+    assert!(app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
+
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt(_))
+    ));
+    assert!(!app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
+    app.shutdown();
+}
+
+#[test]
 fn focusing_injected_nudge_does_not_commit_it_blindly() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     seed_codex_busy_placeholder(&mut app, codex_id);

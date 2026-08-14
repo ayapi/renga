@@ -1012,6 +1012,15 @@ impl App {
                                 queue.pop_front();
                                 focused_notifications.push((pane_id, message));
                                 self.dirty = true;
+                            } else if screen.as_ref().is_some_and(|state| {
+                                state.ready_for_nudge && state.has_draft == Some(false)
+                            }) {
+                                queue.pop_front();
+                                queue.push_front(PendingCodexPeerDelivery::Draft {
+                                    message,
+                                    retries_remaining: 0,
+                                });
+                                self.dirty = true;
                             }
                         }
                     }
