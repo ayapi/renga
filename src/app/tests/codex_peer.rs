@@ -1262,7 +1262,7 @@ fn live_idle_prompt_with_distant_footer_accepts_nudge() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[14;1Hgpt-5.6-sol medium - cwd\x1b[4;3H",
+        b"\x1b[?25h\x1b[2J\x1b[1;1HReady\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[5;1Hwrapped composer row 1\x1b[6;1Hwrapped composer row 2\x1b[7;1Hwrapped composer row 3\x1b[8;1Hwrapped composer row 4\x1b[9;1Hwrapped composer row 5\x1b[10;1Hwrapped composer row 6\x1b[11;1Hwrapped composer row 7\x1b[12;1Hwrapped composer row 8\x1b[14;1Ho3 high - cwd\x1b[1;3H",
     );
     {
         let pane = app.ws().panes.get(&codex_id).expect("pane");
@@ -1306,6 +1306,23 @@ fn live_idle_prompt_with_distant_footer_accepts_nudge() {
         "validated live composer should receive the peer nudge"
     );
     app.shutdown();
+}
+
+#[test]
+fn non_gpt_footer_is_live_with_cursor_parked_on_footer() {
+    let mut parser = vt100::Parser::new(40, 120, 0);
+    parser.process(
+        b"\x1b[?25h\x1b[2J\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Ho3 high - cwd\x1b[6;10H",
+    );
+
+    assert_eq!(
+        codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+        Some(true)
+    );
+    assert_eq!(
+        codex_composer_has_draft_on_screen(parser.screen()),
+        Some(false)
+    );
 }
 
 #[test]
@@ -1820,7 +1837,7 @@ fn busy_codex_nudge_submits_if_turn_finishes_before_tab() {
     // Codex v0.147.0 has no idle action hint. Turn completion is observable
     // only through the disappearance of the busy status above the composer.
     let idle_screen = format!(
-        "\x1b[?25h\x1b[2J\x1b[H\u{203a} {expected}\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[3;20H"
+        "\x1b[?25h\x1b[2J\x1b[H\u{203a} {expected}\x1b[5;1Hgpt-5.6-sol medium - cwd\x1b[3;20H"
     );
     seed_pane_screen(&mut app, sibling_id, idle_screen.as_bytes());
     {

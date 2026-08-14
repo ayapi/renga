@@ -136,9 +136,9 @@ pub(crate) fn screen_has_visible_text(screen: &vt100::Screen) -> bool {
     false
 }
 
-fn looks_like_codex_footer_rows(rows: &[String]) -> bool {
+fn looks_like_codex_footer_rows(rows: &[String], separator_rows: usize) -> bool {
     let joined = rows.concat();
-    (rows.len() == 1 && joined.starts_with("gpt-"))
+    (separator_rows == 1 && rows.len() == 1)
         || joined == "entertosend"
         || (joined.starts_with("tabtoqueuemessage") && joined.ends_with("contextleft"))
 }
@@ -158,6 +158,7 @@ fn codex_live_composer_position(screen: &vt100::Screen) -> Option<(u16, u16)> {
     // followed only by wrapped input, blank separation, and its footer. If a
     // future layout adds unknown content there, leave the peer nudge pending.
     let mut separator_seen = false;
+    let mut separator_rows = 0;
     let mut content_before_separator = false;
     let mut last_content_before_separator = prompt_row;
     let mut footer_rows = Vec::new();
@@ -165,7 +166,10 @@ fn codex_live_composer_position(screen: &vt100::Screen) -> Option<(u16, u16)> {
     for row in prompt_row.saturating_add(1)..rows {
         let normalized = normalized_screen_rows(screen, row, row.saturating_add(1));
         if normalized.is_empty() {
-            separator_seen = true;
+            if footer_rows.is_empty() {
+                separator_seen = true;
+                separator_rows += 1;
+            }
             continue;
         }
         if !separator_seen {
@@ -176,7 +180,7 @@ fn codex_live_composer_position(screen: &vt100::Screen) -> Option<(u16, u16)> {
         footer_rows.push(normalized);
     }
 
-    let footer_seen = looks_like_codex_footer_rows(&footer_rows);
+    let footer_seen = looks_like_codex_footer_rows(&footer_rows, separator_rows);
     if footer_seen
         || (footer_rows.is_empty() && !content_before_separator && cursor_row == prompt_row)
     {
