@@ -1160,6 +1160,140 @@ fn codex_prompt_allows_peer_nudge_uses_recent_content_on_tall_screens() {
 }
 
 #[test]
+fn transcript_prompt_before_unknown_modal_does_not_accept_nudge() {
+    let mut app = App::new(40, 160).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(codex_id);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (12s - esc to interrupt)\x1b[4;1H\xE2\x80\xBA old request\x1b[5;1Htool output\x1b[7;1HAllow this command?\x1b[8;1HYes / No\x1b[4;3H",
+    );
+    {
+        let pane = app.ws().panes.get(&codex_id).expect("pane");
+        let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(codex_composer_has_draft_on_screen(parser.screen()), None);
+        assert_eq!(normalized_codex_composer_text(parser.screen()), None);
+        assert_eq!(
+            codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+            None
+        );
+    }
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "wait through modal".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::Draft { .. })
+    ));
+    assert!(
+        app.ws()
+            .panes
+            .get(&codex_id)
+            .expect("pane")
+            .test_input()
+            .is_empty(),
+        "unknown modal layout must not receive PTY input"
+    );
+    app.shutdown();
+}
+
+#[test]
+fn live_idle_prompt_with_distant_footer_accepts_nudge() {
+    let mut app = App::new(40, 160).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(codex_id);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[14;1Hgpt-5.6-sol medium - cwd\x1b[4;3H",
+    );
+    {
+        let pane = app.ws().panes.get(&codex_id).expect("pane");
+        let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+            Some(true)
+        );
+        assert_eq!(
+            codex_composer_has_draft_on_screen(parser.screen()),
+            Some(false)
+        );
+    }
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "idle prompt".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt(_))
+    ));
+    assert!(
+        !app.ws()
+            .panes
+            .get(&codex_id)
+            .expect("pane")
+            .test_input()
+            .is_empty(),
+        "validated live composer should receive the peer nudge"
+    );
+    app.shutdown();
+}
+
+#[test]
 fn codex_prompt_allows_nudge_with_cursor_parked_on_footer() {
     let mut parser = vt100::Parser::new(40, 80, 0);
     parser.process(

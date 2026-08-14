@@ -4,6 +4,7 @@ pub(crate) const CODEX_APPEND_ENTER_DELAY: Duration = Duration::from_millis(75);
 pub(crate) const CODEX_PEER_NUDGE_COMMIT_DELAY: Duration = Duration::from_millis(1000);
 pub(crate) const CODEX_PEER_NUDGE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const CODEX_PEER_NUDGE_MAX_RETRIES: u8 = 1;
+#[cfg(test)]
 pub(crate) const CODEX_APPEND_ENTER_SNAPSHOT_LINES: usize = 8;
 
 /// Window during which a `(target, from, body)` triple is treated as
@@ -135,45 +136,64 @@ pub(crate) fn screen_has_visible_text(screen: &vt100::Screen) -> bool {
     false
 }
 
+fn looks_like_codex_footer_rows(rows: &[String]) -> bool {
+    let joined = rows.concat();
+    (rows.len() == 1 && joined.starts_with("gpt-"))
+        || joined == "entertosend"
+        || (joined.starts_with("tabtoqueuemessage") && joined.ends_with("contextleft"))
+}
+
+fn codex_live_composer_position(screen: &vt100::Screen) -> Option<(u16, u16)> {
+    let (rows, cols) = screen.size();
+    let (prompt_row, prompt_col) = (0..rows).rev().find_map(|row| {
+        (0..cols).find_map(|col| {
+            screen
+                .cell(row, col)
+                .is_some_and(|cell| cell.contents() == "\u{203a}")
+                .then_some((row, col))
+        })
+    })?;
+    let (cursor_row, _) = screen.cursor_position();
+    // Codex v0.147.0 keeps the live composer as the final prompt marker,
+    // followed only by wrapped input, blank separation, and its footer. If a
+    // future layout adds unknown content there, leave the peer nudge pending.
+    let mut separator_seen = false;
+    let mut content_before_separator = false;
+    let mut last_content_before_separator = prompt_row;
+    let mut footer_rows = Vec::new();
+
+    for row in prompt_row.saturating_add(1)..rows {
+        let normalized = normalized_screen_rows(screen, row, row.saturating_add(1));
+        if normalized.is_empty() {
+            separator_seen = true;
+            continue;
+        }
+        if !separator_seen {
+            content_before_separator = true;
+            last_content_before_separator = row;
+            continue;
+        }
+        footer_rows.push(normalized);
+    }
+
+    let footer_seen = looks_like_codex_footer_rows(&footer_rows);
+    if footer_seen || (!content_before_separator && cursor_row == prompt_row) {
+        return Some((prompt_row, prompt_col));
+    }
+    (footer_rows.is_empty()
+        && content_before_separator
+        && cursor_row > prompt_row
+        && cursor_row <= last_content_before_separator)
+        .then_some((prompt_row, prompt_col))
+}
+
 pub(crate) fn codex_prompt_allows_peer_nudge_on_screen(screen: &vt100::Screen) -> Option<bool> {
     if screen.hide_cursor() {
         return Some(false);
     }
-    let (rows, cols) = screen.size();
-    let mut last_content_row = None;
-    for row in 0..rows {
-        let mut has_text = false;
-        for col in 0..cols {
-            if let Some(cell) = screen.cell(row, col) {
-                if !cell.contents().trim().is_empty() {
-                    has_text = true;
-                    break;
-                }
-            }
-        }
-        if has_text {
-            last_content_row = Some(row);
-        }
-    }
-    let mut prompt_row = None;
+    let (_, cols) = screen.size();
     let (cursor_row, cursor_col) = screen.cursor_position();
-    let end_row = last_content_row.unwrap_or(cursor_row).max(cursor_row);
-    let start_row = end_row
-        .saturating_add(1)
-        .saturating_sub(CODEX_APPEND_ENTER_SNAPSHOT_LINES as u16);
-    for row in (start_row..=end_row).rev() {
-        let mut line = String::with_capacity(cols as usize);
-        for col in 0..cols {
-            if let Some(cell) = screen.cell(row, col) {
-                line.push_str(cell.contents());
-            }
-        }
-        if line.trim_start().starts_with('›') {
-            prompt_row = Some(row);
-            break;
-        }
-    }
-    let prompt_row = prompt_row?;
+    let (prompt_row, _) = codex_live_composer_position(screen)?;
     if cursor_row > prompt_row && !cursor_is_on_codex_footer(screen, prompt_row, cursor_row, cols) {
         return Some(false);
     }
@@ -210,101 +230,53 @@ fn cursor_is_on_codex_footer(
 }
 
 pub(crate) fn codex_composer_has_draft_on_screen(screen: &vt100::Screen) -> Option<bool> {
-    let (rows, cols) = screen.size();
+    let (_, cols) = screen.size();
     let (cursor_row, cursor_col) = screen.cursor_position();
-    let mut last_content_row = None;
-    for row in 0..rows {
-        let mut has_text = false;
-        for col in 0..cols {
-            if let Some(cell) = screen.cell(row, col) {
-                if !cell.contents().trim().is_empty() {
-                    has_text = true;
-                    break;
-                }
-            }
-        }
-        if has_text {
-            last_content_row = Some(row);
-        }
+    let (row, prompt_col) = codex_live_composer_position(screen)?;
+    let input_start = prompt_col.saturating_add(1);
+    let editable_start = if screen
+        .cell(row, input_start)
+        .is_some_and(|cell| cell.contents().trim().is_empty())
+    {
+        input_start.saturating_add(1)
+    } else {
+        input_start
+    };
+    if cursor_row > row && !cursor_is_on_codex_footer(screen, row, cursor_row, cols) {
+        return Some(true);
     }
-    let end_row = last_content_row.unwrap_or(cursor_row).max(cursor_row);
-    // Peer nudges can wrap beyond the short readiness snapshot. Search the
-    // full visible screen so draft protection agrees with screen analysis.
-    let start_row = 0;
-    for row in (start_row..=end_row).rev() {
-        let mut prompt_col = None;
-        for col in 0..cols {
-            if let Some(cell) = screen.cell(row, col) {
-                if cell.contents() == "›" {
-                    prompt_col = Some(col);
-                    break;
-                }
-            }
-        }
-        let Some(prompt_col) = prompt_col else {
-            continue;
-        };
-        let input_start = prompt_col.saturating_add(1);
-        let editable_start = if screen
-            .cell(row, input_start)
-            .is_some_and(|cell| cell.contents().trim().is_empty())
-        {
-            input_start.saturating_add(1)
-        } else {
-            input_start
-        };
-        if cursor_row > row && !cursor_is_on_codex_footer(screen, row, cursor_row, cols) {
+    if cursor_row == row {
+        if cursor_col > editable_start {
             return Some(true);
         }
-        if cursor_row == row {
-            if cursor_col > editable_start {
-                return Some(true);
-            }
-            return Some(false);
-        }
-
-        let mut input_text = String::new();
-        let mut has_input_text = false;
-        let mut has_normal_input_text = false;
-        for col in input_start..cols {
-            let Some(cell) = screen.cell(row, col) else {
-                continue;
-            };
-            input_text.push_str(cell.contents());
-            if cell.contents().trim().is_empty() {
-                continue;
-            }
-            has_input_text = true;
-            if !cell.dim() {
-                has_normal_input_text = true;
-            }
-        }
-        if !has_input_text || looks_like_codex_placeholder(&input_text) {
-            return Some(false);
-        }
-        return Some(has_normal_input_text);
+        return Some(false);
     }
-    None
+
+    let mut input_text = String::new();
+    let mut has_input_text = false;
+    let mut has_normal_input_text = false;
+    for col in input_start..cols {
+        let Some(cell) = screen.cell(row, col) else {
+            continue;
+        };
+        input_text.push_str(cell.contents());
+        if cell.contents().trim().is_empty() {
+            continue;
+        }
+        has_input_text = true;
+        if !cell.dim() {
+            has_normal_input_text = true;
+        }
+    }
+    if !has_input_text || looks_like_codex_placeholder(&input_text) {
+        return Some(false);
+    }
+    Some(has_normal_input_text)
 }
 
 pub(crate) fn normalized_codex_composer_text(screen: &vt100::Screen) -> Option<String> {
     let (rows, cols) = screen.size();
-    let (cursor_row, _) = screen.cursor_position();
-    let last_content_row = (0..rows)
-        .rev()
-        .find(|row| screen_row_has_visible_text(screen, *row, cols));
-    let end_row = last_content_row.unwrap_or(cursor_row).max(cursor_row);
-    // Keep this prompt search aligned with draft detection and the full-screen
-    // prompt lookup in analyze_codex_peer_screen.
-    let start_row = 0;
-    let (prompt_row, prompt_col) = (start_row..=end_row).rev().find_map(|row| {
-        (0..cols).find_map(|col| {
-            screen
-                .cell(row, col)
-                .is_some_and(|cell| cell.contents() == "\u{203a}")
-                .then_some((row, col))
-        })
-    })?;
+    let (prompt_row, prompt_col) = codex_live_composer_position(screen)?;
     let input_start = prompt_col.saturating_add(1);
     let editable_start = if screen
         .cell(prompt_row, input_start)
@@ -361,14 +333,8 @@ fn normalized_screen_rows(screen: &vt100::Screen, start: u16, end: u16) -> Strin
 fn analyze_codex_peer_screen(screen: &vt100::Screen) -> CodexPeerScreenSnapshot {
     let has_draft = codex_composer_has_draft_on_screen(screen);
     let composer = normalized_codex_composer_text(screen);
-    let (rows, cols) = screen.size();
-    let prompt_row = (0..rows).rev().find(|row| {
-        (0..cols).any(|col| {
-            screen
-                .cell(*row, col)
-                .is_some_and(|cell| cell.contents() == "\u{203a}")
-        })
-    });
+    let (rows, _) = screen.size();
+    let prompt_row = codex_live_composer_position(screen).map(|(row, _)| row);
     let (status, footer) = prompt_row.map_or_else(
         || (String::new(), String::new()),
         |prompt_row| {
