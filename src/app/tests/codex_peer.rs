@@ -1137,6 +1137,19 @@ fn codex_prompt_allows_peer_nudge_uses_recent_content_on_tall_screens() {
 }
 
 #[test]
+fn codex_prompt_allows_nudge_with_cursor_parked_on_footer() {
+    let mut parser = vt100::Parser::new(40, 80, 0);
+    parser.process(
+        b"\x1b[?25h\x1b[2J\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1H  gpt-5.6 high\x1b[6;20H",
+    );
+
+    assert_eq!(
+        codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+        Some(true)
+    );
+}
+
+#[test]
 fn flush_pending_codex_peer_messages_does_not_interrupt_existing_codex_draft() {
     let mut app = App::new(40, 80).expect("App::new");
     let sender_id = app.ws().focused_pane_id;

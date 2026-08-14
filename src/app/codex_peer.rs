@@ -173,7 +173,7 @@ pub(crate) fn codex_prompt_allows_peer_nudge_on_screen(screen: &vt100::Screen) -
         }
     }
     let prompt_row = prompt_row?;
-    if cursor_row > prompt_row {
+    if cursor_row > prompt_row && !cursor_is_on_codex_footer(screen, prompt_row, cursor_row, cols) {
         return Some(false);
     }
     if cursor_row == prompt_row && cursor_col > 2 {
