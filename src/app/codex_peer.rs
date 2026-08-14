@@ -42,12 +42,18 @@ pub(crate) struct CodexPeerNotificationState {
     pub(crate) target_pane: usize,
     pub(crate) message: PendingCodexPeerMessage,
     pub(crate) pending_count: usize,
+    pub(crate) retries_remaining: Option<u8>,
 }
 
 impl CodexPeerNotificationState {
-    fn register_message(&mut self, message: PendingCodexPeerMessage) {
+    fn register_message(
+        &mut self,
+        message: PendingCodexPeerMessage,
+        retries_remaining: Option<u8>,
+    ) {
         self.message = message;
         self.pending_count = self.pending_count.saturating_add(1);
+        self.retries_remaining = self.retries_remaining.max(retries_remaining);
     }
 }
 
@@ -669,26 +675,45 @@ impl App {
     }
 
     fn push_pending_codex_peer_nudge(&mut self, pane_id: usize, message: PendingCodexPeerMessage) {
+        self.push_pending_codex_peer_nudge_with_retries(
+            pane_id,
+            message,
+            CODEX_PEER_NUDGE_MAX_RETRIES,
+        );
+    }
+
+    fn push_pending_codex_peer_nudge_with_retries(
+        &mut self,
+        pane_id: usize,
+        message: PendingCodexPeerMessage,
+        retries_remaining: u8,
+    ) {
         let queue = self.pending_codex_peer_messages.entry(pane_id).or_default();
         if queue.is_empty() {
             queue.push_back(PendingCodexPeerDelivery::Draft {
                 message,
-                retries_remaining: CODEX_PEER_NUDGE_MAX_RETRIES,
+                retries_remaining,
             });
         }
     }
 
-    fn show_codex_peer_notification(&mut self, pane_id: usize, message: PendingCodexPeerMessage) {
+    fn show_codex_peer_notification(
+        &mut self,
+        pane_id: usize,
+        message: PendingCodexPeerMessage,
+        retries_remaining: Option<u8>,
+    ) {
         self.pending_codex_peer_messages.remove(&pane_id);
         match self.codex_peer_notification.as_mut() {
             Some(notification) if notification.target_pane == pane_id => {
-                notification.register_message(message);
+                notification.register_message(message, retries_remaining);
             }
             _ => {
                 self.codex_peer_notification = Some(CodexPeerNotificationState {
                     target_pane: pane_id,
                     message,
                     pending_count: 1,
+                    retries_remaining,
                 });
             }
         }
@@ -708,7 +733,7 @@ impl App {
             .and_then(codex_composer_has_draft)
             .unwrap_or(false);
         if has_draft {
-            self.show_codex_peer_notification(pane_id, message);
+            self.show_codex_peer_notification(pane_id, message, Some(CODEX_PEER_NUDGE_MAX_RETRIES));
             return Ok(());
         }
         let ready = self
@@ -769,8 +794,27 @@ impl App {
         let Some(notification) = self.codex_peer_notification.take() else {
             return;
         };
-        self.push_pending_codex_peer_nudge(notification.target_pane, notification.message);
+        self.restore_codex_peer_notification(notification);
         self.dirty = true;
+    }
+
+    fn restore_codex_peer_notification(&mut self, notification: CodexPeerNotificationState) {
+        match notification.retries_remaining {
+            Some(retries_remaining) => self.push_pending_codex_peer_nudge_with_retries(
+                notification.target_pane,
+                notification.message,
+                retries_remaining,
+            ),
+            None => {
+                let queue = self
+                    .pending_codex_peer_messages
+                    .entry(notification.target_pane)
+                    .or_default();
+                if queue.is_empty() {
+                    queue.push_back(PendingCodexPeerDelivery::AwaitFocus(notification.message));
+                }
+            }
+        }
     }
 
     fn materialize_unfocused_codex_peer_notification(&mut self) {
@@ -784,7 +828,7 @@ impl App {
             .resolve_pane_across_workspaces(&PaneRef::Id(notification.target_pane))
             .is_some()
         {
-            self.push_pending_codex_peer_nudge(notification.target_pane, notification.message);
+            self.restore_codex_peer_notification(notification.clone());
         }
         self.codex_peer_notification = None;
         self.dirty = true;
@@ -891,7 +935,11 @@ impl App {
                             if screen.as_ref().and_then(|state| state.has_draft) == Some(true) {
                                 if pane_is_focused {
                                     queue.pop_front();
-                                    focused_notifications.push((pane_id, message));
+                                    focused_notifications.push((
+                                        pane_id,
+                                        message,
+                                        Some(retries_remaining),
+                                    ));
                                     self.dirty = true;
                                 }
                                 continue;
@@ -966,7 +1014,11 @@ impl App {
                                     let _ = write_input_to_pane(pane, b"\x15", false);
                                 }
                                 queue.pop_front();
-                                focused_notifications.push((pane_id, message));
+                                focused_notifications.push((
+                                    pane_id,
+                                    message,
+                                    Some(retries_remaining),
+                                ));
                                 self.dirty = true;
                                 continue;
                             }
@@ -1010,7 +1062,7 @@ impl App {
                         PendingCodexPeerDelivery::AwaitFocus(message) => {
                             if pane_is_focused {
                                 queue.pop_front();
-                                focused_notifications.push((pane_id, message));
+                                focused_notifications.push((pane_id, message, None));
                                 self.dirty = true;
                             } else if screen.as_ref().is_some_and(|state| {
                                 state.ready_for_nudge && state.has_draft == Some(false)
@@ -1033,8 +1085,8 @@ impl App {
         for pane_id in empty_panes {
             self.pending_codex_peer_messages.remove(&pane_id);
         }
-        for (pane_id, message) in focused_notifications {
-            self.show_codex_peer_notification(pane_id, message);
+        for (pane_id, message, retries_remaining) in focused_notifications {
+            self.show_codex_peer_notification(pane_id, message, retries_remaining);
         }
     }
 }
