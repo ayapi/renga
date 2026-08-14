@@ -2121,6 +2121,48 @@ fn await_focus_nudge_resumes_when_unfocused_pane_becomes_idle() {
 }
 
 #[test]
+fn await_focus_nudge_does_not_resume_over_footer_parked_draft() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    app.pending_codex_peer_messages.insert(
+        codex_id,
+        VecDeque::from([PendingCodexPeerDelivery::AwaitFocus(
+            PendingCodexPeerMessage {
+                from_pane: sender_id,
+                from_name: None,
+                from_kind: None,
+            },
+        )]),
+    );
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[HPrevious output\x1b[4;1H\xE2\x80\xBA keep my draft\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[6;20H",
+    );
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::AwaitFocus(_))
+    ));
+    assert!(app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
+    app.shutdown();
+}
+
+#[test]
 fn exhausted_notification_stays_parked_after_focus_leaves() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     app.pending_codex_peer_messages.insert(
