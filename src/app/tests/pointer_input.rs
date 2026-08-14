@@ -492,6 +492,93 @@ fn two_pane_vertical_app() -> (App, usize, usize) {
     (app, a_id, b_id)
 }
 
+fn make_scrollbar_visible(app: &App, pane_id: usize) {
+    app.ws()
+        .panes
+        .get(&pane_id)
+        .expect("pane exists")
+        .total_scrollback
+        .store(1_000, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn pane_rect(app: &App, pane_id: usize) -> Rect {
+    app.ws()
+        .last_pane_rects
+        .iter()
+        .find_map(|&(id, rect)| (id == pane_id).then_some(rect))
+        .expect("pane rect exists")
+}
+
+#[test]
+fn visible_scrollbar_on_left_split_wins_over_resize_gesture() {
+    let (mut app, a_id, _b_id) = two_pane_vertical_app();
+    make_scrollbar_visible(&app, a_id);
+    let rect = pane_rect(&app, a_id);
+    let scrollbar_col = rect.x + rect.width - 1;
+
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        scrollbar_col,
+        20,
+    ));
+
+    assert!(matches!(
+        app.dragging,
+        Some(DragTarget::Scrollbar(id, _)) if id == a_id
+    ));
+    assert_eq!(app.ws().layout.pane_count(), 2);
+    app.shutdown();
+}
+
+#[test]
+fn repeated_visible_scrollbar_click_does_not_split_outer_edge() {
+    let (mut app, _a_id, b_id) = two_pane_vertical_app();
+    make_scrollbar_visible(&app, b_id);
+    let rect = pane_rect(&app, b_id);
+    let scrollbar_col = rect.x + rect.width - 1;
+
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        scrollbar_col,
+        20,
+    ));
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        scrollbar_col,
+        20,
+    ));
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        scrollbar_col,
+        20,
+    ));
+
+    assert_eq!(app.ws().layout.pane_count(), 2);
+    assert!(matches!(
+        app.dragging,
+        Some(DragTarget::Scrollbar(id, _)) if id == b_id
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn hidden_scrollbar_does_not_claim_right_border_click() {
+    let (mut app, _a_id, b_id) = two_pane_vertical_app();
+    let rect = pane_rect(&app, b_id);
+    let right_border_col = rect.x + rect.width - 1;
+
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        right_border_col,
+        20,
+    ));
+
+    assert!(!matches!(app.dragging, Some(DragTarget::Scrollbar(..))));
+    assert!(app.last_edge_click.is_some());
+    assert_eq!(app.ws().layout.pane_count(), 2);
+    app.shutdown();
+}
+
 #[test]
 fn boundary_double_click_splits_between_siblings() {
     let (mut app, a_id, b_id) = two_pane_vertical_app();
