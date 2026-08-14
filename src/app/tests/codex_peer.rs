@@ -1767,6 +1767,66 @@ fn native_queue_commit_does_not_send_changed_user_draft() {
 
     app.flush_pending_codex_peer_messages();
 
+    // With enough wrapped rows to move the footer outside its measured range,
+    // the exact-composer snapshot is also unavailable. Both checks therefore
+    // degrade to a pending QueueAt instead of ever selecting Enter.
+    assert!(app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::QueueAt { .. })
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn queue_hint_outside_footer_range_never_falls_through_to_enter() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_codex_busy_placeholder(&mut app, codex_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "narrow pane".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: None,
+        from_kind: None,
+    });
+    let chars = expected.chars().collect::<Vec<_>>();
+    let mut screen =
+        String::from("\x1b[?25h\x1b[2J\x1b[H\u{25e6} Working (1m 03s - esc to interrupt)");
+    for (index, chunk) in chars.chunks(20).enumerate() {
+        let row = 4 + index;
+        let text = chunk.iter().collect::<String>();
+        let prefix = if index == 0 { "\u{203a} " } else { "  " };
+        screen.push_str(&format!("\x1b[{row};1H{prefix}{text}"));
+    }
+    let blank_row = 4 + chars.chunks(20).len();
+    let footer_row = blank_row + 1;
+    screen.push_str(&format!(
+        "\x1b[{footer_row};1H  tab to queue message  51% context left\x1b[4;3H"
+    ));
+    seed_pane_screen(&mut app, codex_id, screen.as_bytes());
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    make_codex_native_queue_ready(&mut app, codex_id);
+
+    app.flush_pending_codex_peer_messages();
+
     assert!(app
         .ws()
         .panes
