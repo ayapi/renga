@@ -383,23 +383,28 @@ fn analyze_codex_peer_screen(screen: &vt100::Screen) -> CodexPeerScreenSnapshot 
     // Positive detection controls whether renga may inject and press Tab, so
     // anchor the busy signal above the composer and the queue action below it.
     // Transcript mentions and unknown future UI safely remain pending.
-    let busy = status.lines().any(|line| {
+    let native_queue_busy = status.lines().any(|line| {
         let status_text = line.trim_start_matches(|ch: char| !ch.is_alphanumeric());
         status_text.starts_with("working(") && status_text.contains("esctointerrupt")
     });
+    // A partial or unfamiliar interrupt status is not enough evidence to use
+    // Codex's native queue, but it is enough to reject the idle path. This
+    // keeps wrapped or renamed status text from causing an Enter mid-turn.
+    let interrupt_status_visible = status.contains("esctointerrupt");
     let busy_queue_available =
-        !screen.hide_cursor() && busy && footer.contains("tabtoqueuemessage");
-    let can_queue_message = !screen.hide_cursor() && has_draft == Some(false) && busy;
+        !screen.hide_cursor() && native_queue_busy && footer.contains("tabtoqueuemessage");
+    let can_queue_message = !screen.hide_cursor() && has_draft == Some(false) && native_queue_busy;
     // Codex does not render an idle action hint. After injection, the reliable
     // completion signal is that the prompt remains visible while the busy
     // status above it has disappeared. QueueAt separately requires the exact
     // injected composer text before this may result in Enter.
-    let can_submit_injected_message = prompt_row.is_some() && !screen.hide_cursor() && !busy;
+    let can_submit_injected_message =
+        prompt_row.is_some() && !screen.hide_cursor() && !interrupt_status_visible;
     let ready_without_prompt = prompt_row.is_none() && {
         let screen_text = normalized_screen_rows(screen, 0, rows);
         screen_text.contains("entertosend") || screen_text.contains("readyforinput")
     };
-    let ready_for_nudge = !busy
+    let ready_for_nudge = !interrupt_status_visible
         && screen_has_visible_text(screen)
         && (codex_prompt_allows_peer_nudge_on_screen(screen).unwrap_or(ready_without_prompt));
     CodexPeerScreenSnapshot {

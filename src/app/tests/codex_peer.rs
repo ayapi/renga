@@ -1452,7 +1452,7 @@ fn busy_codex_uses_structured_status_row() {
 }
 
 #[test]
-fn nearby_transcript_interrupt_phrase_does_not_mark_prompt_busy() {
+fn nearby_transcript_interrupt_phrase_uses_neither_automatic_path() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     seed_pane_screen(
         &mut app,
@@ -1472,8 +1472,84 @@ fn nearby_transcript_interrupt_phrase_does_not_mark_prompt_busy() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::SubmitAt(_))
+        Some(PendingCodexPeerDelivery::Draft { .. })
     ));
+    app.shutdown();
+}
+
+#[test]
+fn wrapped_busy_status_blocks_both_queue_and_idle_paths() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (1m 03s -\x1b[2;1Hesc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[4;3H",
+    );
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "wrapped status".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::Draft { .. })
+    ));
+    assert!(app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
+    app.shutdown();
+}
+
+#[test]
+fn unfamiliar_interrupt_status_blocks_both_queue_and_idle_paths() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Thinking (48s - esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[4;3H",
+    );
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "unfamiliar status".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::Draft { .. })
+    ));
+    assert!(app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
     app.shutdown();
 }
 
