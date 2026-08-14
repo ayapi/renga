@@ -379,7 +379,10 @@ fn analyze_codex_peer_screen(screen: &vt100::Screen) -> CodexPeerScreenSnapshot 
     // Positive detection controls whether renga may inject and press Tab, so
     // anchor the busy signal above the composer and the queue action below it.
     // Transcript mentions and unknown future UI safely remain pending.
-    let busy = status.contains("esctointerrupt");
+    let busy = status.lines().any(|line| {
+        let status_text = line.trim_start_matches(|ch: char| !ch.is_alphanumeric());
+        status_text.starts_with("working(") && status_text.contains("esctointerrupt")
+    });
     let busy_queue_available =
         !screen.hide_cursor() && busy && footer.contains("tabtoqueuemessage");
     let can_queue_message = !screen.hide_cursor() && has_draft == Some(false) && busy;

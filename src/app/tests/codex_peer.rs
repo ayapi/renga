@@ -1426,12 +1426,12 @@ fn unfocused_busy_codex_without_draft_queues_nudge_natively() {
 }
 
 #[test]
-fn busy_codex_uses_positioned_interrupt_hint_without_working_label() {
+fn busy_codex_uses_structured_status_row() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[Hesc to interrupt\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6 high\x1b[1;9H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (48s - esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6 high\x1b[1;9H",
     );
 
     app.handle_peer_send(
@@ -1447,6 +1447,32 @@ fn busy_codex_uses_positioned_interrupt_hint_without_working_label() {
             .get(&codex_id)
             .and_then(|q| q.front()),
         Some(PendingCodexPeerDelivery::QueueAt { .. })
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn nearby_transcript_interrupt_phrase_does_not_mark_prompt_busy() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[HDuring a turn Codex prints esc to interrupt in its status row.\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[4;3H",
+    );
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "nearby transcript".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt(_))
     ));
     app.shutdown();
 }
