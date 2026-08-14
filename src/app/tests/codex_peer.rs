@@ -1241,6 +1241,120 @@ fn transcript_prompt_separated_from_unknown_output_is_not_live() {
 }
 
 #[test]
+fn persistently_unknown_screen_surfaces_notification_on_focus() {
+    let mut app = App::new(40, 160).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(codex_id);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[Hfuture Codex layout",
+    );
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "unknown screen".to_string(),
+    )
+    .expect("peer send");
+
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::Draft {
+            unknown_screen_checks: 1,
+            ..
+        })
+    ));
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::AwaitFocus(_))
+    ));
+    assert!(
+        app.ws()
+            .panes
+            .get(&codex_id)
+            .expect("pane")
+            .test_input()
+            .is_empty(),
+        "unknown screens must not receive PTY input"
+    );
+
+    app.handle_focus(&ipc::PaneRef::Id(codex_id))
+        .expect("focus unknown Codex pane");
+    assert!(app.visible_codex_peer_notification().is_some());
+    app.shutdown();
+}
+
+#[test]
+fn recognized_screen_resets_unknown_check_count() {
+    let mut app = App::new(40, 160).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(codex_id);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    seed_pane_screen(&mut app, codex_id, b"\x1b[?25h\x1b[2J\x1b[Hunknown");
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "reset count".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    seed_codex_draft(&mut app, codex_id);
+    app.flush_pending_codex_peer_messages();
+    seed_pane_screen(&mut app, codex_id, b"\x1b[?25h\x1b[2J\x1b[Hunknown again");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::Draft {
+            unknown_screen_checks: 1,
+            ..
+        })
+    ));
+    app.shutdown();
+}
+
+#[test]
 fn live_idle_prompt_with_distant_footer_accepts_nudge() {
     let mut app = App::new(40, 160).expect("App::new");
     let sender_id = app.ws().focused_pane_id;

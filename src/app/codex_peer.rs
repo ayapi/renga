@@ -4,6 +4,7 @@ pub(crate) const CODEX_APPEND_ENTER_DELAY: Duration = Duration::from_millis(75);
 pub(crate) const CODEX_PEER_NUDGE_COMMIT_DELAY: Duration = Duration::from_millis(1000);
 pub(crate) const CODEX_PEER_NUDGE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const CODEX_PEER_NUDGE_MAX_RETRIES: u8 = 1;
+pub(crate) const CODEX_PEER_UNKNOWN_SCREEN_MAX_CHECKS: u8 = 2;
 #[cfg(test)]
 pub(crate) const CODEX_APPEND_ENTER_SNAPSHOT_LINES: usize = 8;
 
@@ -63,6 +64,7 @@ pub(crate) enum PendingCodexPeerDelivery {
     Draft {
         message: PendingCodexPeerMessage,
         retries_remaining: u8,
+        unknown_screen_checks: u8,
     },
     SubmitAt(Instant),
     QueueAt {
@@ -665,6 +667,7 @@ impl App {
             queue.push_back(PendingCodexPeerDelivery::Draft {
                 message,
                 retries_remaining,
+                unknown_screen_checks: 0,
             });
         }
     }
@@ -903,7 +906,44 @@ impl App {
                         PendingCodexPeerDelivery::Draft {
                             message,
                             retries_remaining,
+                            unknown_screen_checks,
                         } => {
+                            let screen_unrecognized = screen
+                                .as_ref()
+                                .is_none_or(|state| state.has_draft.is_none());
+                            if screen_unrecognized {
+                                let next_checks = unknown_screen_checks.saturating_add(1);
+                                queue.pop_front();
+                                if next_checks >= CODEX_PEER_UNKNOWN_SCREEN_MAX_CHECKS {
+                                    if pane_is_focused {
+                                        focused_notifications.push((
+                                            pane_id,
+                                            message,
+                                            Some(retries_remaining),
+                                        ));
+                                    } else {
+                                        queue.push_front(PendingCodexPeerDelivery::AwaitFocus(
+                                            message,
+                                        ));
+                                    }
+                                } else {
+                                    queue.push_front(PendingCodexPeerDelivery::Draft {
+                                        message,
+                                        retries_remaining,
+                                        unknown_screen_checks: next_checks,
+                                    });
+                                }
+                                self.dirty = true;
+                                continue;
+                            }
+                            if unknown_screen_checks > 0 {
+                                queue.pop_front();
+                                queue.push_front(PendingCodexPeerDelivery::Draft {
+                                    message: message.clone(),
+                                    retries_remaining,
+                                    unknown_screen_checks: 0,
+                                });
+                            }
                             if screen.as_ref().and_then(|state| state.has_draft) == Some(true) {
                                 if pane_is_focused {
                                     queue.pop_front();
@@ -1003,6 +1043,7 @@ impl App {
                                     queue.push_front(PendingCodexPeerDelivery::Draft {
                                         message,
                                         retries_remaining: retries_remaining - 1,
+                                        unknown_screen_checks: 0,
                                     });
                                 } else {
                                     queue.push_front(PendingCodexPeerDelivery::AwaitFocus(message));
@@ -1043,6 +1084,7 @@ impl App {
                                 queue.push_front(PendingCodexPeerDelivery::Draft {
                                     message,
                                     retries_remaining: 0,
+                                    unknown_screen_checks: 0,
                                 });
                                 self.dirty = true;
                             }
