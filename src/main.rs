@@ -153,15 +153,15 @@ fn main() -> Result<()> {
 
     // Load user config + apply CLI override (CLI > file > default).
     let mut user_config = config::Config::load();
-    user_config.apply_cli_overrides(
-        cli.ime,
-        cli.ime_freeze_panes,
-        cli.ime_overlay_catchup_ms,
-        cli.lang,
-        cli.fps,
-        cli.file_tree_override(),
-        cli.shell.clone(),
-    );
+    user_config.apply_cli_overrides(config::CliOverrides {
+        ime_mode: cli.ime,
+        freeze_panes_on_overlay: cli.ime_freeze_panes,
+        overlay_catchup_ms: cli.ime_overlay_catchup_ms,
+        ui_lang: cli.lang,
+        ui_fps: cli.fps,
+        ui_file_tree: cli.file_tree_override(),
+        shell_program: cli.shell.clone(),
+    });
     // Install the pane-shell override before the first pane spawns.
     // Must come after the CLI merge so `--shell` beats `[shell]
     // program`, and before App::new so the initial pane sees it.

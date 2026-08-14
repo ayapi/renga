@@ -21,6 +21,19 @@ pub struct Config {
     pub shell: ShellConfig,
 }
 
+/// Optional command-line values applied on top of a loaded [`Config`].
+/// A missing value leaves the corresponding file/default value untouched.
+#[derive(Debug, Default)]
+pub struct CliOverrides {
+    pub ime_mode: Option<ImeMode>,
+    pub freeze_panes_on_overlay: Option<bool>,
+    pub overlay_catchup_ms: Option<u64>,
+    pub ui_lang: Option<crate::i18n::UiLang>,
+    pub ui_fps: Option<u16>,
+    pub ui_file_tree: Option<bool>,
+    pub shell_program: Option<String>,
+}
+
 /// Shell selection for new panes. Additive key on the frozen v1.0
 /// config surface — older binaries ignore the whole section.
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -244,16 +257,16 @@ impl Config {
     /// Apply an optional CLI override on top of the loaded config.
     /// `None` leaves the field untouched, mirroring the precedence
     /// "CLI > file > default".
-    pub fn apply_cli_overrides(
-        &mut self,
-        ime_mode: Option<ImeMode>,
-        freeze_panes_on_overlay: Option<bool>,
-        overlay_catchup_ms: Option<u64>,
-        ui_lang: Option<crate::i18n::UiLang>,
-        ui_fps: Option<u16>,
-        ui_file_tree: Option<bool>,
-        shell_program: Option<String>,
-    ) {
+    pub fn apply_cli_overrides(&mut self, overrides: CliOverrides) {
+        let CliOverrides {
+            ime_mode,
+            freeze_panes_on_overlay,
+            overlay_catchup_ms,
+            ui_lang,
+            ui_fps,
+            ui_file_tree,
+            shell_program,
+        } = overrides;
         if let Some(program) = shell_program {
             self.shell.program = Some(program);
         }
@@ -392,7 +405,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(Some(ImeMode::Off), None, None, None, None, None, None);
+        cfg.apply_cli_overrides(CliOverrides {
+            ime_mode: Some(ImeMode::Off),
+            ..Default::default()
+        });
         assert_eq!(cfg.ime.mode, ImeMode::Off);
     }
 
@@ -405,7 +421,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, None, None, None, None);
+        cfg.apply_cli_overrides(CliOverrides::default());
         assert_eq!(cfg.ime.mode, ImeMode::Off);
     }
 
@@ -480,11 +496,17 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, Some(false), None, None, None, None, None);
+        cfg.apply_cli_overrides(CliOverrides {
+            freeze_panes_on_overlay: Some(false),
+            ..Default::default()
+        });
         assert!(!cfg.ime.freeze_panes_on_overlay);
 
         let mut cfg2 = Config::default();
-        cfg2.apply_cli_overrides(None, Some(true), None, None, None, None, None);
+        cfg2.apply_cli_overrides(CliOverrides {
+            freeze_panes_on_overlay: Some(true),
+            ..Default::default()
+        });
         assert!(cfg2.ime.freeze_panes_on_overlay);
     }
 
@@ -519,19 +541,28 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, Some(3000), None, None, None, None);
+        cfg.apply_cli_overrides(CliOverrides {
+            overlay_catchup_ms: Some(3000),
+            ..Default::default()
+        });
         assert_eq!(cfg.ime.overlay_catchup_ms, 3000);
 
         let mut cfg2 = Config::default();
         // Non-zero sub-floor value must be clamped up.
-        cfg2.apply_cli_overrides(None, None, Some(10), None, None, None, None);
+        cfg2.apply_cli_overrides(CliOverrides {
+            overlay_catchup_ms: Some(10),
+            ..Default::default()
+        });
         assert_eq!(cfg2.ime.overlay_catchup_ms, MIN_OVERLAY_CATCHUP_MS);
 
         // Zero must stay zero (means "disabled") even when the default
         // is a non-zero value — an explicit `--ime-overlay-catchup-ms 0`
         // must still give a pure freeze.
         let mut cfg3 = Config::default();
-        cfg3.apply_cli_overrides(None, None, Some(0), None, None, None, None);
+        cfg3.apply_cli_overrides(CliOverrides {
+            overlay_catchup_ms: Some(0),
+            ..Default::default()
+        });
         assert_eq!(cfg3.ime.overlay_catchup_ms, 0);
     }
 
@@ -626,11 +657,17 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, None, Some(60), None, None);
+        cfg.apply_cli_overrides(CliOverrides {
+            ui_fps: Some(60),
+            ..Default::default()
+        });
         assert_eq!(cfg.ui.fps, 60);
 
         let mut cfg2 = Config::default();
-        cfg2.apply_cli_overrides(None, None, None, None, Some(0), None, None);
+        cfg2.apply_cli_overrides(CliOverrides {
+            ui_fps: Some(0),
+            ..Default::default()
+        });
         assert_eq!(cfg2.ui.fps, MIN_UI_FPS);
     }
 
@@ -661,15 +698,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(
-            None,
-            None,
-            None,
-            Some(crate::i18n::UiLang::En),
-            None,
-            None,
-            None,
-        );
+        cfg.apply_cli_overrides(CliOverrides {
+            ui_lang: Some(crate::i18n::UiLang::En),
+            ..Default::default()
+        });
         assert_eq!(cfg.ui.lang, crate::i18n::UiLang::En);
     }
 
@@ -682,7 +714,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, None, None, None, None);
+        cfg.apply_cli_overrides(CliOverrides::default());
         assert_eq!(cfg.ui.lang, crate::i18n::UiLang::En);
     }
 
@@ -718,12 +750,18 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, None, None, Some(true), None);
+        cfg.apply_cli_overrides(CliOverrides {
+            ui_file_tree: Some(true),
+            ..Default::default()
+        });
         assert!(cfg.ui.file_tree);
 
         // …and `--no-file-tree` must disable the default-on sidebar.
         let mut cfg2 = Config::default();
-        cfg2.apply_cli_overrides(None, None, None, None, None, Some(false), None);
+        cfg2.apply_cli_overrides(CliOverrides {
+            ui_file_tree: Some(false),
+            ..Default::default()
+        });
         assert!(!cfg2.ui.file_tree);
     }
 
@@ -758,15 +796,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("powershell".to_string()),
-        );
+        cfg.apply_cli_overrides(CliOverrides {
+            shell_program: Some("powershell".to_string()),
+            ..Default::default()
+        });
         assert_eq!(cfg.shell.program.as_deref(), Some("powershell"));
     }
 
@@ -779,7 +812,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, None, None, None, None);
+        cfg.apply_cli_overrides(CliOverrides::default());
         assert_eq!(cfg.shell.program.as_deref(), Some("cmd"));
     }
 
@@ -792,7 +825,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        cfg.apply_cli_overrides(None, None, None, None, None, None, None);
+        cfg.apply_cli_overrides(CliOverrides::default());
         assert!(!cfg.ui.file_tree);
     }
 }
