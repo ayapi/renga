@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) const CODEX_APPEND_ENTER_DELAY: Duration = Duration::from_millis(75);
-pub(crate) const CODEX_PEER_NUDGE_SUBMIT_DELAY: Duration = Duration::from_millis(1000);
+pub(crate) const CODEX_PEER_NUDGE_COMMIT_DELAY: Duration = Duration::from_millis(1000);
 pub(crate) const CODEX_PEER_NUDGE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const CODEX_APPEND_ENTER_SNAPSHOT_LINES: usize = 8;
 
@@ -667,7 +667,7 @@ impl App {
         let queue = self.pending_codex_peer_messages.entry(pane_id).or_default();
         queue.clear();
         queue.push_back(PendingCodexPeerDelivery::SubmitAt(
-            Instant::now() + CODEX_PEER_NUDGE_SUBMIT_DELAY,
+            Instant::now() + CODEX_PEER_NUDGE_COMMIT_DELAY,
         ));
         self.codex_peer_notification = None;
         self.dirty = true;
@@ -839,7 +839,7 @@ impl App {
                                 if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
                                     queue.pop_front();
                                     queue.push_front(PendingCodexPeerDelivery::QueueAt {
-                                        ready_at: now + CODEX_PEER_NUDGE_SUBMIT_DELAY,
+                                        ready_at: now + CODEX_PEER_NUDGE_COMMIT_DELAY,
                                         expires_at: now + CODEX_PEER_NUDGE_COMMIT_TIMEOUT,
                                         message,
                                         expected_composer: normalize_codex_composer_expected(
@@ -862,7 +862,7 @@ impl App {
                             if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
                                 queue.pop_front();
                                 queue.push_front(PendingCodexPeerDelivery::SubmitAt(
-                                    now + CODEX_PEER_NUDGE_SUBMIT_DELAY,
+                                    now + CODEX_PEER_NUDGE_COMMIT_DELAY,
                                 ));
                                 self.dirty = true;
                             }
