@@ -1,5 +1,8 @@
 use super::super::*;
-use crate::app::codex_peer::{codex_composer_has_draft_on_screen, normalized_codex_composer_text};
+use crate::app::codex_peer::{
+    codex_composer_has_draft_on_screen, normalized_codex_composer_text,
+    CODEX_PEER_NUDGE_MAX_RETRIES,
+};
 
 fn seed_focused_pane_screen(app: &mut App, bytes: &[u8]) -> usize {
     let pane_id = app.ws().focused_pane_id;
@@ -2206,6 +2209,46 @@ fn exhausted_notification_stays_parked_after_focus_leaves() {
         .expect("pane")
         .test_input()
         .is_empty());
+    app.shutdown();
+}
+
+#[test]
+fn coalesced_notification_keeps_largest_retry_budget() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    app.handle_focus(&ipc::PaneRef::Id(codex_id))
+        .expect("focus codex");
+    app.codex_peer_notification = Some(CodexPeerNotificationState {
+        target_pane: codex_id,
+        message: PendingCodexPeerMessage {
+            from_pane: sender_id,
+            from_name: None,
+            from_kind: None,
+        },
+        pending_count: 1,
+        retries_remaining: Some(CODEX_PEER_NUDGE_MAX_RETRIES),
+    });
+    app.pending_codex_peer_messages.insert(
+        codex_id,
+        VecDeque::from([PendingCodexPeerDelivery::AwaitFocus(
+            PendingCodexPeerMessage {
+                from_pane: sender_id,
+                from_name: Some("later".to_string()),
+                from_kind: None,
+            },
+        )]),
+    );
+
+    app.flush_pending_codex_peer_messages();
+
+    let notification = app
+        .visible_codex_peer_notification()
+        .expect("coalesced notification");
+    assert_eq!(notification.pending_count, 2);
+    assert_eq!(
+        notification.retries_remaining,
+        Some(CODEX_PEER_NUDGE_MAX_RETRIES),
+        "an eligible coalesced message keeps a retry budget for the notification"
+    );
     app.shutdown();
 }
 
