@@ -564,6 +564,12 @@ fn repeated_visible_scrollbar_click_does_not_split_outer_edge() {
 #[test]
 fn hidden_scrollbar_does_not_claim_right_border_click() {
     let (mut app, _a_id, b_id) = two_pane_vertical_app();
+    app.ws()
+        .panes
+        .get(&b_id)
+        .unwrap()
+        .total_scrollback
+        .store(0, std::sync::atomic::Ordering::Relaxed);
     let rect = pane_rect(&app, b_id);
     let right_border_col = rect.x + rect.width - 1;
 
