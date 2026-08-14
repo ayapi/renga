@@ -1,5 +1,5 @@
 use super::super::*;
-use crate::app::codex_peer::codex_composer_has_draft_on_screen;
+use crate::app::codex_peer::{codex_composer_has_draft_on_screen, normalized_codex_composer_text};
 
 fn seed_focused_pane_screen(app: &mut App, bytes: &[u8]) -> usize {
     let pane_id = app.ws().focused_pane_id;
@@ -35,6 +35,45 @@ fn seed_codex_busy_placeholder(app: &mut App, pane_id: usize) {
         pane_id,
         b"\x1b[?25h\x1b[2J\x1b[HWorking (1m 03s - esc to interrupt; tab to queue message)\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6 high\x1b[6;20H",
     );
+}
+
+fn seed_codex_busy_composer(app: &mut App, pane_id: usize, text: &str) {
+    let screen = format!(
+        "\x1b[?25h\x1b[2J\x1b[3;1HWorking (1m 03s - esc to interrupt; tab to queue message)\x1b[5;1H\u{203a} {text}\x1b[10;1H  gpt-5.6 high\x1b[7;20H"
+    );
+    seed_pane_screen(app, pane_id, screen.as_bytes());
+}
+
+fn make_codex_native_queue_ready(app: &mut App, pane_id: usize) {
+    let queue = app
+        .pending_codex_peer_messages
+        .get_mut(&pane_id)
+        .expect("pending nudge");
+    match queue.front_mut().expect("pending delivery") {
+        PendingCodexPeerDelivery::QueueAt { ready_at, .. } => *ready_at = Instant::now(),
+        other => panic!("expected native queue stage, got {other:?}"),
+    }
+}
+
+fn setup_unfocused_registered_codex() -> (App, usize, usize) {
+    let mut app = App::new(40, 160).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(codex_id);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    (app, sender_id, codex_id)
 }
 
 #[test]
@@ -1309,18 +1348,39 @@ fn unfocused_busy_codex_without_draft_queues_nudge_natively() {
         .get(&sibling_id)
         .and_then(|q| q.front());
     assert!(
-        matches!(pending, Some(PendingCodexPeerDelivery::QueueAt(_))),
+        matches!(pending, Some(PendingCodexPeerDelivery::QueueAt { .. })),
         "busy Codex nudge should advance to native queue stage: {pending:?}"
     );
 
+    let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: None,
+        from_kind: None,
+    });
+    seed_codex_busy_composer(&mut app, sibling_id, &expected);
+    {
+        let pane = app.ws().panes.get(&sibling_id).expect("pane");
+        let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+        let observed = normalized_codex_composer_text(parser.screen()).unwrap_or_else(|| {
+            panic!(
+                "composer not found: {:?}",
+                screen_tail_lines(parser.screen())
+            )
+        });
+        assert_eq!(
+            observed,
+            expected
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        );
+    }
     app.ws_mut()
         .panes
         .get_mut(&sibling_id)
         .expect("pane")
         .clear_test_input();
-    if let Some(queue) = app.pending_codex_peer_messages.get_mut(&sibling_id) {
-        queue[0] = PendingCodexPeerDelivery::QueueAt(Instant::now());
-    }
+    make_codex_native_queue_ready(&mut app, sibling_id);
     app.flush_pending_codex_peer_messages();
     assert!(
         !app.pending_codex_peer_messages.contains_key(&sibling_id),
@@ -1365,22 +1425,31 @@ fn busy_codex_nudge_submits_if_turn_finishes_before_tab() {
         app.pending_codex_peer_messages
             .get(&sibling_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::QueueAt(_))
+        Some(PendingCodexPeerDelivery::QueueAt { .. })
     ));
 
-    seed_pane_screen(
-        &mut app,
-        sibling_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA injected peer nudge\x1b[3;1Henter to send\x1b[1;23H",
-    );
+    let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: None,
+        from_kind: None,
+    });
+    let idle_screen =
+        format!("\x1b[?25h\x1b[2J\x1b[H\u{203a} {expected}\x1b[6;1Henter to send\x1b[3;20H");
+    seed_pane_screen(&mut app, sibling_id, idle_screen.as_bytes());
+    {
+        let pane = app.ws().panes.get(&sibling_id).expect("pane");
+        let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            normalized_codex_composer_text(parser.screen()),
+            Some(expected.chars().filter(|ch| !ch.is_whitespace()).collect())
+        );
+    }
     app.ws_mut()
         .panes
         .get_mut(&sibling_id)
         .expect("pane")
         .clear_test_input();
-    if let Some(queue) = app.pending_codex_peer_messages.get_mut(&sibling_id) {
-        queue[0] = PendingCodexPeerDelivery::QueueAt(Instant::now());
-    }
+    make_codex_native_queue_ready(&mut app, sibling_id);
     app.flush_pending_codex_peer_messages();
 
     assert!(
@@ -1429,6 +1498,130 @@ fn unfocused_idle_codex_without_draft_advances_to_submit_stage() {
             .and_then(|q| q.front()),
         Some(PendingCodexPeerDelivery::SubmitAt(_))
     ));
+    app.shutdown();
+}
+
+#[test]
+fn idle_transcript_queue_hint_does_not_select_native_queue() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[HI explained that Tab to queue message is how Codex queues\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Henter to send\x1b[4;3H",
+    );
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "idle transcript false positive".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt(_))
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn native_queue_commit_does_not_send_changed_user_draft() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_codex_busy_placeholder(&mut app, codex_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "do not send user draft".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA what happens if I\x1b[3;1Henter to send\x1b[1;20H",
+    );
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    make_codex_native_queue_ready(&mut app, codex_id);
+
+    app.flush_pending_codex_peer_messages();
+
+    assert!(app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::QueueAt { .. })
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn focusing_injected_nudge_does_not_commit_it_blindly() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_codex_busy_placeholder(&mut app, codex_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "focus during delay".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+    let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: None,
+        from_kind: None,
+    });
+    seed_codex_busy_composer(&mut app, codex_id, &expected);
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+
+    app.handle_focus(&ipc::PaneRef::Id(codex_id))
+        .expect("focus codex");
+
+    assert_eq!(
+        app.ws().panes.get(&codex_id).expect("pane").test_input(),
+        b"\x15",
+        "only Ctrl+U may clear the verified injected nudge"
+    );
+    assert!(app.visible_codex_peer_notification().is_some());
+    app.shutdown();
+}
+
+#[test]
+fn second_message_does_not_discard_in_flight_native_queue_commit() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_codex_busy_placeholder(&mut app, codex_id);
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "first".to_string())
+        .expect("first send");
+    app.flush_pending_codex_peer_messages();
+    app.ws_mut().focused_pane_id = codex_id;
+
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "second".to_string())
+        .expect("second send");
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::QueueAt { .. })
+    ));
+    assert!(app.codex_peer_notification.is_none());
     app.shutdown();
 }
 

@@ -53,7 +53,21 @@ impl CodexPeerNotificationState {
 pub(crate) enum PendingCodexPeerDelivery {
     Draft(PendingCodexPeerMessage),
     SubmitAt(Instant),
-    QueueAt(Instant),
+    QueueAt {
+        ready_at: Instant,
+        message: PendingCodexPeerMessage,
+        expected_composer: String,
+    },
+}
+
+#[derive(Debug)]
+struct CodexPeerScreenSnapshot {
+    has_draft: Option<bool>,
+    composer: Option<String>,
+    ready_for_nudge: bool,
+    can_queue_message: bool,
+    busy_queue_available: bool,
+    can_submit_message: bool,
 }
 
 pub(crate) fn screen_tail_lines(screen: &vt100::Screen) -> Vec<String> {
@@ -277,6 +291,85 @@ pub(crate) fn codex_composer_has_draft_on_screen(screen: &vt100::Screen) -> Opti
     None
 }
 
+pub(crate) fn normalized_codex_composer_text(screen: &vt100::Screen) -> Option<String> {
+    let (rows, cols) = screen.size();
+    let (cursor_row, _) = screen.cursor_position();
+    let last_content_row = (0..rows)
+        .rev()
+        .find(|row| screen_row_has_visible_text(screen, *row, cols));
+    let end_row = last_content_row.unwrap_or(cursor_row).max(cursor_row);
+    let start_row = end_row
+        .saturating_add(1)
+        .saturating_sub(CODEX_APPEND_ENTER_SNAPSHOT_LINES as u16);
+    let (prompt_row, prompt_col) = (start_row..=end_row).rev().find_map(|row| {
+        (0..cols).find_map(|col| {
+            screen
+                .cell(row, col)
+                .is_some_and(|cell| cell.contents() == "\u{203a}")
+                .then_some((row, col))
+        })
+    })?;
+    let input_start = prompt_col.saturating_add(1);
+    let editable_start = if screen
+        .cell(prompt_row, input_start)
+        .is_some_and(|cell| cell.contents().trim().is_empty())
+    {
+        input_start.saturating_add(1)
+    } else {
+        input_start
+    };
+    let mut text = String::new();
+    for row in prompt_row..rows {
+        let col_start = if row == prompt_row { editable_start } else { 0 };
+        let mut line = String::new();
+        for col in col_start..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                line.push_str(cell.contents());
+            }
+        }
+        if row > prompt_row && line.trim().is_empty() {
+            break;
+        }
+        text.push_str(&line);
+    }
+    Some(
+        text.chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>(),
+    )
+}
+
+fn normalize_codex_composer_expected(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn codex_peer_screen_snapshot(screen: &vt100::Screen) -> CodexPeerScreenSnapshot {
+    let has_draft = codex_composer_has_draft_on_screen(screen);
+    let composer = normalized_codex_composer_text(screen);
+    let tail = screen_tail_lines(screen).join("\n").to_ascii_lowercase();
+    let normalized_tail: String = tail.chars().filter(|ch| !ch.is_whitespace()).collect();
+    // Positive detection controls whether renga may inject and press Tab, so
+    // require Codex's live Working status plus both advertised busy actions.
+    // Transcript mentions and unknown future UI safely remain pending.
+    let busy = normalized_tail.contains("working(") && normalized_tail.contains("esctointerrupt");
+    let busy_queue_available =
+        !screen.hide_cursor() && busy && normalized_tail.contains("tabtoqueuemessage");
+    let can_queue_message = has_draft == Some(false) && busy_queue_available;
+    let can_submit_message = !busy
+        && (normalized_tail.contains("entertosend") || normalized_tail.contains("readyforinput"));
+    let ready_for_nudge = !busy
+        && screen_has_visible_text(screen)
+        && (codex_prompt_allows_peer_nudge_on_screen(screen).unwrap_or(can_submit_message));
+    CodexPeerScreenSnapshot {
+        has_draft,
+        composer,
+        ready_for_nudge,
+        can_queue_message,
+        busy_queue_available,
+        can_submit_message,
+    }
+}
+
 fn codex_composer_has_draft(pane: &Pane) -> Option<bool> {
     let Ok(parser) = pane.parser.lock() else {
         return None;
@@ -388,7 +481,14 @@ impl App {
             let target_is_focused = self.active_tab == target_ws
                 && self.workspaces[target_ws].focus_target == FocusTarget::Pane
                 && self.workspaces[target_ws].focused_pane_id == target_id;
-            if target_is_focused {
+            let nudge_commit_in_flight = self
+                .pending_codex_peer_messages
+                .get(&target_id)
+                .and_then(|queue| queue.front())
+                .is_some_and(|delivery| {
+                    matches!(delivery, PendingCodexPeerDelivery::QueueAt { .. })
+                });
+            if target_is_focused && !nudge_commit_in_flight {
                 self.route_focused_codex_peer_message(target_id, message)?;
             } else {
                 self.push_pending_codex_peer_nudge(target_id, message);
@@ -699,48 +799,23 @@ impl App {
         if !registered_codex && !pane.is_codex_running() {
             return false;
         }
-        let Some(tail) = codex_peer_screen_tail(pane) else {
-            return false;
-        };
-        if tail.contains("esc to interrupt") || tail.contains("tab to queue message") {
-            return false;
-        }
-        if !pane_screen_has_visible_text(pane) {
-            return false;
-        }
-        if let Some(allowed) = codex_prompt_allows_peer_nudge(pane) {
-            return allowed;
-        }
-        tail.contains("enter to send") || tail.contains("ready for input")
-    }
-
-    fn codex_peer_can_queue_message(registered_codex: bool, pane: &Pane) -> bool {
-        if !registered_codex && !pane.is_codex_running() {
-            return false;
-        }
-        let Some(tail) = codex_peer_screen_tail(pane) else {
-            return false;
-        };
-        pane_screen_has_visible_text(pane) && tail.contains("tab to queue message")
-    }
-
-    fn codex_peer_can_submit_injected_draft(registered_codex: bool, pane: &Pane) -> bool {
-        if !registered_codex && !pane.is_codex_running() {
-            return false;
-        }
-        let Some(tail) = codex_peer_screen_tail(pane) else {
-            return false;
-        };
-        pane_screen_has_visible_text(pane)
-            && (tail.contains("enter to send") || tail.contains("ready for input"))
-    }
-
-    fn busy_codex_composer_accepts_peer_nudge(pane: &Pane) -> bool {
         let Ok(parser) = pane.parser.lock() else {
             return false;
         };
-        let screen = parser.screen();
-        !screen.hide_cursor() && codex_composer_has_draft_on_screen(screen) == Some(false)
+        codex_peer_screen_snapshot(parser.screen()).ready_for_nudge
+    }
+
+    fn codex_peer_screen_snapshot(
+        registered_codex: bool,
+        pane: &Pane,
+    ) -> Option<CodexPeerScreenSnapshot> {
+        if !registered_codex && !pane.is_codex_running() {
+            return None;
+        }
+        let Ok(parser) = pane.parser.lock() else {
+            return None;
+        };
+        Some(codex_peer_screen_snapshot(parser.screen()))
     }
 
     pub(crate) fn flush_pending_codex_peer_messages(&mut self) {
@@ -763,9 +838,12 @@ impl App {
                     continue;
                 };
                 if let Some(pane) = ws.panes.get_mut(&pane_id) {
+                    let registered_codex =
+                        self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex);
+                    let screen = Self::codex_peer_screen_snapshot(registered_codex, pane);
                     match delivery {
                         PendingCodexPeerDelivery::Draft(message) => {
-                            if codex_composer_has_draft(pane).unwrap_or(false) {
+                            if screen.as_ref().and_then(|state| state.has_draft) == Some(true) {
                                 if pane_is_focused {
                                     queue.pop_front();
                                     focused_notifications.push((pane_id, message));
@@ -773,34 +851,34 @@ impl App {
                                 }
                                 continue;
                             }
-                            let registered_codex = self.peer_client_kinds.get(&pane_id)
-                                == Some(&PeerClientKind::Codex);
+                            let payload_text = format_codex_peer_message(&message);
                             if !pane_is_focused
-                                && Self::codex_peer_can_queue_message(registered_codex, pane)
+                                && screen.as_ref().is_some_and(|state| state.can_queue_message)
                             {
-                                if !Self::busy_codex_composer_accepts_peer_nudge(pane) {
-                                    continue;
-                                }
                                 let payload = crate::mcp_peer::build_send_keys_payload(
-                                    &format_codex_peer_message(&message),
+                                    &payload_text,
                                     None,
                                     false,
                                 )
                                 .expect("codex peer draft payload");
                                 if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
                                     queue.pop_front();
-                                    queue.push_front(PendingCodexPeerDelivery::QueueAt(
-                                        now + CODEX_PEER_NUDGE_SUBMIT_DELAY,
-                                    ));
+                                    queue.push_front(PendingCodexPeerDelivery::QueueAt {
+                                        ready_at: now + CODEX_PEER_NUDGE_SUBMIT_DELAY,
+                                        message,
+                                        expected_composer: normalize_codex_composer_expected(
+                                            &payload_text,
+                                        ),
+                                    });
                                     self.dirty = true;
                                 }
                                 continue;
                             }
-                            if !Self::codex_peer_delivery_ready(registered_codex, pane) {
+                            if !screen.as_ref().is_some_and(|state| state.ready_for_nudge) {
                                 continue;
                             }
                             let payload = crate::mcp_peer::build_send_keys_payload(
-                                &format_codex_peer_message(&message),
+                                &payload_text,
                                 None,
                                 false,
                             )
@@ -824,23 +902,39 @@ impl App {
                                 self.dirty = true;
                             }
                         }
-                        PendingCodexPeerDelivery::QueueAt(ready_at) => {
-                            if now < ready_at {
+                        PendingCodexPeerDelivery::QueueAt {
+                            ready_at,
+                            message,
+                            expected_composer,
+                        } => {
+                            let composer_matches =
+                                screen.as_ref().and_then(|state| state.composer.as_ref())
+                                    == Some(&expected_composer);
+                            if pane_is_focused {
+                                if composer_matches {
+                                    let _ = write_input_to_pane(pane, b"\x15", false);
+                                }
+                                queue.pop_front();
+                                focused_notifications.push((pane_id, message));
+                                self.dirty = true;
                                 continue;
                             }
-                            let registered_codex = self.peer_client_kinds.get(&pane_id)
-                                == Some(&PeerClientKind::Codex);
-                            let payload =
-                                if Self::codex_peer_can_queue_message(registered_codex, pane) {
-                                    b"\t".as_slice()
-                                } else if Self::codex_peer_can_submit_injected_draft(
-                                    registered_codex,
-                                    pane,
-                                ) {
-                                    b"\r".as_slice()
-                                } else {
-                                    continue;
-                                };
+                            if now < ready_at || !composer_matches {
+                                continue;
+                            }
+                            let payload = if screen
+                                .as_ref()
+                                .is_some_and(|state| state.busy_queue_available)
+                            {
+                                b"\t".as_slice()
+                            } else if screen
+                                .as_ref()
+                                .is_some_and(|state| state.can_submit_message)
+                            {
+                                b"\r".as_slice()
+                            } else {
+                                continue;
+                            };
                             if write_input_to_pane(pane, payload, false).is_ok() {
                                 queue.pop_front();
                                 self.dirty = true;
