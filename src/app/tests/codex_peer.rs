@@ -1440,6 +1440,17 @@ fn non_gpt_footer_is_live_with_cursor_parked_on_footer() {
 }
 
 #[test]
+fn wrapped_legacy_enter_to_send_footer_is_recognized() {
+    let mut parser = vt100::Parser::new(20, 12, 0);
+    parser.process(b"\x1b[?25h\x1b[2J\x1b[1;1H\xE2\x80\xBA \x1b[3;5Henter to send\x1b[1;3H");
+
+    assert_eq!(
+        codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+        Some(true)
+    );
+}
+
+#[test]
 fn codex_prompt_allows_nudge_with_cursor_parked_on_footer() {
     let mut parser = vt100::Parser::new(40, 80, 0);
     parser.process(
