@@ -215,11 +215,9 @@ impl App {
                     rect.height.saturating_sub(2),
                 );
                 let scrollbar_col = inner.x.saturating_add(inner.width);
-                let scrollbar_visible = self
-                    .ws()
-                    .panes
-                    .get(&pane_id)
-                    .is_some_and(|pane| pane.scrollbar_info().1 > inner.height as usize);
+                let scrollbar_visible = self.ws().panes.get(&pane_id).is_some_and(|pane| {
+                    !pane.exited && pane.scrollbar_info().1 > inner.height as usize
+                });
                 (scrollbar_visible
                     && inner.width > 0
                     && inner.height > 0

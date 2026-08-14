@@ -580,6 +580,25 @@ fn hidden_scrollbar_does_not_claim_right_border_click() {
 }
 
 #[test]
+fn exited_pane_does_not_claim_invisible_scrollbar() {
+    let (mut app, a_id, _b_id) = two_pane_vertical_app();
+    make_scrollbar_visible(&app, a_id);
+    app.ws_mut().panes.get_mut(&a_id).unwrap().exited = true;
+    let rect = pane_rect(&app, a_id);
+    let right_border_col = rect.x + rect.width - 1;
+
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        right_border_col,
+        20,
+    ));
+
+    assert!(!matches!(app.dragging, Some(DragTarget::Scrollbar(..))));
+    assert!(matches!(app.dragging, Some(DragTarget::PaneSplit(..))));
+    app.shutdown();
+}
+
+#[test]
 fn boundary_double_click_splits_between_siblings() {
     let (mut app, a_id, b_id) = two_pane_vertical_app();
     assert_eq!(app.ws().layout.pane_count(), 2);
