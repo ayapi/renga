@@ -1272,11 +1272,10 @@ fn extract_osc7(data: &[u8]) -> Option<PathBuf> {
         let path = if path_str.starts_with('/') {
             // No hostname (file:///path)
             path_str
-        } else if let Some(slash_pos) = path_str.find('/') {
+        } else {
+            let slash_pos = path_str.find('/')?;
             // Has hostname (file://host/path)
             &path_str[slash_pos..]
-        } else {
-            return None;
         };
 
         // On Windows/MSYS2, convert /c/Users/... to C:\Users\...
@@ -1500,6 +1499,16 @@ fn detect_shell_unix() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_osc7_handles_empty_and_named_hosts() {
+        let local = extract_osc7(b"\x1b]7;file:///workspace/project\x07");
+        let hosted = extract_osc7(b"\x1b]7;file://host/workspace/project\x07");
+
+        assert_eq!(local, Some(PathBuf::from("/workspace/project")));
+        assert_eq!(hosted, local);
+        assert_eq!(extract_osc7(b"\x1b]7;file://host\x07"), None);
+    }
 
     #[test]
     fn startup_command_uses_the_same_submit_byte_as_enter() {
