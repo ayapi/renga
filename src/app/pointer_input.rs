@@ -837,6 +837,10 @@ impl App {
                     self.hover_border = Some(DragTarget::FileTreeBorder);
                 } else if self.is_on_preview_border(col) {
                     self.hover_border = Some(DragTarget::PreviewBorder);
+                } else if let Some((pane_id, inner)) = self.pane_scrollbar_at(col, row) {
+                    // Match the press priority: do not advertise split resize
+                    // on a cell whose click manipulates the scrollbar.
+                    self.hover_border = Some(DragTarget::Scrollbar(pane_id, inner));
                 } else {
                     // Tint the shared internal divider under the cursor
                     // so it reads as draggable / double-clickable, the

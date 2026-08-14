@@ -599,6 +599,22 @@ fn exited_pane_does_not_claim_invisible_scrollbar() {
 }
 
 #[test]
+fn visible_scrollbar_hover_does_not_advertise_split_resize() {
+    let (mut app, a_id, _b_id) = two_pane_vertical_app();
+    make_scrollbar_visible(&app, a_id);
+    let rect = pane_rect(&app, a_id);
+    let scrollbar_col = rect.x + rect.width - 1;
+
+    app.handle_mouse_event(boundary_mouse(MouseEventKind::Moved, scrollbar_col, 20));
+
+    assert!(matches!(
+        app.hover_border,
+        Some(DragTarget::Scrollbar(id, _)) if id == a_id
+    ));
+    app.shutdown();
+}
+
+#[test]
 fn boundary_double_click_splits_between_siblings() {
     let (mut app, a_id, b_id) = two_pane_vertical_app();
     assert_eq!(app.ws().layout.pane_count(), 2);
