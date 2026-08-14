@@ -108,11 +108,6 @@ pub(crate) fn screen_tail_lines(screen: &vt100::Screen) -> Vec<String> {
     lines
 }
 
-fn pane_screen_tail_lines(pane: &Pane) -> Option<Vec<String>> {
-    let parser = pane.parser.lock().ok()?;
-    Some(screen_tail_lines(parser.screen()))
-}
-
 pub(crate) fn screen_has_visible_text(screen: &vt100::Screen) -> bool {
     let (rows, cols) = screen.size();
     for row in 0..rows {
@@ -125,13 +120,6 @@ pub(crate) fn screen_has_visible_text(screen: &vt100::Screen) -> bool {
         }
     }
     false
-}
-
-fn pane_screen_has_visible_text(pane: &Pane) -> bool {
-    let Ok(parser) = pane.parser.lock() else {
-        return false;
-    };
-    screen_has_visible_text(parser.screen())
 }
 
 pub(crate) fn codex_prompt_allows_peer_nudge_on_screen(screen: &vt100::Screen) -> Option<bool> {
@@ -180,13 +168,6 @@ pub(crate) fn codex_prompt_allows_peer_nudge_on_screen(screen: &vt100::Screen) -
         return Some(false);
     }
     Some(true)
-}
-
-fn codex_prompt_allows_peer_nudge(pane: &Pane) -> Option<bool> {
-    let Ok(parser) = pane.parser.lock() else {
-        return None;
-    };
-    codex_prompt_allows_peer_nudge_on_screen(parser.screen())
 }
 
 fn looks_like_codex_placeholder(text: &str) -> bool {
@@ -377,14 +358,6 @@ fn codex_composer_has_draft(pane: &Pane) -> Option<bool> {
         return None;
     };
     codex_composer_has_draft_on_screen(parser.screen())
-}
-
-fn codex_peer_screen_tail(pane: &Pane) -> Option<String> {
-    Some(
-        pane_screen_tail_lines(pane)?
-            .join("\n")
-            .to_ascii_lowercase(),
-    )
 }
 
 fn pending_startup_looks_like_codex(pane: &Pane) -> bool {
