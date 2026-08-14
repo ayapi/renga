@@ -1483,7 +1483,7 @@ fn wrapped_busy_status_blocks_both_queue_and_idle_paths() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (1m 03s -\x1b[2;1Hesc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[4;3H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (1m 03s - es\x1b[2;1Hc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[4;3H",
     );
     app.ws_mut()
         .panes

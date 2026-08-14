@@ -396,7 +396,7 @@ fn analyze_codex_peer_screen(screen: &vt100::Screen) -> CodexPeerScreenSnapshot 
     // A partial or unfamiliar interrupt status is not enough evidence to use
     // Codex's native queue, but it is enough to reject the idle path. This
     // keeps wrapped or renamed status text from causing an Enter mid-turn.
-    let interrupt_status_visible = status.contains("esctointerrupt");
+    let interrupt_status_visible = status.replace('\n', "").contains("esctointerrupt");
     let busy_queue_available =
         !screen.hide_cursor() && native_queue_busy && footer.contains("tabtoqueuemessage");
     let can_queue_message = !screen.hide_cursor() && has_draft == Some(false) && native_queue_busy;
