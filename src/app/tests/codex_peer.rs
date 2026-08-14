@@ -1426,12 +1426,12 @@ fn unfocused_busy_codex_without_draft_queues_nudge_natively() {
 }
 
 #[test]
-fn busy_codex_status_cursor_still_recognizes_empty_composer() {
+fn busy_codex_uses_positioned_interrupt_hint_without_working_label() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[HWorking (48s - esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6 high\x1b[1;9H",
+        b"\x1b[?25h\x1b[2J\x1b[Hesc to interrupt\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6 high\x1b[1;9H",
     );
 
     app.handle_peer_send(
@@ -1491,8 +1491,11 @@ fn busy_codex_nudge_submits_if_turn_finishes_before_tab() {
         from_name: None,
         from_kind: None,
     });
-    let idle_screen =
-        format!("\x1b[?25h\x1b[2J\x1b[H\u{203a} {expected}\x1b[6;1Henter to send\x1b[3;20H");
+    // Codex v0.147.0 has no idle action hint. Turn completion is observable
+    // only through the disappearance of the busy status above the composer.
+    let idle_screen = format!(
+        "\x1b[?25h\x1b[2J\x1b[H\u{203a} {expected}\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[3;20H"
+    );
     seed_pane_screen(&mut app, sibling_id, idle_screen.as_bytes());
     {
         let pane = app.ws().panes.get(&sibling_id).expect("pane");

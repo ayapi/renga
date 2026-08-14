@@ -69,9 +69,10 @@ struct CodexPeerScreenSnapshot {
     ready_for_nudge: bool,
     can_queue_message: bool,
     busy_queue_available: bool,
-    can_submit_message: bool,
+    can_submit_injected_message: bool,
 }
 
+#[cfg(test)]
 pub(crate) fn screen_tail_lines(screen: &vt100::Screen) -> Vec<String> {
     let (rows, cols) = screen.size();
     let (cursor_row, _) = screen.cursor_position();
@@ -369,12 +370,15 @@ fn codex_peer_screen_snapshot(screen: &vt100::Screen) -> CodexPeerScreenSnapshot
     // Positive detection controls whether renga may inject and press Tab, so
     // anchor the busy signal above the composer and the queue action below it.
     // Transcript mentions and unknown future UI safely remain pending.
-    let busy = status.contains("working(") && status.contains("esctointerrupt");
+    let busy = status.contains("esctointerrupt");
     let busy_queue_available =
         !screen.hide_cursor() && busy && footer.contains("tabtoqueuemessage");
     let can_queue_message = !screen.hide_cursor() && has_draft == Some(false) && busy;
-    let can_submit_message =
-        !busy && (footer.contains("entertosend") || footer.contains("readyforinput"));
+    // Codex does not render an idle action hint. After injection, the reliable
+    // completion signal is that the prompt remains visible while the busy
+    // status above it has disappeared. QueueAt separately requires the exact
+    // injected composer text before this may result in Enter.
+    let can_submit_injected_message = prompt_row.is_some() && !screen.hide_cursor() && !busy;
     let ready_without_prompt = prompt_row.is_none() && {
         let screen_text = normalized_screen_rows(screen, 0, rows);
         screen_text.contains("entertosend") || screen_text.contains("readyforinput")
@@ -388,7 +392,7 @@ fn codex_peer_screen_snapshot(screen: &vt100::Screen) -> CodexPeerScreenSnapshot
         ready_for_nudge,
         can_queue_message,
         busy_queue_available,
-        can_submit_message,
+        can_submit_injected_message,
     }
 }
 
@@ -878,6 +882,8 @@ impl App {
                                 if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
                                     queue.pop_front();
                                     queue.push_front(PendingCodexPeerDelivery::QueueAt {
+                                        // Keep the commit key in a later PTY write so Codex
+                                        // does not interpret text plus Tab/Enter as a paste.
                                         ready_at: now + CODEX_PEER_NUDGE_COMMIT_DELAY,
                                         expires_at: now + CODEX_PEER_NUDGE_COMMIT_TIMEOUT,
                                         message,
@@ -954,7 +960,7 @@ impl App {
                                 b"\t".as_slice()
                             } else if screen
                                 .as_ref()
-                                .is_some_and(|state| state.can_submit_message)
+                                .is_some_and(|state| state.can_submit_injected_message)
                             {
                                 b"\r".as_slice()
                             } else {
