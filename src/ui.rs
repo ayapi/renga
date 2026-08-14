@@ -1,3 +1,4 @@
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -1140,39 +1141,54 @@ fn render_terminal_content(
 
     drop(parser); // release lock before scrollbar_info
 
-    // Scrollbar on the right edge
+    // Scrollbar on the pane's right border. The content area has the same
+    // width as the vt100 screen, so painting the track in its last column
+    // would hide real terminal data there.
     let (scroll_offset, total_lines) = pane.scrollbar_info();
-    if total_lines > rows {
-        let scrollbar_x = area.x + area.width - 1;
-        let max_scroll = total_lines.saturating_sub(rows);
-        let visible_ratio = rows as f32 / total_lines as f32;
-        let thumb_height = (area.height as f32 * visible_ratio).max(1.0) as u16;
-
-        // Position: 0 = bottom, max_scroll = top
-        let scroll_ratio = if max_scroll > 0 {
-            1.0 - (scroll_offset as f32 / max_scroll as f32)
-        } else {
-            1.0
-        };
-        let thumb_top = ((area.height - thumb_height) as f32 * scroll_ratio) as u16;
-
-        let buf = frame.buffer_mut();
-        for row in 0..area.height {
-            let y = area.y + row;
-            let is_thumb = row >= thumb_top && row < thumb_top + thumb_height;
-            let (sym, style) = if is_thumb {
-                ("\u{2588}", Style::default().fg(SCROLL_THUMB)) // █ thumb
-            } else {
-                ("\u{2502}", Style::default().fg(TEXT_DIM)) // │ track
-            };
-            if let Some(cell) = buf.cell_mut((scrollbar_x, y)) {
-                cell.set_symbol(sym);
-                cell.set_style(style);
-            }
-        }
-    }
+    render_pane_scrollbar(frame.buffer_mut(), area, scroll_offset, total_lines, rows);
 
     caret
+}
+
+/// Paint the terminal scrollbar over the block's right border, immediately
+/// after `content_area`, without consuming a vt100 content column.
+fn render_pane_scrollbar(
+    buf: &mut Buffer,
+    content_area: Rect,
+    scroll_offset: usize,
+    total_lines: usize,
+    visible_rows: usize,
+) {
+    if total_lines <= visible_rows || content_area.width == 0 || content_area.height == 0 {
+        return;
+    }
+
+    let scrollbar_x = content_area.x.saturating_add(content_area.width);
+    let max_scroll = total_lines.saturating_sub(visible_rows);
+    let visible_ratio = visible_rows as f32 / total_lines as f32;
+    let thumb_height = (content_area.height as f32 * visible_ratio).max(1.0) as u16;
+
+    // Position: 0 = bottom, max_scroll = top
+    let scroll_ratio = if max_scroll > 0 {
+        1.0 - (scroll_offset as f32 / max_scroll as f32)
+    } else {
+        1.0
+    };
+    let thumb_top = ((content_area.height - thumb_height) as f32 * scroll_ratio) as u16;
+
+    for row in 0..content_area.height {
+        let y = content_area.y + row;
+        let is_thumb = row >= thumb_top && row < thumb_top + thumb_height;
+        let (sym, style) = if is_thumb {
+            ("\u{2588}", Style::default().fg(SCROLL_THUMB)) // █ thumb
+        } else {
+            ("\u{2502}", Style::default().fg(TEXT_DIM)) // │ track
+        };
+        if let Some(cell) = buf.cell_mut((scrollbar_x, y)) {
+            cell.set_symbol(sym);
+            cell.set_style(style);
+        }
+    }
 }
 
 fn should_track_claude_caret(
@@ -2032,6 +2048,25 @@ mod syntax_color_tests {
                 "({r:#x},{g:#x},{b:#x}) mapped to {c:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pane_scrollbar_tests {
+    use super::render_pane_scrollbar;
+    use ratatui::{buffer::Buffer, layout::Rect};
+
+    #[test]
+    fn scrollbar_preserves_final_terminal_column_and_uses_border() {
+        let outer = Rect::new(0, 0, 117, 3);
+        let content = Rect::new(1, 1, 115, 1);
+        let mut buf = Buffer::empty(outer);
+        buf.cell_mut((115, 1)).unwrap().set_symbol("X");
+
+        render_pane_scrollbar(&mut buf, content, 0, 100, 1);
+
+        assert_eq!(buf.cell((115, 1)).unwrap().symbol(), "X");
+        assert_eq!(buf.cell((116, 1)).unwrap().symbol(), "\u{2588}");
     }
 }
 

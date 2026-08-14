@@ -245,3 +245,12 @@ fn extraction_start_on_continuation_cell_skips_the_half_char() {
     let parser = screen_with("日本".as_bytes());
     assert_eq!(extract_screen_text(parser.screen(), 0, 1, 0, 3), "本");
 }
+
+#[test]
+fn extraction_includes_ascii_in_final_screen_column() {
+    let mut parser = vt100::Parser::new(2, 115, 0);
+    let line = format!("{}X", ".".repeat(114));
+    parser.process(line.as_bytes());
+
+    assert_eq!(extract_screen_text(parser.screen(), 0, 0, 0, 114), line);
+}

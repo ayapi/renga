@@ -533,8 +533,10 @@ impl App {
                             return;
                         }
 
-                        let scrollbar_col = rect.x + rect.width - 2;
-                        if col >= scrollbar_col {
+                        // The scrollbar is painted over the right border so
+                        // the final terminal content column remains usable.
+                        let scrollbar_col = rect.x + rect.width - 1;
+                        if col == scrollbar_col {
                             let inner = Rect::new(
                                 rect.x + 1,
                                 rect.y + 1,
