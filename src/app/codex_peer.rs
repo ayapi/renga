@@ -352,7 +352,7 @@ fn normalized_screen_rows(screen: &vt100::Screen, start: u16, end: u16) -> Strin
         .join("\n")
 }
 
-fn codex_peer_screen_snapshot(screen: &vt100::Screen) -> CodexPeerScreenSnapshot {
+fn analyze_codex_peer_screen(screen: &vt100::Screen) -> CodexPeerScreenSnapshot {
     let has_draft = codex_composer_has_draft_on_screen(screen);
     let composer = normalized_codex_composer_text(screen);
     let (rows, cols) = screen.size();
@@ -832,7 +832,7 @@ impl App {
         let Ok(parser) = pane.parser.lock() else {
             return false;
         };
-        codex_peer_screen_snapshot(parser.screen()).ready_for_nudge
+        analyze_codex_peer_screen(parser.screen()).ready_for_nudge
     }
 
     fn codex_peer_screen_snapshot(
@@ -845,7 +845,7 @@ impl App {
         let Ok(parser) = pane.parser.lock() else {
             return None;
         };
-        Some(codex_peer_screen_snapshot(parser.screen()))
+        Some(analyze_codex_peer_screen(parser.screen()))
     }
 
     pub(crate) fn flush_pending_codex_peer_messages(&mut self) {
