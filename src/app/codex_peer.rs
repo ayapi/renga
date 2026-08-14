@@ -228,9 +228,9 @@ pub(crate) fn codex_composer_has_draft_on_screen(screen: &vt100::Screen) -> Opti
         }
     }
     let end_row = last_content_row.unwrap_or(cursor_row).max(cursor_row);
-    let start_row = end_row
-        .saturating_add(1)
-        .saturating_sub(CODEX_APPEND_ENTER_SNAPSHOT_LINES as u16);
+    // Peer nudges can wrap beyond the short readiness snapshot. Search the
+    // full visible screen so draft protection agrees with screen analysis.
+    let start_row = 0;
     for row in (start_row..=end_row).rev() {
         let mut prompt_col = None;
         for col in 0..cols {
@@ -294,9 +294,9 @@ pub(crate) fn normalized_codex_composer_text(screen: &vt100::Screen) -> Option<S
         .rev()
         .find(|row| screen_row_has_visible_text(screen, *row, cols));
     let end_row = last_content_row.unwrap_or(cursor_row).max(cursor_row);
-    let start_row = end_row
-        .saturating_add(1)
-        .saturating_sub(CODEX_APPEND_ENTER_SNAPSHOT_LINES as u16);
+    // Keep this prompt search aligned with draft detection and the full-screen
+    // prompt lookup in analyze_codex_peer_screen.
+    let start_row = 0;
     let (prompt_row, prompt_col) = (start_row..=end_row).rev().find_map(|row| {
         (0..cols).find_map(|col| {
             screen

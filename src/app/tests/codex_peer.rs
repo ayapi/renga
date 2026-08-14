@@ -44,6 +44,26 @@ fn seed_codex_busy_composer(app: &mut App, pane_id: usize, text: &str) {
     seed_pane_screen(app, pane_id, screen.as_bytes());
 }
 
+fn seed_codex_long_busy_composer(app: &mut App, pane_id: usize, text: &str) {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut screen =
+        String::from("\x1b[?25h\x1b[2J\x1b[H\u{25e6} Working (1m 03s - esc to interrupt)");
+    for (index, chunk) in chars.chunks(20).enumerate() {
+        let row = 4 + index;
+        let text = chunk.iter().collect::<String>();
+        let prefix = if index == 0 { "\u{203a} " } else { "  " };
+        screen.push_str(&format!("\x1b[{row};1H{prefix}{text}"));
+    }
+    let blank_row = 4 + chars.chunks(20).len();
+    let footer_row = blank_row + 1;
+    let cursor_row = blank_row - 1;
+    let cursor_col = chars.chunks(20).last().map_or(3, |chunk| chunk.len() + 3);
+    screen.push_str(&format!(
+        "\x1b[{footer_row};1H  tab to queue message  51% context left\x1b[{cursor_row};{cursor_col}H"
+    ));
+    seed_pane_screen(app, pane_id, screen.as_bytes());
+}
+
 fn make_codex_native_queue_ready(app: &mut App, pane_id: usize) {
     let queue = app
         .pending_codex_peer_messages
@@ -1554,7 +1574,7 @@ fn unfamiliar_interrupt_status_blocks_both_queue_and_idle_paths() {
 }
 
 #[test]
-fn split_transcript_words_do_not_form_busy_signal_across_rows() {
+fn split_transcript_words_use_neither_automatic_path() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     seed_pane_screen(
         &mut app,
@@ -1574,7 +1594,7 @@ fn split_transcript_words_do_not_form_busy_signal_across_rows() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::SubmitAt(_))
+        Some(PendingCodexPeerDelivery::Draft { .. })
     ));
     app.shutdown();
 }
@@ -1977,6 +1997,59 @@ fn native_queue_commit_stops_after_one_retry_and_waits_for_focus() {
             .get(&codex_id)
             .and_then(|q| q.front()),
         Some(PendingCodexPeerDelivery::AwaitFocus(_))
+    ));
+
+    app.handle_focus(&ipc::PaneRef::Id(codex_id))
+        .expect("focus codex");
+    assert!(app.visible_codex_peer_notification().is_some());
+    app.shutdown();
+}
+
+#[test]
+fn long_wrapped_composer_is_detected_and_surfaces_on_focus() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_codex_busy_placeholder(&mut app, codex_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "long composer".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: None,
+        from_kind: None,
+    });
+    seed_codex_long_busy_composer(&mut app, codex_id, &expected);
+    {
+        let pane = app.ws().panes.get(&codex_id).expect("pane");
+        let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            normalized_codex_composer_text(parser.screen()),
+            Some(expected.chars().filter(|ch| !ch.is_whitespace()).collect())
+        );
+        assert_eq!(
+            codex_composer_has_draft_on_screen(parser.screen()),
+            Some(true)
+        );
+    }
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    expire_codex_native_queue(&mut app, codex_id);
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::Draft {
+            retries_remaining: 0,
+            ..
+        })
     ));
 
     app.handle_focus(&ipc::PaneRef::Id(codex_id))
