@@ -627,6 +627,40 @@ fn dedicated_scrollbar_click_and_drag_change_scrollback() {
 }
 
 #[test]
+fn wheel_on_dedicated_scrollbar_uses_host_scrollback() {
+    let (mut app, a_id, _b_id) = two_pane_vertical_app();
+    seed_real_scrollback(&app, a_id);
+    let pane = app.ws().panes.get(&a_id).unwrap();
+    pane.parser
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .process(b"\x1b[?1000h\x1b[?1006h");
+    let rect = pane_rect(&app, a_id);
+
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::ScrollUp,
+        rect.x + rect.width - 2,
+        20,
+    ));
+
+    let scrollback = app
+        .ws()
+        .panes
+        .get(&a_id)
+        .unwrap()
+        .parser
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .screen()
+        .scrollback();
+    assert_eq!(
+        scrollback, 3,
+        "scrollbar wheel should stay in host scrollback"
+    );
+    app.shutdown();
+}
+
+#[test]
 fn right_border_double_click_splits_with_visible_scrollbar() {
     let (mut app, _a_id, b_id) = two_pane_vertical_app();
     make_scrollbar_visible(&app, b_id);

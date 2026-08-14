@@ -877,15 +877,19 @@ impl App {
             {
                 continue;
             }
-            let local_col = col.saturating_sub(rect.x).saturating_sub(1);
-            let local_row = row.saturating_sub(rect.y).saturating_sub(1);
+            let local_coords = pane_local_coords(rect, col, row);
             let codex_hint = self.pane_expects_codex_peer_delivery(self.active_tab, pane_id);
 
             let bytes = if disable_forward {
                 None
             } else {
-                self.ws().panes.get(&pane_id).and_then(|p| {
-                    p.wheel_forward_bytes(codex_hint, scroll_down, local_col, local_row)
+                // UI chrome (the dedicated scrollbar and pane borders) has
+                // no PTY coordinate. Keep wheel events there in renga's host
+                // scrollback instead of emitting an out-of-range mouse report.
+                local_coords.and_then(|(local_col, local_row)| {
+                    self.ws().panes.get(&pane_id).and_then(|p| {
+                        p.wheel_forward_bytes(codex_hint, scroll_down, local_col, local_row)
+                    })
                 })
             };
 
