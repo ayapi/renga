@@ -254,7 +254,7 @@ impl Config {
         }
     }
 
-    /// Apply an optional CLI override on top of the loaded config.
+    /// Apply optional CLI overrides on top of the loaded config.
     /// `None` leaves the field untouched, mirroring the precedence
     /// "CLI > file > default".
     pub fn apply_cli_overrides(&mut self, overrides: CliOverrides) {
