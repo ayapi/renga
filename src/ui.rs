@@ -1179,15 +1179,16 @@ fn render_pane_scrollbar(
     for row in 0..content_area.height {
         let y = content_area.y + row;
         let is_thumb = row >= thumb_top && row < thumb_top + thumb_height;
-        let (sym, style) = if is_thumb {
-            ("\u{2588}", Style::default().fg(SCROLL_THUMB)) // █ thumb
-        } else {
-            ("\u{2502}", Style::default().fg(TEXT_DIM)) // │ track
-        };
-        if let Some(cell) = buf.cell_mut((scrollbar_x, y)) {
-            cell.set_symbol(sym);
-            cell.set_style(style);
+        if !is_thumb {
+            continue;
         }
+        let Some(cell) = buf.cell_mut((scrollbar_x, y)) else {
+            continue;
+        };
+        // The block's existing right border is the track. Leave every
+        // non-thumb cell untouched so its focused/unfocused color stays.
+        cell.set_symbol("\u{2588}");
+        cell.set_style(Style::default().fg(SCROLL_THUMB));
     }
 }
 
@@ -2054,6 +2055,7 @@ mod syntax_color_tests {
 #[cfg(test)]
 mod pane_scrollbar_tests {
     use super::render_pane_scrollbar;
+    use ratatui::style::{Color, Style};
     use ratatui::{buffer::Buffer, layout::Rect};
 
     #[test]
@@ -2067,6 +2069,41 @@ mod pane_scrollbar_tests {
 
         assert_eq!(buf.cell((115, 1)).unwrap().symbol(), "X");
         assert_eq!(buf.cell((116, 1)).unwrap().symbol(), "\u{2588}");
+    }
+
+    #[test]
+    fn scrollbar_keeps_border_symbol_and_accent_outside_thumb() {
+        let outer = Rect::new(0, 0, 117, 6);
+        let content = Rect::new(1, 1, 115, 4);
+        let mut buf = Buffer::empty(outer);
+        for y in content.y..content.y + content.height {
+            buf.cell_mut((116, y))
+                .unwrap()
+                .set_symbol("\u{2502}")
+                .set_style(Style::default().fg(Color::LightBlue));
+        }
+
+        render_pane_scrollbar(&mut buf, content, 0, 8, 4);
+
+        let track = buf.cell((116, 1)).unwrap();
+        assert_eq!(track.symbol(), "\u{2502}");
+        assert_eq!(track.fg, Color::LightBlue);
+        let thumb = buf.cell((116, 3)).unwrap();
+        assert_eq!(thumb.symbol(), "\u{2588}");
+        assert_eq!(thumb.fg, super::SCROLL_THUMB);
+    }
+
+    #[test]
+    fn adjacent_panes_paint_thumbs_on_distinct_right_edges() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 6));
+        let left_content = Rect::new(1, 1, 48, 4);
+        let right_content = Rect::new(51, 1, 48, 4);
+
+        render_pane_scrollbar(&mut buf, left_content, 0, 8, 4);
+        render_pane_scrollbar(&mut buf, right_content, 0, 8, 4);
+
+        assert_eq!(buf.cell((49, 3)).unwrap().symbol(), "\u{2588}");
+        assert_eq!(buf.cell((99, 3)).unwrap().symbol(), "\u{2588}");
     }
 }
 
