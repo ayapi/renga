@@ -1325,6 +1325,58 @@ fn unfocused_busy_codex_without_draft_queues_nudge_natively() {
 }
 
 #[test]
+fn busy_codex_nudge_submits_if_turn_finishes_before_tab() {
+    let mut app = App::new(40, 160).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    seed_codex_busy_placeholder(&mut app, sibling_id);
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "correction near turn completion".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&sibling_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::QueueAt(_))
+    ));
+
+    seed_pane_screen(
+        &mut app,
+        sibling_id,
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA injected peer nudge\x1b[3;1Henter to send\x1b[1;23H",
+    );
+    if let Some(queue) = app.pending_codex_peer_messages.get_mut(&sibling_id) {
+        queue[0] = PendingCodexPeerDelivery::QueueAt(Instant::now());
+    }
+    app.flush_pending_codex_peer_messages();
+
+    assert!(
+        !app.pending_codex_peer_messages.contains_key(&sibling_id),
+        "Enter should commit the injected nudge after Codex becomes idle"
+    );
+    app.shutdown();
+}
+
+#[test]
 fn unfocused_busy_codex_with_draft_does_not_inject_nudge() {
     let mut app = App::new(40, 160).expect("App::new");
     let sender_id = app.ws().focused_pane_id;

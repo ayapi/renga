@@ -724,6 +724,17 @@ impl App {
         pane_screen_has_visible_text(pane) && tail.contains("tab to queue message")
     }
 
+    fn codex_peer_can_submit_injected_draft(registered_codex: bool, pane: &Pane) -> bool {
+        if !registered_codex && !pane.is_codex_running() {
+            return false;
+        }
+        let Some(tail) = codex_peer_screen_tail(pane) else {
+            return false;
+        };
+        pane_screen_has_visible_text(pane)
+            && (tail.contains("enter to send") || tail.contains("ready for input"))
+    }
+
     fn busy_codex_composer_accepts_peer_nudge(pane: &Pane) -> bool {
         let Ok(parser) = pane.parser.lock() else {
             return false;
@@ -822,7 +833,10 @@ impl App {
                             let payload =
                                 if Self::codex_peer_can_queue_message(registered_codex, pane) {
                                     b"\t".as_slice()
-                                } else if Self::codex_peer_delivery_ready(registered_codex, pane) {
+                                } else if Self::codex_peer_can_submit_injected_draft(
+                                    registered_codex,
+                                    pane,
+                                ) {
                                     b"\r".as_slice()
                                 } else {
                                     continue;
