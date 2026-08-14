@@ -29,6 +29,14 @@ fn seed_codex_ready_placeholder(app: &mut App, pane_id: usize) {
     );
 }
 
+fn seed_codex_busy_placeholder(app: &mut App, pane_id: usize) {
+    seed_pane_screen(
+        app,
+        pane_id,
+        b"\x1b[?25h\x1b[2J\x1b[HWorking (1m 03s - esc to interrupt; tab to queue message)\x1b[4;1H\xE2\x80\xBA Improve documentation in @filename\x1b[6;1H  gpt-5.6 high\x1b[4;3H",
+    );
+}
+
 #[test]
 fn codex_peer_delivery_ready_accepts_ready_for_input_fallback() {
     let mut app = App::new(40, 80).expect("App::new");
@@ -1239,6 +1247,112 @@ fn unfocused_codex_with_draft_stays_silent_and_queued() {
         sender_id,
         &ipc::PaneRef::Id(sibling_id),
         "hello codex".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(app.visible_codex_peer_notification().is_none());
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&sibling_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::Draft(_))
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn unfocused_busy_codex_without_draft_queues_nudge_natively() {
+    let mut app = App::new(40, 160).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    seed_codex_busy_placeholder(&mut app, sibling_id);
+    {
+        let pane = app.ws().panes.get(&sibling_id).expect("pane");
+        let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            codex_composer_has_draft_on_screen(parser.screen()),
+            Some(false)
+        );
+        assert!(!parser.screen().hide_cursor());
+        let tail = screen_tail_lines(parser.screen())
+            .join("\n")
+            .to_ascii_lowercase();
+        assert!(tail.contains("tab to queue message"), "{tail:?}");
+    }
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "correction while working".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(app.visible_codex_peer_notification().is_none());
+    let pending = app
+        .pending_codex_peer_messages
+        .get(&sibling_id)
+        .and_then(|q| q.front());
+    assert!(
+        matches!(pending, Some(PendingCodexPeerDelivery::QueueAt(_))),
+        "busy Codex nudge should advance to native queue stage: {pending:?}"
+    );
+
+    if let Some(queue) = app.pending_codex_peer_messages.get_mut(&sibling_id) {
+        queue[0] = PendingCodexPeerDelivery::QueueAt(Instant::now());
+    }
+    app.flush_pending_codex_peer_messages();
+    assert!(
+        !app.pending_codex_peer_messages.contains_key(&sibling_id),
+        "Tab should commit the nudge to Codex's native queue"
+    );
+    app.shutdown();
+}
+
+#[test]
+fn unfocused_busy_codex_with_draft_does_not_inject_nudge() {
+    let mut app = App::new(40, 160).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    seed_pane_screen(
+        &mut app,
+        sibling_id,
+        b"\x1b[?25h\x1b[2J\x1b[HWorking (1m 03s - esc to interrupt; tab to queue message)\x1b[4;1H\xE2\x80\xBA keep my draft\x1b[6;1H  gpt-5.6 high\x1b[4;16H",
+    );
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "do not overwrite draft".to_string(),
     )
     .expect("peer send");
     app.flush_pending_codex_peer_messages();

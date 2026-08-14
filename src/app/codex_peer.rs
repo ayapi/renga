@@ -53,6 +53,7 @@ impl CodexPeerNotificationState {
 pub(crate) enum PendingCodexPeerDelivery {
     Draft(PendingCodexPeerMessage),
     SubmitAt(Instant),
+    QueueAt(Instant),
 }
 
 pub(crate) fn screen_tail_lines(screen: &vt100::Screen) -> Vec<String> {
@@ -693,6 +694,24 @@ impl App {
         tail.contains("enter to send") || tail.contains("ready for input")
     }
 
+    fn codex_peer_can_queue_message(registered_codex: bool, pane: &Pane) -> bool {
+        if !registered_codex && !pane.is_codex_running() {
+            return false;
+        }
+        let Some(tail) = codex_peer_screen_tail(pane) else {
+            return false;
+        };
+        pane_screen_has_visible_text(pane) && tail.contains("tab to queue message")
+    }
+
+    fn busy_codex_composer_accepts_peer_nudge(pane: &Pane) -> bool {
+        let Ok(parser) = pane.parser.lock() else {
+            return false;
+        };
+        let screen = parser.screen();
+        !screen.hide_cursor() && codex_composer_has_draft_on_screen(screen) == Some(false)
+    }
+
     pub(crate) fn flush_pending_codex_peer_messages(&mut self) {
         self.materialize_unfocused_codex_peer_notification();
         let now = Instant::now();
@@ -725,6 +744,27 @@ impl App {
                             }
                             let registered_codex = self.peer_client_kinds.get(&pane_id)
                                 == Some(&PeerClientKind::Codex);
+                            if !pane_is_focused
+                                && Self::codex_peer_can_queue_message(registered_codex, pane)
+                            {
+                                if !Self::busy_codex_composer_accepts_peer_nudge(pane) {
+                                    continue;
+                                }
+                                let payload = crate::mcp_peer::build_send_keys_payload(
+                                    &format_codex_peer_message(&message),
+                                    None,
+                                    false,
+                                )
+                                .expect("codex peer draft payload");
+                                if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
+                                    queue.pop_front();
+                                    queue.push_front(PendingCodexPeerDelivery::QueueAt(
+                                        now + CODEX_PEER_NUDGE_SUBMIT_DELAY,
+                                    ));
+                                    self.dirty = true;
+                                }
+                                continue;
+                            }
                             if !Self::codex_peer_delivery_ready(registered_codex, pane) {
                                 continue;
                             }
@@ -749,6 +789,25 @@ impl App {
                             let payload = crate::mcp_peer::build_send_keys_payload("", None, true)
                                 .expect("codex peer submit payload");
                             if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
+                                queue.pop_front();
+                                self.dirty = true;
+                            }
+                        }
+                        PendingCodexPeerDelivery::QueueAt(ready_at) => {
+                            if now < ready_at {
+                                continue;
+                            }
+                            let registered_codex = self.peer_client_kinds.get(&pane_id)
+                                == Some(&PeerClientKind::Codex);
+                            let payload =
+                                if Self::codex_peer_can_queue_message(registered_codex, pane) {
+                                    b"\t".as_slice()
+                                } else if Self::codex_peer_delivery_ready(registered_codex, pane) {
+                                    b"\r".as_slice()
+                                } else {
+                                    continue;
+                                };
+                            if write_input_to_pane(pane, payload, false).is_ok() {
                                 queue.pop_front();
                                 self.dirty = true;
                             }
