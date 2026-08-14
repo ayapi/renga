@@ -366,13 +366,17 @@ fn analyze_codex_peer_screen(screen: &vt100::Screen) -> CodexPeerScreenSnapshot 
     let (status, footer) = prompt_row.map_or_else(
         || (String::new(), String::new()),
         |prompt_row| {
+            // Codex v0.147.0 keeps the busy status three rows above the
+            // prompt (status, two blank rows, prompt). Four rows retain one
+            // row of tolerance; remeasure this if Codex changes that layout.
+            let status_start = prompt_row.saturating_sub(4);
+            // With a roughly 200-character nudge in a 56-column pane, the
+            // native queue footer was five rows below the prompt. Seven rows
+            // below the prompt cover the measured wrapping with room to spare.
+            let footer_end = prompt_row.saturating_add(8).min(rows);
             (
-                normalized_screen_rows(screen, prompt_row.saturating_sub(4), prompt_row),
-                normalized_screen_rows(
-                    screen,
-                    prompt_row.saturating_add(1),
-                    prompt_row.saturating_add(8).min(rows),
-                ),
+                normalized_screen_rows(screen, status_start, prompt_row),
+                normalized_screen_rows(screen, prompt_row.saturating_add(1), footer_end),
             )
         },
     );
