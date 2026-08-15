@@ -587,7 +587,7 @@ fn tools_spec() -> Value {
         },
         {
             "name": "spawn_pane",
-            "description": "Split a pane to create a new one in the same renga tab. When `command` is provided, renga queues it for asynchronous startup; the process has not been confirmed started when this tool returns, so allow startup time and use `inspect_pane` to verify. When `command` is omitted and `role` is exactly `claude`, renga preloads and queues the peer-enabled Claude startup command; an explicit `command` takes precedence. Returns the new pane's numeric id so you can address it from later tool calls. Refuses if the target is already at minimum size or the tab has hit its pane cap.",
+            "description": "Split a pane to create a new one in the same renga tab. Returns the new pane's numeric id so you can address it from later tool calls. Refuses if the target is already at minimum size or the tab has hit its pane cap. renga queues any effective startup command for asynchronous execution; the process has not been confirmed started when this tool returns, so allow startup time and use `inspect_pane` to verify. When `command` is omitted and `role` is exactly `claude`, renga queues the peer-enabled Claude startup command for automatic execution; an explicit `command` takes precedence. Claude may take 90–150 s to start.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -666,7 +666,7 @@ fn tools_spec() -> Value {
         },
         {
             "name": "spawn_codex_pane",
-            "description": "Higher-level convenience over `spawn_pane`: creates a split pane and queues a Codex startup command without the orchestrating caller having to synthesize a shell-quoted `codex ...` command string. Process startup is asynchronous and has not been confirmed when this tool returns; allow startup time, then use `inspect_pane` to verify (Codex may take 90–150 s). This helper assumes the user has already run `renga mcp install --client codex`; that registration injects the `RENGA_PEER_CLIENT_KIND=codex` env into Codex's MCP server subprocess, so the queued plain `codex` command is configured to register the new pane as a pull-based peer. Extra `args[]` are appended after the `codex` token using the same POSIX-style shell quoting as spawn_claude_pane. Pane creation semantics (split refusal, cwd validation, name / role attachment) match `spawn_pane`.",
+            "description": "Higher-level convenience over `spawn_pane`: creates a split pane and queues a Codex startup command without the orchestrating caller having to synthesize a shell-quoted `codex ...` command string. Process startup is asynchronous and has not been confirmed when this tool returns; allow startup time, then use `inspect_pane` to verify (Codex may take 90–150 s). This helper assumes the user has already run `renga mcp install --client codex`; that registration injects the `RENGA_PEER_CLIENT_KIND=codex` env into Codex's MCP server subprocess, so a plain `codex` launch is enough for the new pane to register as a pull-based peer. Extra `args[]` are appended after the `codex` token using the same POSIX-style shell quoting as spawn_claude_pane. Pane creation semantics (split refusal, cwd validation, name / role attachment) match `spawn_pane`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3243,11 +3243,12 @@ mod tests {
         };
 
         let spawn = description("spawn_pane");
-        assert!(spawn.contains("queues it for asynchronous startup"));
+        assert!(spawn.contains("queues any effective startup command"));
         assert!(spawn.contains("has not been confirmed started"));
         assert!(spawn.contains("`role` is exactly `claude`"));
-        assert!(spawn.contains("preloads and queues"));
+        assert!(spawn.contains("for automatic execution"));
         assert!(spawn.contains("an explicit `command` takes precedence"));
+        assert!(spawn.contains("Claude may take 90–150 s"));
 
         for name in ["spawn_claude_pane", "spawn_codex_pane"] {
             let description = description(name);
@@ -3290,6 +3291,10 @@ mod tests {
             assert!(
                 !instructions.contains("launches"),
                 "instructions must not claim process startup: {instructions}"
+            );
+            assert!(
+                !instructions.contains("runs a startup command"),
+                "instructions must describe command queueing: {instructions}"
             );
         }
     }
