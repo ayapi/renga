@@ -1337,7 +1337,7 @@ fn handle_spawn_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
         &Request::Split {
             target,
             direction,
-            command,
+            command: command.clone(),
             id: name,
             role,
             cwd,
@@ -1345,10 +1345,7 @@ fn handle_spawn_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     ) {
         Ok(Response::Ok { data }) => {
             let new_id = data.get("id").and_then(|v| v.as_u64());
-            let msg = match new_id {
-                Some(n) => format!("Spawned pane id={n}."),
-                None => "Spawned pane (id not reported).".to_string(),
-            };
+            let msg = spawn_pane_created_message(new_id, command.as_deref());
             ok_response(id, tool_text_result(&msg))
         }
         Ok(Response::Err { message, code }) => err_response(
@@ -1358,6 +1355,19 @@ fn handle_spawn_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
         ),
         Ok(other) => err_response(id, -32603, &format!("unexpected renga response: {other:?}")),
         Err(e) => err_response(id, -32603, &format!("renga call failed: {e}")),
+    }
+}
+
+fn spawn_pane_created_message(new_id: Option<u64>, command: Option<&str>) -> String {
+    let pane = match new_id {
+        Some(n) => format!("Created pane id={n}."),
+        None => "Created pane (id not reported).".to_string(),
+    };
+    match command {
+        Some(command) => {
+            format!("{pane} Startup command queued (process start not yet confirmed): {command}")
+        }
+        None => format!("{pane} No startup command requested."),
     }
 }
 
@@ -1725,10 +1735,7 @@ fn handle_spawn_claude_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     ) {
         Ok(Response::Ok { data }) => {
             let new_id = data.get("id").and_then(|v| v.as_u64());
-            let msg = match new_id {
-                Some(n) => format!("Spawned Claude pane id={n}. Launch command: {command}"),
-                None => format!("Spawned Claude pane (id not reported). Launch command: {command}"),
-            };
+            let msg = claude_spawn_queued_message(new_id, &command);
             ok_response(id, tool_text_result(&msg))
         }
         Ok(Response::Err { message, code }) => err_response(
@@ -1741,6 +1748,17 @@ fn handle_spawn_claude_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
         ),
         Ok(other) => err_response(id, -32603, &format!("unexpected renga response: {other:?}")),
         Err(e) => err_response(id, -32603, &format!("renga call failed: {e}")),
+    }
+}
+
+fn claude_spawn_queued_message(new_id: Option<u64>, command: &str) -> String {
+    match new_id {
+        Some(n) => format!(
+            "Created pane id={n}. Claude startup command queued (process start not yet confirmed): {command}"
+        ),
+        None => format!(
+            "Created pane (id not reported). Claude startup command queued (process start not yet confirmed): {command}"
+        ),
     }
 }
 
@@ -3581,6 +3599,33 @@ Commands:
         // extra_args cleanly, mirroring what the handler forwards.
         let got = build_claude_launch_command(None, None, &[]);
         assert_eq!(got, CLAUDE_PEER_LAUNCH_CMD);
+    }
+
+    #[test]
+    fn spawn_pane_success_text_reports_queued_not_started() {
+        let msg = spawn_pane_created_message(Some(7), Some("cargo test"));
+
+        assert_eq!(
+            msg,
+            "Created pane id=7. Startup command queued (process start not yet confirmed): cargo test"
+        );
+    }
+
+    #[test]
+    fn spawn_pane_success_text_without_command_reports_none_requested() {
+        let msg = spawn_pane_created_message(Some(7), None);
+
+        assert_eq!(msg, "Created pane id=7. No startup command requested.");
+    }
+
+    #[test]
+    fn spawn_claude_pane_success_text_reports_queued_not_started() {
+        let msg = claude_spawn_queued_message(Some(9), "claude --model opus");
+
+        assert_eq!(
+            msg,
+            "Created pane id=9. Claude startup command queued (process start not yet confirmed): claude --model opus"
+        );
     }
 
     #[test]
