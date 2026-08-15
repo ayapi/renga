@@ -489,7 +489,8 @@ send_message calls may need approval before peer messaging becomes reliable.\n\n
     - spawn_pane: Split an existing pane to create a new one. Optionally queues a startup command \
     for asynchronous execution; process startup is not confirmed when the tool returns. With no \
     explicit `command`, role `claude` queues the peer-enabled Claude command. The tool can also \
-    assign a stable name or set an explicit working directory via \
+    assign a stable name, attach a free-form role label shown in the UI and list_panes, or set an \
+    explicit working directory via \
     `cwd` (absolute, or relative to the caller pane's cwd). Use `cwd` instead of `cd <dir> && ...` \
     inside `command` so the claude auto-upgrade keeps working.\n\
     - spawn_claude_pane: Higher-level convenience when the target process is Claude Code. Takes \
@@ -530,9 +531,10 @@ send_message calls may need approval before peer messaging becomes reliable.\n\n
     `permission_mode` / `model` / `args[]` fields, always enables the peer channel, and keeps \
     launch policy in renga so orchestrator prompts never have to synthesize shell-quoted command \
     strings. For arbitrary shell commands (non-Claude), use spawn_pane / new_tab. When the \
-    requested command starts with a bare `claude` invocation, the MCP rewrites the queued command to the \
-    peer-enabled form (`claude --dangerously-load-development-channels server:renga-peers \
-    --permission-mode bypassPermissions`), but \
+    requested command starts with a bare `claude` invocation, the MCP injects the peer-enabling \
+    flags after `claude` while preserving all caller-provided trailing arguments \
+    (`claude --dangerously-load-development-channels server:renga-peers \
+    --permission-mode bypassPermissions ...`), but \
     spawn_claude_pane is the recommended API for agent harnesses. For Codex startup commands, prefer \
     spawn_codex_pane once `renga mcp install --client codex` has been run for that user.\n\n\
     IMPORTANT about pane control: these tools affect the user's live layout. Use them with \
@@ -3268,8 +3270,11 @@ mod tests {
 
         for name in ["spawn_pane", "spawn_claude_pane", "spawn_codex_pane"] {
             let description = description(name);
+            let lower = description.to_ascii_lowercase();
             assert!(
-                !description.contains("launches"),
+                !lower.contains("launches claude")
+                    && !lower.contains("launches codex")
+                    && !lower.contains("launches plain"),
                 "{name} must not claim process startup: {description}"
             );
         }
@@ -3288,10 +3293,11 @@ mod tests {
 
         for kind in [PeerClientKind::Claude, PeerClientKind::Codex] {
             let instructions = instructions_blob(kind);
+            let lower = instructions.to_ascii_lowercase();
             assert!(instructions.contains("queues a startup command"));
             assert!(instructions.contains("Process startup is asynchronous"));
             assert!(instructions.contains("process startup is not confirmed"));
-            assert!(instructions.contains("MCP rewrites the queued command"));
+            assert!(instructions.contains("preserving all caller-provided trailing arguments"));
             let new_tab_instructions = instructions
                 .split_once("- new_tab:")
                 .and_then(|(_, tail)| tail.split_once("- inspect_pane:"))
@@ -3303,7 +3309,9 @@ mod tests {
                 .contains("role `claude` queues the peer-enabled Claude command"));
             assert!(new_tab_instructions.contains("an explicit `command` takes precedence"));
             assert!(
-                !instructions.contains("launches"),
+                !lower.contains("launches claude")
+                    && !lower.contains("launches codex")
+                    && !lower.contains("launches plain"),
                 "instructions must not claim process startup: {instructions}"
             );
             assert!(

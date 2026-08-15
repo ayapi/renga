@@ -180,10 +180,12 @@ Errors: `split_refused` (MAX_PANES = 16, or below `min_pane_width` /
 
 ### 1.7 `spawn_claude_pane` — stable
 
-Same envelope as `spawn_pane` minus `command`, plus structured Claude fields:
 Both specialized tools (§1.7 and §1.8) always send their generated startup
 command, so the `role: "claude"` default documented in §1.6 does not apply to
 either tool.
+
+`spawn_claude_pane` has the same envelope as `spawn_pane` minus `command`, plus
+these structured Claude fields:
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
