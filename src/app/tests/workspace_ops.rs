@@ -409,14 +409,22 @@ fn split_role_default_response_reports_the_command_actually_queued() {
         .startup_command
         .as_deref()
         .expect("role default reported");
-    let response = crate::mcp_peer::spawn_pane_created_message(
-        Some(outcome.id as u64),
-        Some(effective_command),
+    let response = crate::mcp_peer::spawn_pane_ok_response(
+        &serde_json::json!(1),
+        &serde_json::json!({
+            "id": outcome.id,
+            "startup_command": outcome.startup_command.clone(),
+        }),
+        None,
+        false,
     );
+    let response_text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text result");
 
     assert_eq!(pending, effective_command);
     assert_eq!(
-        response,
+        response_text,
         format!(
             "Created pane id={}. Startup command queued (process start not yet confirmed; allow startup time, then use inspect_pane to verify): {pending}",
             outcome.id

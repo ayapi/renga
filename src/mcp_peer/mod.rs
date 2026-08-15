@@ -1357,7 +1357,7 @@ fn handle_spawn_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     }
 }
 
-fn spawn_pane_ok_response(
+pub(crate) fn spawn_pane_ok_response(
     id: &Value,
     data: &Value,
     requested_command: Option<&str>,
@@ -1435,17 +1435,6 @@ fn startup_timing_hint(product_suffix: &str) -> &'static str {
         " for Claude" => "; Claude may take 90–150 s",
         " for Codex" => "; Codex may take 90–150 s",
         _ => "",
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn spawn_pane_created_message(new_id: Option<u64>, command: Option<&str>) -> String {
-    match command {
-        Some(command) => spawn_queued_message(new_id, None, command),
-        None => format!(
-            "{} No startup command requested.",
-            created_pane_text(new_id)
-        ),
     }
 }
 
