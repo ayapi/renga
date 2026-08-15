@@ -36,13 +36,13 @@ fn seed_codex_busy_placeholder(app: &mut App, pane_id: usize) {
     seed_pane_screen(
         app,
         pane_id,
-        b"\x1b[?25h\x1b[2J\x1b[HWorking (1m 03s - esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6 high\x1b[6;20H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (1m 03s \xE2\x80\xA2 esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6-sol high \xC2\xB7 cwd\x1b[6;20H",
     );
 }
 
 fn seed_codex_busy_composer(app: &mut App, pane_id: usize, text: &str) {
     let screen = format!(
-        "\x1b[?25h\x1b[2J\x1b[3;1HWorking (1m 03s - esc to interrupt)\x1b[5;1H\u{203a} {text}\x1b[10;1H  tab to queue message  51% context left\x1b[7;20H"
+        "\x1b[?25h\x1b[2J\x1b[3;1H\u{25e6} Working (1m 03s \u{2022} esc to interrupt)\x1b[5;1H\u{203a} {text}\x1b[10;1H  tab to queue message  51% context left\x1b[7;20H"
     );
     seed_pane_screen(app, pane_id, screen.as_bytes());
 }
@@ -50,7 +50,7 @@ fn seed_codex_busy_composer(app: &mut App, pane_id: usize, text: &str) {
 fn seed_codex_long_busy_composer(app: &mut App, pane_id: usize, text: &str) {
     let chars = text.chars().collect::<Vec<_>>();
     let mut screen =
-        String::from("\x1b[?25h\x1b[2J\x1b[H\u{25e6} Working (1m 03s - esc to interrupt)");
+        String::from("\x1b[?25h\x1b[2J\x1b[H\u{25e6} Working (1m 03s \u{2022} esc to interrupt)");
     for (index, chunk) in chars.chunks(20).enumerate() {
         let row = 4 + index;
         let text = chunk.iter().collect::<String>();
@@ -1112,7 +1112,7 @@ fn flush_pending_codex_peer_messages_waits_for_non_blank_codex_screen() {
         let pane = app.ws_mut().panes.get_mut(&sibling_id).expect("pane");
         let mut parser = pane.parser.lock().unwrap();
         parser
-            .process(b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Explain this codebase\n\n  gpt-5.4 high");
+            .process(b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Explain this codebase\n\n  gpt-5.4 high \xC2\xB7 cwd");
     }
     app.flush_pending_codex_peer_messages();
     assert_eq!(
@@ -1143,7 +1143,7 @@ fn codex_prompt_allows_peer_nudge_uses_recent_content_on_tall_screens() {
           \n\
           \xE2\x80\xBA Summarize recent commits\n\
           \n\
-            gpt-5.4 high\x1b[4;3H",
+            gpt-5.4 high \xC2\xB7 cwd\x1b[4;3H",
     );
 
     let screen = parser.screen();
@@ -1181,7 +1181,7 @@ fn transcript_prompt_before_unknown_modal_does_not_accept_nudge() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (12s - esc to interrupt)\x1b[4;1H\xE2\x80\xBA old request\x1b[5;1Htool output\x1b[7;1HAllow this command?\x1b[8;1HYes / No\x1b[4;3H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (12s \xE2\x80\xA2 esc to interrupt)\x1b[4;1H\xE2\x80\xBA old request\x1b[5;1Htool output\x1b[7;1HAllow this command?\x1b[8;1HYes / No\x1b[4;3H",
     );
     {
         let pane = app.ws().panes.get(&codex_id).expect("pane");
@@ -1241,16 +1241,24 @@ fn transcript_prompt_separated_from_unknown_output_is_not_live() {
 }
 
 #[test]
-fn single_transcript_output_row_is_not_a_structural_footer() {
-    let mut bottom_parser = vt100::Parser::new(40, 120, 0);
-    bottom_parser.process(
-        b"\x1b[?25h\x1b[2J\x1b[38;1H\xE2\x80\xBA please refactor the parser\x1b[40;1H  reading src/app.rs\x1b[38;3H",
-    );
-    assert_eq!(
-        codex_prompt_allows_peer_nudge_on_screen(bottom_parser.screen()),
-        None,
-        "a transcript ending on the last screen row must still be rejected"
-    );
+fn ordinary_transcript_output_rows_are_not_structural_footers() {
+    for output in [
+        "reading src/app.rs",
+        "reading src/low-level.rs",
+        "reading crates/high-perf/mod.rs",
+        "the throughput is high",
+    ] {
+        let mut bottom_parser = vt100::Parser::new(40, 120, 0);
+        let screen = format!(
+            "\x1b[?25h\x1b[2J\x1b[38;1H\u{203a} please refactor the parser\x1b[40;1H  {output}\x1b[38;3H"
+        );
+        bottom_parser.process(screen.as_bytes());
+        assert_eq!(
+            codex_prompt_allows_peer_nudge_on_screen(bottom_parser.screen()),
+            None,
+            "transcript output at the last screen row must be rejected: {output}"
+        );
+    }
 
     let mut app = App::new(40, 160).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
@@ -1272,7 +1280,7 @@ fn single_transcript_output_row_is_not_a_structural_footer() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[4;1H\xE2\x80\xBA please refactor the parser\x1b[6;1H  reading src/app.rs\x1b[4;3H",
+        b"\x1b[?25h\x1b[2J\x1b[4;1H\xE2\x80\xBA please refactor the parser\x1b[6;1H  reading src/low-level.rs\x1b[4;3H",
     );
     {
         let pane = app.ws().panes.get(&codex_id).expect("pane");
@@ -1414,7 +1422,7 @@ fn recognized_unactionable_screen_eventually_surfaces_on_focus() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Thinking (12s - esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[4;3H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Thinking (12s \xE2\x80\xA2 esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
     );
     {
         let pane = app.ws().panes.get(&codex_id).expect("pane");
@@ -1525,7 +1533,7 @@ fn live_idle_prompt_with_distant_footer_accepts_nudge() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[1;1HReady\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[5;1Hwrapped composer row 1\x1b[6;1Hwrapped composer row 2\x1b[7;1Hwrapped composer row 3\x1b[8;1Hwrapped composer row 4\x1b[9;1Hwrapped composer row 5\x1b[10;1Hwrapped composer row 6\x1b[11;1Hwrapped composer row 7\x1b[12;1Hwrapped composer row 8\x1b[14;1Ho3 high - cwd\x1b[1;3H",
+        b"\x1b[?25h\x1b[2J\x1b[1;1HReady\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[5;1Hwrapped composer row 1\x1b[6;1Hwrapped composer row 2\x1b[7;1Hwrapped composer row 3\x1b[8;1Hwrapped composer row 4\x1b[9;1Hwrapped composer row 5\x1b[10;1Hwrapped composer row 6\x1b[11;1Hwrapped composer row 7\x1b[12;1Hwrapped composer row 8\x1b[14;1Ho3 high \xC2\xB7 cwd\x1b[1;3H",
     );
     {
         let pane = app.ws().panes.get(&codex_id).expect("pane");
@@ -1575,7 +1583,7 @@ fn live_idle_prompt_with_distant_footer_accepts_nudge() {
 fn non_gpt_footer_is_live_with_cursor_parked_on_footer() {
     let mut parser = vt100::Parser::new(40, 120, 0);
     parser.process(
-        b"\x1b[?25h\x1b[2J\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Ho3 high - cwd\x1b[6;10H",
+        b"\x1b[?25h\x1b[2J\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Ho3 high \xC2\xB7 cwd\x1b[6;10H",
     );
 
     assert_eq!(
@@ -1610,7 +1618,7 @@ fn indented_empty_composer_accepts_nudge_without_waiting() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[4;5H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Ho3 high - cwd\x1b[4;7H",
+        b"\x1b[?25h\x1b[2J\x1b[4;5H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Ho3 high \xC2\xB7 cwd\x1b[4;7H",
     );
     {
         let pane = app.ws().panes.get(&codex_id).expect("pane");
@@ -1656,7 +1664,7 @@ fn wrapped_legacy_enter_to_send_footer_is_recognized() {
 fn codex_prompt_allows_nudge_with_cursor_parked_on_footer() {
     let mut parser = vt100::Parser::new(40, 80, 0);
     parser.process(
-        b"\x1b[?25h\x1b[2J\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1H  gpt-5.6 high\x1b[6;20H",
+        b"\x1b[?25h\x1b[2J\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1H  gpt-5.6-sol high \xC2\xB7 cwd\x1b[6;20H",
     );
 
     assert_eq!(
@@ -1694,7 +1702,9 @@ fn flush_pending_codex_peer_messages_does_not_interrupt_existing_codex_draft() {
     {
         let pane = app.ws_mut().panes.get_mut(&sibling_id).expect("pane");
         let mut parser = pane.parser.lock().unwrap();
-        parser.process(b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA typed draft\n\n  gpt-5.4 high");
+        parser.process(
+            b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA typed draft\n\n  gpt-5.4 high \xC2\xB7 cwd",
+        );
     }
     app.flush_pending_codex_peer_messages();
     assert_eq!(
@@ -1709,7 +1719,7 @@ fn flush_pending_codex_peer_messages_does_not_interrupt_existing_codex_draft() {
         let pane = app.ws_mut().panes.get_mut(&sibling_id).expect("pane");
         let mut parser = pane.parser.lock().unwrap();
         parser.process(
-            b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Run /review on my current changes\n\n  gpt-5.4 high\x1b[1;3H",
+            b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Run /review on my current changes\n\n  gpt-5.4 high \xC2\xB7 cwd\x1b[1;3H",
         );
     }
     app.flush_pending_codex_peer_messages();
@@ -1947,7 +1957,7 @@ fn busy_codex_uses_structured_status_row() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (48s - esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6 high\x1b[1;9H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (48s \xE2\x80\xA2 esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6-sol high \xC2\xB7 cwd\x1b[1;9H",
     );
 
     app.handle_peer_send(
@@ -1973,7 +1983,7 @@ fn nearby_transcript_interrupt_phrase_uses_neither_automatic_path() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[HDuring a turn Codex prints esc to interrupt in its status row.\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[4;3H",
+        b"\x1b[?25h\x1b[2J\x1b[HDuring a turn Codex prints esc to interrupt in its status row.\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
     );
 
     app.handle_peer_send(
@@ -1999,7 +2009,7 @@ fn wrapped_busy_status_blocks_both_queue_and_idle_paths() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (1m 03s - es\x1b[2;1Hc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[4;3H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (1m 03s \xE2\x80\xA2 es\x1b[2;1Hc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
     );
     app.ws_mut()
         .panes
@@ -2037,7 +2047,7 @@ fn unfamiliar_interrupt_status_blocks_both_queue_and_idle_paths() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Thinking (48s - esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[4;3H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Thinking (48s \xE2\x80\xA2 esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
     );
     app.ws_mut()
         .panes
@@ -2075,7 +2085,7 @@ fn split_transcript_words_use_neither_automatic_path() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[HTo stop a run you press Esc to\x1b[2;1Hinterrupt it, then retry.\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[4;3H",
+        b"\x1b[?25h\x1b[2J\x1b[HTo stop a run you press Esc to\x1b[2;1Hinterrupt it, then retry.\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
     );
 
     app.handle_peer_send(
@@ -2101,7 +2111,7 @@ fn distant_transcript_interrupt_hint_does_not_mark_prompt_busy() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (12s - esc to interrupt)\x1b[8;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[10;1Hgpt-5.6-sol medium - cwd\x1b[8;3H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (12s \xE2\x80\xA2 esc to interrupt)\x1b[8;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[10;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[8;3H",
     );
 
     app.handle_peer_send(
@@ -2164,7 +2174,7 @@ fn busy_codex_nudge_submits_if_turn_finishes_before_tab() {
     // Codex v0.147.0 has no idle action hint. Turn completion is observable
     // only through the disappearance of the busy status above the composer.
     let idle_screen = format!(
-        "\x1b[?25h\x1b[2J\x1b[H\u{203a} {expected}\x1b[5;1Hgpt-5.6-sol medium - cwd\x1b[3;20H"
+        "\x1b[?25h\x1b[2J\x1b[H\u{203a} {expected}\x1b[5;1Hgpt-5.6-sol medium \u{b7} cwd\x1b[3;20H"
     );
     seed_pane_screen(&mut app, sibling_id, idle_screen.as_bytes());
     {
@@ -2318,7 +2328,7 @@ fn queue_hint_outside_footer_range_never_falls_through_to_enter() {
     });
     let chars = expected.chars().collect::<Vec<_>>();
     let mut screen =
-        String::from("\x1b[?25h\x1b[2J\x1b[H\u{25e6} Working (1m 03s - esc to interrupt)");
+        String::from("\x1b[?25h\x1b[2J\x1b[H\u{25e6} Working (1m 03s \u{2022} esc to interrupt)");
     for (index, chunk) in chars.chunks(20).enumerate() {
         let row = 4 + index;
         let text = chunk.iter().collect::<String>();
@@ -2664,7 +2674,7 @@ fn await_focus_nudge_does_not_resume_over_footer_parked_draft() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[HPrevious output\x1b[4;1H\xE2\x80\xBA keep my draft\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[6;20H",
+        b"\x1b[?25h\x1b[2J\x1b[HPrevious output\x1b[4;1H\xE2\x80\xBA keep my draft\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[6;20H",
     );
     app.ws_mut()
         .panes
@@ -2864,7 +2874,7 @@ fn unfocused_busy_codex_with_draft_does_not_inject_nudge() {
     seed_pane_screen(
         &mut app,
         sibling_id,
-        b"\x1b[?25h\x1b[2J\x1b[HWorking (1m 03s - esc to interrupt)\x1b[4;1H\xE2\x80\xBA keep my draft\x1b[6;1H  gpt-5.6 high\x1b[4;16H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (1m 03s \xE2\x80\xA2 esc to interrupt)\x1b[4;1H\xE2\x80\xBA keep my draft\x1b[6;1H  gpt-5.6-sol high \xC2\xB7 cwd\x1b[4;16H",
     );
 
     app.handle_peer_send(
@@ -3146,7 +3156,7 @@ fn codex_composer_draft_uses_cursor_position_below_prompt_row() {
 fn codex_empty_composer_ignores_cursor_parked_on_footer() {
     let mut parser = vt100::Parser::new(40, 80, 0);
     parser.process(
-        b"\x1b[?25h\x1b[2J\x1b[HWorking (8s - tab to queue message)\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6 high\x1b[6;20H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (8s \xE2\x80\xA2 esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mImprove documentation in @filename\x1b[22m\x1b[6;1H  gpt-5.6-sol high \xC2\xB7 cwd\x1b[6;20H",
     );
 
     assert_eq!(
@@ -3159,7 +3169,7 @@ fn codex_empty_composer_ignores_cursor_parked_on_footer() {
 fn codex_real_draft_remains_protected_with_cursor_parked_on_footer() {
     let mut parser = vt100::Parser::new(40, 80, 0);
     parser.process(
-        b"\x1b[?25h\x1b[2J\x1b[HWorking (8s - tab to queue message)\x1b[4;1H\xE2\x80\xBA keep my draft\x1b[6;1H  gpt-5.6 high\x1b[6;20H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Working (8s \xE2\x80\xA2 esc to interrupt)\x1b[4;1H\xE2\x80\xBA keep my draft\x1b[6;1H  gpt-5.6-sol high \xC2\xB7 cwd\x1b[6;20H",
     );
 
     assert_eq!(

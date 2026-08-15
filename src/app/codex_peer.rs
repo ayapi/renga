@@ -148,11 +148,7 @@ fn looks_like_codex_footer_rows(rows: &[String], separator_rows: usize) -> bool 
     let model_footer = rows.len() == 1
         && ["minimal", "low", "medium", "high", "xhigh"]
             .iter()
-            .any(|effort| {
-                joined.ends_with(effort)
-                    || joined.contains(&format!("{effort}-"))
-                    || joined.contains(&format!("{effort}·"))
-            });
+            .any(|effort| joined.contains(&format!("{effort}\u{b7}")));
     (separator_rows == 1 && model_footer)
         // Codex v0.147.0 no longer shows this footer, but retain exact support
         // for older releases where the phrase may wrap in a narrow pane.
