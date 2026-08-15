@@ -1356,38 +1356,69 @@ fn handle_spawn_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
 
 fn spawn_pane_ok_response(id: &Value, data: &Value, requested_command: Option<&str>) -> Value {
     let new_id = data.get("id").and_then(|v| v.as_u64());
-    let msg = match data.get("startup_command") {
-        Some(Value::String(command)) => spawn_pane_created_message(new_id, Some(command)),
-        Some(Value::Null) => spawn_pane_created_message(new_id, None),
-        None | Some(_) => spawn_pane_unconfirmed_message(new_id, requested_command),
-    };
+    let msg = spawn_startup_message(new_id, None, data, requested_command);
     ok_response(id, tool_text_result(&msg))
 }
 
-fn spawn_pane_unconfirmed_message(new_id: Option<u64>, requested_command: Option<&str>) -> String {
-    let pane = match new_id {
+fn created_pane_text(new_id: Option<u64>) -> String {
+    match new_id {
         Some(n) => format!("Created pane id={n}."),
         None => "Created pane (id not reported).".to_string(),
-    };
-    let status = "Startup command unconfirmed (renga server may predate effective-command reporting; process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s)";
+    }
+}
+
+fn spawn_startup_message(
+    new_id: Option<u64>,
+    product: Option<&str>,
+    data: &Value,
+    requested_command: Option<&str>,
+) -> String {
+    match data.get("startup_command") {
+        Some(Value::String(command)) => spawn_queued_message(new_id, product, command),
+        Some(Value::Null) => format!(
+            "{} No startup command requested.",
+            created_pane_text(new_id)
+        ),
+        None | Some(_) => spawn_unconfirmed_message(new_id, product, requested_command),
+    }
+}
+
+fn spawn_unconfirmed_message(
+    new_id: Option<u64>,
+    product: Option<&str>,
+    requested_command: Option<&str>,
+) -> String {
+    let pane = created_pane_text(new_id);
+    let product = product
+        .map(|name| format!(" for {name}"))
+        .unwrap_or_default();
+    let status = format!(
+        "Startup command unconfirmed{product} (renga server may predate effective-command reporting; process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s)"
+    );
     match requested_command {
         Some(command) => format!("{pane} {status}: {command}"),
         None => format!("{pane} {status}."),
     }
 }
 
+fn spawn_queued_message(new_id: Option<u64>, product: Option<&str>, command: &str) -> String {
+    let pane = created_pane_text(new_id);
+    let product = product
+        .map(|name| format!(" for {name}"))
+        .unwrap_or_default();
+    format!(
+        "{pane} Startup command queued{product} (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): {command}"
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn spawn_pane_created_message(new_id: Option<u64>, command: Option<&str>) -> String {
-    let pane = match new_id {
-        Some(n) => format!("Created pane id={n}."),
-        None => "Created pane (id not reported).".to_string(),
-    };
     match command {
-        Some(command) => {
-            format!(
-                "{pane} Startup command queued (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): {command}"
-            )
-        }
-        None => format!("{pane} No startup command requested."),
+        Some(command) => spawn_queued_message(new_id, None, command),
+        None => format!(
+            "{} No startup command requested.",
+            created_pane_text(new_id)
+        ),
     }
 }
 
@@ -1769,34 +1800,18 @@ fn handle_spawn_claude_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
 
 fn spawn_claude_pane_ok_response(id: &Value, data: &Value, command: &str) -> Value {
     let new_id = data.get("id").and_then(|v| v.as_u64());
-    let msg = claude_spawn_queued_message(new_id, command);
+    let msg = spawn_startup_message(new_id, Some("Claude"), data, Some(command));
     ok_response(id, tool_text_result(&msg))
-}
-
-fn claude_spawn_queued_message(new_id: Option<u64>, command: &str) -> String {
-    match new_id {
-        Some(n) => format!(
-            "Created pane id={n}. Startup command queued for Claude (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): {command}"
-        ),
-        None => format!(
-            "Created pane (id not reported). Startup command queued for Claude (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): {command}"
-        ),
-    }
 }
 
 fn handle_spawn_codex_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     handle_spawn_codex_pane_with(id, args, ctx, install::verify_codex_renga_peers_install)
 }
 
-fn codex_spawn_queued_message(new_id: Option<u64>, command: &str) -> String {
-    match new_id {
-        Some(n) => format!(
-            "Created pane id={n}. Startup command queued for Codex (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): {command}"
-        ),
-        None => format!(
-            "Created pane (id not reported). Startup command queued for Codex (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): {command}"
-        ),
-    }
+fn spawn_codex_pane_ok_response(id: &Value, data: &Value, command: &str) -> Value {
+    let new_id = data.get("id").and_then(|v| v.as_u64());
+    let msg = spawn_startup_message(new_id, Some("Codex"), data, Some(command));
+    ok_response(id, tool_text_result(&msg))
 }
 
 /// Inner form with an injectable verifier so unit tests can drive the
@@ -1864,11 +1879,7 @@ fn handle_spawn_codex_pane_with(
             cwd,
         },
     ) {
-        Ok(Response::Ok { data }) => {
-            let new_id = data.get("id").and_then(|v| v.as_u64());
-            let msg = codex_spawn_queued_message(new_id, &command);
-            ok_response(id, tool_text_result(&msg))
-        }
+        Ok(Response::Ok { data }) => spawn_codex_pane_ok_response(id, &data, &command),
         Ok(Response::Err { message, code }) => err_response(
             id,
             -32603,
@@ -3699,8 +3710,11 @@ Commands:
 
     #[test]
     fn spawn_claude_pane_success_response_reports_queued_not_started() {
-        let response =
-            spawn_claude_pane_ok_response(&json!(43), &json!({ "id": 9 }), "claude --model opus");
+        let response = spawn_claude_pane_ok_response(
+            &json!(43),
+            &json!({ "id": 9, "startup_command": "claude --model sonnet" }),
+            "claude --model opus",
+        );
 
         assert_eq!(
             response,
@@ -3710,12 +3724,26 @@ Commands:
                 "result": {
                     "content": [{
                         "type": "text",
-                        "text": "Created pane id=9. Startup command queued for Claude (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): claude --model opus"
+                        "text": "Created pane id=9. Startup command queued for Claude (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): claude --model sonnet"
                     }],
                     "isError": false
                 }
             })
         );
+    }
+
+    #[test]
+    fn specialized_spawn_responses_hedge_with_local_command_for_older_server() {
+        for response in [
+            spawn_claude_pane_ok_response(&json!(46), &json!({ "id": 9 }), "claude --model opus"),
+            spawn_codex_pane_ok_response(&json!(47), &json!({ "id": 10 }), "codex --yolo"),
+        ] {
+            let text = response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("text result");
+            assert!(text.contains("Startup command unconfirmed"), "{text}");
+            assert!(!text.contains("No startup command requested."));
+        }
     }
 
     #[test]
@@ -3813,12 +3841,19 @@ Commands:
     }
 
     #[test]
-    fn spawn_codex_pane_success_text_reports_queued_not_started() {
-        let msg = codex_spawn_queued_message(Some(8), "codex --yolo");
+    fn spawn_codex_pane_success_response_uses_server_command() {
+        let response = spawn_codex_pane_ok_response(
+            &json!(48),
+            &json!({ "id": 8, "startup_command": "codex --model gpt-5" }),
+            "codex --yolo",
+        );
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text result");
 
         assert_eq!(
-            msg,
-            "Created pane id=8. Startup command queued for Codex (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): codex --yolo"
+            text,
+            "Created pane id=8. Startup command queued for Codex (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): codex --model gpt-5"
         );
     }
 
