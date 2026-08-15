@@ -237,7 +237,12 @@ use sparingly.
 | `cwd` | string | no | Absolute or relative-to-caller. Defaults to the renga server's cwd. |
 
 Returns: numeric pane id of the new tab's initial pane. Focus switches to the
-new tab.
+new tab. The success text also reports the effective startup command from the
+server: a string means the command was queued but process start is not yet
+confirmed, explicit `null` confirms no command was requested, and a missing or
+non-string value is reported as unconfirmed for compatibility with older
+servers. When neither `command` nor `role` was supplied, no startup command is
+possible and an older server's missing key is reported as no command requested.
 
 ### 1.12 `inspect_pane` — stable
 
@@ -603,7 +608,8 @@ because downstream is required to read the `[code]` token for branching.
   are unset when absent; keys with a documented default (for example
   `send.append_enter`, `inspect.include_cursor`, and `PaneInfo` geometry) take
   that default when absent; additively introduced keys that an older peer may
-  predate (for example `split.startup_command` and `peer_send.delivery`) are
+  predate (for example `split.startup_command`, `new_tab.startup_command`, and
+  `peer_send.delivery`) are
   unknown / unverified when absent and must not be interpreted as `false`,
   `null`, or confirmation that no action occurred. If a key qualifies as both
   optional-when-unset and additively introduced, use the conservative latter
