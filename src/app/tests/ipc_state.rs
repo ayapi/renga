@@ -267,7 +267,7 @@ fn handle_split_relative_cwd_resolves_against_target_pane_cwd() {
     // Plant a subdir under the target pane's cwd and split with a
     // relative cwd pointing at it. The resolved pane cwd must
     // equal the canonicalized subdir.
-    let tmp = std::env::temp_dir().join("renga-cwd-test-target");
+    let tmp = std::env::temp_dir().join(format!("renga-cwd-test-target-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("mkdir tmp");
     let sub = tmp.join("child");
