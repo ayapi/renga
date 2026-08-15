@@ -741,7 +741,7 @@ fn tools_spec() -> Value {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Optional shell command to run in the new pane once the shell is ready. A bare `claude` (or `claude <args>`) is auto-upgraded to the Alt+P peer-enabled form so the new instance joins the renga-peers network. If you pass --dangerously-load-development-channels explicitly, it is left alone."
+                        "description": "Optional shell command to queue in the new pane. Process start is asynchronous and not yet confirmed when new_tab returns; allow startup time, then use inspect_pane to verify. A bare `claude` (or `claude <args>`) is auto-upgraded to the Alt+P peer-enabled form so the new instance joins the renga-peers network. If you pass --dangerously-load-development-channels explicitly, it is left alone."
                     },
                     "name": {
                         "type": "string",
@@ -753,7 +753,7 @@ fn tools_spec() -> Value {
                     },
                     "role": {
                         "type": "string",
-                        "description": "Optional free-form role label attached to the new pane."
+                        "description": "Optional free-form role label attached to the new pane. When command is omitted and role is exactly `claude`, renga queues the peer-enabled Claude startup command; an explicit command takes precedence. Process start is not confirmed by the response."
                     },
                     "cwd": {
                         "type": "string",
@@ -4232,6 +4232,27 @@ Commands:
                 "{tool} schema must advertise cwd property"
             );
         }
+    }
+
+    #[test]
+    fn new_tab_schema_explains_queued_command_and_claude_role_default() {
+        let spec = tools_spec();
+        let new_tab = spec
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool.get("name").and_then(|value| value.as_str()) == Some("new_tab"))
+            .expect("new_tab entry");
+        let properties = &new_tab["inputSchema"]["properties"];
+
+        assert_eq!(
+            properties["command"]["description"],
+            "Optional shell command to queue in the new pane. Process start is asynchronous and not yet confirmed when new_tab returns; allow startup time, then use inspect_pane to verify. A bare `claude` (or `claude <args>`) is auto-upgraded to the Alt+P peer-enabled form so the new instance joins the renga-peers network. If you pass --dangerously-load-development-channels explicitly, it is left alone."
+        );
+        assert_eq!(
+            properties["role"]["description"],
+            "Optional free-form role label attached to the new pane. When command is omitted and role is exactly `claude`, renga queues the peer-enabled Claude startup command; an explicit command takes precedence. Process start is not confirmed by the response."
+        );
     }
 
     #[test]
