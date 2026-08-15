@@ -542,6 +542,7 @@ impl App {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_split(
         &mut self,
         target: &PaneRef,
@@ -599,7 +600,7 @@ impl App {
         let effective_command = command.or_else(|| default_command_for_role(role.as_deref()));
         if let Some(pane) = self.ws_mut().panes.get_mut(&new_pane_id) {
             if let Some(cmd) = effective_command.as_deref() {
-                pane.queue_startup_command(&cmd);
+                pane.queue_startup_command(cmd);
             }
             if let Some(r) = role {
                 pane.role = Some(r);

@@ -30,7 +30,9 @@ use interprocess::local_socket::{prelude::*, ListenerOptions, Stream};
 use super::endpoint::{EndpointKind, EndpointName};
 use super::events::EventBus;
 use super::{err_code, Event, Request, Response, APP_REPLY_TIMEOUT};
-use crate::app::{AppCommand, SplitOutcome};
+use crate::app::AppCommand;
+#[cfg(test)]
+use crate::app::SplitOutcome;
 
 /// Upper bound for waiting on the accept thread during shutdown.
 /// `Drop` must not hang on an uncooperative accept thread — if the
