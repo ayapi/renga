@@ -143,8 +143,8 @@ pub(crate) fn screen_has_visible_text(screen: &vt100::Screen) -> bool {
 fn looks_like_codex_footer_rows(rows: &[String], separator_rows: usize) -> bool {
     let joined = rows.concat();
     (separator_rows == 1 && rows.len() == 1)
-        // Codex v0.147.0 no longer shows this footer, but older releases did;
-        // keep accepting it when a narrow pane wraps the phrase across rows.
+        // Codex v0.147.0 no longer shows this footer, but retain exact support
+        // for older releases where the phrase may wrap in a narrow pane.
         || joined == "entertosend"
         || (joined.starts_with("tabtoqueuemessage") && joined.ends_with("contextleft"))
 }

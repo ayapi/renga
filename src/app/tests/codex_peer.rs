@@ -28,7 +28,7 @@ fn seed_codex_ready_placeholder(app: &mut App, pane_id: usize) {
     seed_pane_screen(
         app,
         pane_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\n\nenter to send\x1b[1;3H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\r\n\r\nenter to send\x1b[1;3H",
     );
 }
 
@@ -864,7 +864,7 @@ fn handle_peer_send_defers_codex_nudge_while_target_is_focused() {
     {
         let pane = app.ws_mut().panes.get_mut(&sibling_id).expect("pane");
         let mut parser = pane.parser.lock().unwrap();
-        parser.process(b"\x1b[?25h\x1b[2J\x1b[Hready for input\n\nenter to send");
+        parser.process(b"\x1b[?25h\x1b[2J\x1b[Hready for input\r\n\r\nenter to send");
     }
     app.flush_pending_codex_peer_messages();
     assert_eq!(
@@ -1052,7 +1052,7 @@ fn flush_pending_codex_peer_messages_requires_ready_screen() {
     {
         let pane = app.ws_mut().panes.get_mut(&sibling_id).expect("pane");
         let mut parser = pane.parser.lock().unwrap();
-        parser.process(b"\x1b[?25h\x1b[2J\x1b[Hready for input\n\nenter to send");
+        parser.process(b"\x1b[?25h\x1b[2J\x1b[Hready for input\r\n\r\nenter to send");
     }
     app.flush_pending_codex_peer_messages();
     assert_eq!(
@@ -2882,7 +2882,7 @@ fn focused_codex_pending_queue_auto_submits_after_draft_clears_to_unknown_placeh
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Write tests for @filename\n\nenter to send\x1b[1;3H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Write tests for @filename\r\n\r\nenter to send\x1b[1;3H",
     );
     app.flush_pending_codex_peer_messages();
 
