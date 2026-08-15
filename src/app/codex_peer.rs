@@ -76,7 +76,7 @@ pub(crate) enum PendingCodexPeerDelivery {
         expected_composer: String,
         retries_remaining: u8,
     },
-    AwaitFocus(PendingCodexPeerMessage),
+    AwaitFocus(PendingCodexPeerMessage, u8),
 }
 
 #[derive(Debug)]
@@ -797,7 +797,10 @@ impl App {
                     .entry(notification.target_pane)
                     .or_default();
                 if queue.is_empty() {
-                    queue.push_back(PendingCodexPeerDelivery::AwaitFocus(notification.message));
+                    queue.push_back(PendingCodexPeerDelivery::AwaitFocus(
+                        notification.message,
+                        0,
+                    ));
                 }
             }
         }
@@ -985,7 +988,10 @@ impl App {
                                         Some(retries_remaining),
                                     ));
                                 } else {
-                                    queue.push_front(PendingCodexPeerDelivery::AwaitFocus(message));
+                                    queue.push_front(PendingCodexPeerDelivery::AwaitFocus(
+                                        message,
+                                        retries_remaining,
+                                    ));
                                 }
                                 self.dirty = true;
                             }
@@ -1036,7 +1042,9 @@ impl App {
                                         stalled_since: now,
                                     });
                                 } else {
-                                    queue.push_front(PendingCodexPeerDelivery::AwaitFocus(message));
+                                    queue.push_front(PendingCodexPeerDelivery::AwaitFocus(
+                                        message, 0,
+                                    ));
                                 }
                                 self.dirty = true;
                                 continue;
@@ -1062,10 +1070,14 @@ impl App {
                                 self.dirty = true;
                             }
                         }
-                        PendingCodexPeerDelivery::AwaitFocus(message) => {
+                        PendingCodexPeerDelivery::AwaitFocus(message, retries_remaining) => {
                             if pane_is_focused {
                                 queue.pop_front();
-                                focused_notifications.push((pane_id, message, None));
+                                focused_notifications.push((
+                                    pane_id,
+                                    message,
+                                    (retries_remaining > 0).then_some(retries_remaining),
+                                ));
                                 self.dirty = true;
                             } else if screen.as_ref().is_some_and(|state| {
                                 state.ready_for_nudge && state.has_draft == Some(false)
@@ -1073,7 +1085,7 @@ impl App {
                                 queue.pop_front();
                                 queue.push_front(PendingCodexPeerDelivery::Draft {
                                     message,
-                                    retries_remaining: 0,
+                                    retries_remaining,
                                     stalled_since: now,
                                 });
                                 self.dirty = true;

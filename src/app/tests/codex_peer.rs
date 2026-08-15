@@ -1297,7 +1297,8 @@ fn persistently_unknown_screen_surfaces_notification_on_focus() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|queue| queue.front()),
-        Some(PendingCodexPeerDelivery::AwaitFocus(_))
+        Some(PendingCodexPeerDelivery::AwaitFocus(_, retries_remaining))
+            if *retries_remaining == CODEX_PEER_NUDGE_MAX_RETRIES
     ));
     assert!(
         app.ws()
@@ -1370,7 +1371,7 @@ fn recognized_unactionable_screen_eventually_surfaces_on_focus() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|queue| queue.front()),
-        Some(PendingCodexPeerDelivery::AwaitFocus(_))
+        Some(PendingCodexPeerDelivery::AwaitFocus(..))
     ));
     app.handle_focus(&ipc::PaneRef::Id(codex_id))
         .expect("focus stalled Codex pane");
@@ -2399,7 +2400,7 @@ fn native_queue_commit_stops_after_one_retry_and_waits_for_focus() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::AwaitFocus(_))
+        Some(PendingCodexPeerDelivery::AwaitFocus(..))
     ));
 
     seed_codex_busy_placeholder(&mut app, codex_id);
@@ -2422,7 +2423,7 @@ fn native_queue_commit_stops_after_one_retry_and_waits_for_focus() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::AwaitFocus(_))
+        Some(PendingCodexPeerDelivery::AwaitFocus(..))
     ));
 
     app.handle_focus(&ipc::PaneRef::Id(codex_id))
@@ -2495,6 +2496,7 @@ fn await_focus_nudge_resumes_when_unfocused_pane_becomes_idle() {
                 from_name: None,
                 from_kind: None,
             },
+            0,
         )]),
     );
     seed_codex_ready_placeholder(&mut app, codex_id);
@@ -2540,6 +2542,36 @@ fn await_focus_nudge_resumes_when_unfocused_pane_becomes_idle() {
 }
 
 #[test]
+fn await_focus_resume_preserves_retry_budget() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    app.pending_codex_peer_messages.insert(
+        codex_id,
+        VecDeque::from([PendingCodexPeerDelivery::AwaitFocus(
+            PendingCodexPeerMessage {
+                from_pane: sender_id,
+                from_name: None,
+                from_kind: None,
+            },
+            CODEX_PEER_NUDGE_MAX_RETRIES,
+        )]),
+    );
+    seed_codex_ready_placeholder(&mut app, codex_id);
+
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::Draft {
+            retries_remaining: CODEX_PEER_NUDGE_MAX_RETRIES,
+            ..
+        })
+    ));
+    app.shutdown();
+}
+
+#[test]
 fn await_focus_nudge_does_not_resume_over_footer_parked_draft() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     app.pending_codex_peer_messages.insert(
@@ -2550,6 +2582,7 @@ fn await_focus_nudge_does_not_resume_over_footer_parked_draft() {
                 from_name: None,
                 from_kind: None,
             },
+            0,
         )]),
     );
     seed_pane_screen(
@@ -2569,7 +2602,7 @@ fn await_focus_nudge_does_not_resume_over_footer_parked_draft() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::AwaitFocus(_))
+        Some(PendingCodexPeerDelivery::AwaitFocus(..))
     ));
     assert!(app
         .ws()
@@ -2592,6 +2625,7 @@ fn exhausted_notification_stays_parked_after_focus_leaves() {
                 from_name: None,
                 from_kind: None,
             },
+            0,
         )]),
     );
     seed_codex_busy_placeholder(&mut app, codex_id);
@@ -2616,7 +2650,7 @@ fn exhausted_notification_stays_parked_after_focus_leaves() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::AwaitFocus(_))
+        Some(PendingCodexPeerDelivery::AwaitFocus(..))
     ));
     assert!(app
         .ws()
@@ -2651,6 +2685,7 @@ fn coalesced_notification_keeps_largest_retry_budget() {
                 from_name: Some("later".to_string()),
                 from_kind: None,
             },
+            0,
         )]),
     );
 
