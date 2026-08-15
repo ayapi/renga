@@ -30,7 +30,7 @@ use interprocess::local_socket::{prelude::*, ListenerOptions, Stream};
 use super::endpoint::{EndpointKind, EndpointName};
 use super::events::EventBus;
 use super::{err_code, Event, Request, Response, APP_REPLY_TIMEOUT};
-use crate::app::AppCommand;
+use crate::app::{AppCommand, SplitOutcome};
 
 /// Upper bound for waiting on the accept thread during shutdown.
 /// `Drop` must not hang on an uncooperative accept thread — if the
@@ -446,7 +446,10 @@ fn dispatch_request(req: Request, command_tx: &Sender<AppCommand>) -> Response {
                 return Response::err_coded(err_code::SHUTTING_DOWN, "app shutting down");
             }
             match reply_rx.recv_timeout(APP_REPLY_TIMEOUT) {
-                Ok(Ok(new_id)) => Response::ok_value(serde_json::json!({ "id": new_id })),
+                Ok(Ok(outcome)) => Response::ok_value(serde_json::json!({
+                    "id": outcome.id,
+                    "startup_command": outcome.startup_command,
+                })),
                 Ok(Err(err)) => err.into_response(),
                 Err(e) => {
                     Response::err_coded(err_code::APP_TIMEOUT, format!("app did not respond: {e}"))
@@ -766,7 +769,12 @@ mod tests {
         let (tx, rx) = mpsc::channel::<AppCommand>();
         let handle = thread::spawn(move || {
             if let Ok(AppCommand::Split { reply, .. }) = rx.recv() {
-                reply.send(Ok(42)).unwrap();
+                reply
+                    .send(Ok(SplitOutcome {
+                        id: 42,
+                        startup_command: Some("cargo test".into()),
+                    }))
+                    .unwrap();
             }
         });
         let resp = dispatch_request(
@@ -784,6 +792,10 @@ mod tests {
         match resp {
             Response::Ok { data } => {
                 assert_eq!(data.get("id").and_then(|v| v.as_u64()), Some(42));
+                assert_eq!(
+                    data.get("startup_command").and_then(|v| v.as_str()),
+                    Some("cargo test")
+                );
             }
             other => panic!("expected Ok, got {other:?}"),
         }
@@ -903,7 +915,12 @@ mod tests {
         let handle = thread::spawn(move || {
             if let Ok(AppCommand::Split { role, reply, .. }) = rx.recv() {
                 assert_eq!(role.as_deref(), Some("worker"));
-                reply.send(Ok(7)).unwrap();
+                reply
+                    .send(Ok(SplitOutcome {
+                        id: 7,
+                        startup_command: None,
+                    }))
+                    .unwrap();
             }
         });
         let resp = dispatch_request(

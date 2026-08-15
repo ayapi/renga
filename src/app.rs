@@ -22,8 +22,8 @@ mod selection;
 mod sidebar_input;
 mod workspace_state;
 
-pub(crate) use self::app_state::CLAUDE_PEER_LAUNCH_CMD;
 pub use self::app_state::{App, AppCommand, AppEvent};
+pub(crate) use self::app_state::{SplitOutcome, CLAUDE_PEER_LAUNCH_CMD};
 #[cfg(test)]
 use self::codex_peer::{
     codex_prompt_allows_peer_nudge_on_screen, format_codex_peer_message, screen_tail_lines,

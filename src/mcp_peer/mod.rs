@@ -1345,7 +1345,8 @@ fn handle_spawn_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     ) {
         Ok(Response::Ok { data }) => {
             let new_id = data.get("id").and_then(|v| v.as_u64());
-            let msg = spawn_pane_created_message(new_id, command.as_deref());
+            let effective_command = data.get("startup_command").and_then(|v| v.as_str());
+            let msg = spawn_pane_created_message(new_id, effective_command);
             ok_response(id, tool_text_result(&msg))
         }
         Ok(Response::Err { message, code }) => err_response(
@@ -1358,7 +1359,7 @@ fn handle_spawn_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     }
 }
 
-fn spawn_pane_created_message(new_id: Option<u64>, command: Option<&str>) -> String {
+pub(crate) fn spawn_pane_created_message(new_id: Option<u64>, command: Option<&str>) -> String {
     let pane = match new_id {
         Some(n) => format!("Created pane id={n}."),
         None => "Created pane (id not reported).".to_string(),

@@ -58,7 +58,8 @@ impl App {
                 cwd,
                 reply,
             } => {
-                let result = self.handle_split(&target, direction, command, name, role, cwd);
+                let result =
+                    self.handle_split_with_outcome(&target, direction, command, name, role, cwd);
                 let _ = reply.send(result);
             }
             AppCommand::NewTab {
@@ -550,6 +551,19 @@ impl App {
         role: Option<String>,
         cwd: Option<String>,
     ) -> std::result::Result<usize, ipc::CodedError> {
+        self.handle_split_with_outcome(target, direction, command, name, role, cwd)
+            .map(|outcome| outcome.id)
+    }
+
+    pub(crate) fn handle_split_with_outcome(
+        &mut self,
+        target: &PaneRef,
+        direction: ipc::Direction,
+        command: Option<String>,
+        name: Option<String>,
+        role: Option<String>,
+        cwd: Option<String>,
+    ) -> std::result::Result<SplitOutcome, ipc::CodedError> {
         let target_pane_id = self.ws().resolve_pane_ref(target).ok_or_else(|| {
             ipc::CodedError::new(
                 ipc::err_code::PANE_NOT_FOUND,
@@ -584,7 +598,7 @@ impl App {
         };
         let effective_command = command.or_else(|| default_command_for_role(role.as_deref()));
         if let Some(pane) = self.ws_mut().panes.get_mut(&new_pane_id) {
-            if let Some(cmd) = effective_command {
+            if let Some(cmd) = effective_command.as_deref() {
                 pane.queue_startup_command(&cmd);
             }
             if let Some(r) = role {
@@ -597,6 +611,9 @@ impl App {
             }
         }
         self.emit_pane_started(new_pane_id);
-        Ok(new_pane_id)
+        Ok(SplitOutcome {
+            id: new_pane_id,
+            startup_command: effective_command,
+        })
     }
 }

@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SplitOutcome {
+    pub(crate) id: usize,
+    pub(crate) startup_command: Option<String>,
+}
+
 /// Commands that flow from the IPC server thread into the App's event
 /// loop. Each variant carries a `oneshot::Sender` so the server thread
 /// can block-wait for the App to finish processing.
@@ -25,7 +31,8 @@ pub enum AppCommand {
     /// Split the target pane. If `command` is given, it's queued on the
     /// new pane and flushed when its shell prompt appears. If `name` is
     /// given, it's registered so later IPC calls can address the pane by
-    /// name. Returns the new pane's id on success.
+    /// name. Returns the new pane's id and effective startup command on
+    /// success so the IPC response can report the command actually queued.
     Split {
         target: PaneRef,
         direction: ipc::Direction,
@@ -33,7 +40,7 @@ pub enum AppCommand {
         name: Option<String>,
         role: Option<String>,
         cwd: Option<String>,
-        reply: oneshot::Sender<std::result::Result<usize, ipc::CodedError>>,
+        reply: oneshot::Sender<std::result::Result<SplitOutcome, ipc::CodedError>>,
     },
     /// Open a new tab with a fresh single pane. Focus switches to the
     /// new tab (mirrors the Alt+T keybinding). Returns the new pane's

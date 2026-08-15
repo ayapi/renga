@@ -389,6 +389,43 @@ fn default_command_for_role_returns_none_for_other_roles() {
 }
 
 #[test]
+fn split_role_default_response_reports_the_command_actually_queued() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let outcome = app
+        .handle_split_with_outcome(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            Some("claude".into()),
+            None,
+        )
+        .expect("split succeeds");
+    let pane = app.ws().panes.get(&outcome.id).expect("pane exists");
+    let pending = std::str::from_utf8(pane.pending_startup.as_ref().expect("command queued"))
+        .expect("utf8")
+        .trim_end_matches(['\r', '\n']);
+    let effective_command = outcome
+        .startup_command
+        .as_deref()
+        .expect("role default reported");
+    let response = crate::mcp_peer::spawn_pane_created_message(
+        Some(outcome.id as u64),
+        Some(effective_command),
+    );
+
+    assert_eq!(pending, effective_command);
+    assert_eq!(
+        response,
+        format!(
+            "Created pane id={}. Startup command queued (process start not yet confirmed): {pending}",
+            outcome.id
+        )
+    );
+    app.shutdown();
+}
+
+#[test]
 fn apply_layout_auto_upgrades_bare_claude_command() {
     // Issue #126: layout toml's `command = "claude"` should receive
     // the same peer-enabled launch-line upgrade as MCP spawn_pane /
