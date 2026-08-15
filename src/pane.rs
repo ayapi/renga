@@ -23,13 +23,13 @@ struct CachedMouseProtocol {
 /// A terminal pane wrapping a PTY and vt100 parser.
 pub struct Pane {
     pub id: usize,
-    master: Box<dyn MasterPty + Send>,
+    master: Option<Box<dyn MasterPty + Send>>,
     writer: Box<dyn Write + Send>,
     #[cfg(test)]
     test_input: Vec<u8>,
     pub parser: Arc<Mutex<vt100::Parser>>,
-    child: Box<dyn Child + Send + Sync>,
-    _reader_handle: thread::JoinHandle<()>,
+    child: Option<Box<dyn Child + Send + Sync>>,
+    _reader_handle: Option<thread::JoinHandle<()>>,
     last_rows: u16,
     last_cols: u16,
     pub exited: bool,
@@ -118,6 +118,94 @@ impl Pane {
         cols: u16,
         event_tx: Sender<AppEvent>,
         cwd: Option<PathBuf>,
+    ) -> Result<Self> {
+        #[cfg(test)]
+        {
+            let _ = event_tx;
+            Ok(Self::new_headless(id, rows, cols, cwd))
+        }
+        #[cfg(not(test))]
+        {
+            Self::new_real_with_cwd(id, rows, cols, event_tx, cwd)
+        }
+    }
+
+    /// Spawn a real shell-backed pane from tests that intentionally
+    /// exercise the PTY lifecycle. Ordinary unit tests use the
+    /// process-free constructor selected by [`Self::new_with_cwd`].
+    #[cfg(test)]
+    pub(crate) fn new_real(
+        id: usize,
+        rows: u16,
+        cols: u16,
+        event_tx: Sender<AppEvent>,
+    ) -> Result<Self> {
+        Self::new_real_with_cwd(id, rows, cols, event_tx, None)
+    }
+
+    #[cfg(test)]
+    fn new_real_with_setup_probe(
+        id: usize,
+        rows: u16,
+        cols: u16,
+        event_tx: Sender<AppEvent>,
+        probe: &[u8],
+    ) -> Result<Self> {
+        Self::new_real_with_cwd_and_probe(id, rows, cols, event_tx, None, Some(probe))
+    }
+
+    #[cfg(test)]
+    fn new_headless(id: usize, rows: u16, cols: u16, cwd: Option<PathBuf>) -> Self {
+        let work_dir =
+            cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+        Self {
+            id,
+            master: None,
+            writer: Box::new(std::io::sink()),
+            test_input: Vec::new(),
+            parser: Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10000))),
+            child: None,
+            _reader_handle: None,
+            last_rows: rows,
+            last_cols: cols,
+            exited: false,
+            title: Arc::new(Mutex::new(String::new())),
+            cwd: work_dir,
+            total_scrollback: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pending_startup: None,
+            prompt_seen: Arc::new(AtomicBool::new(false)),
+            claude_seen: Arc::new(AtomicBool::new(false)),
+            codex_seen: Arc::new(AtomicBool::new(false)),
+            claude_caret_cache: Mutex::new(None),
+            mouse_protocol_cache: Arc::new(Mutex::new(None)),
+            alternate_scroll_mode: Arc::new(AtomicBool::new(false)),
+            codex_transcript_overlay_hint: Arc::new(AtomicBool::new(false)),
+            role: None,
+            summary: None,
+            exit_event_emitted: false,
+            #[cfg(windows)]
+            job: None,
+        }
+    }
+
+    fn new_real_with_cwd(
+        id: usize,
+        rows: u16,
+        cols: u16,
+        event_tx: Sender<AppEvent>,
+        cwd: Option<PathBuf>,
+    ) -> Result<Self> {
+        Self::new_real_with_cwd_and_probe(id, rows, cols, event_tx, cwd, None)
+    }
+
+    fn new_real_with_cwd_and_probe(
+        id: usize,
+        rows: u16,
+        cols: u16,
+        event_tx: Sender<AppEvent>,
+        cwd: Option<PathBuf>,
+        setup_probe: Option<&[u8]>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
 
@@ -222,13 +310,13 @@ impl Pane {
 
         let mut pane = Self {
             id,
-            master: pair.master,
+            master: Some(pair.master),
             writer,
             #[cfg(test)]
             test_input: Vec::new(),
             parser,
-            child,
-            _reader_handle: reader_handle,
+            child: Some(child),
+            _reader_handle: Some(reader_handle),
             last_rows: rows,
             last_cols: cols,
             exited: false,
@@ -253,19 +341,29 @@ impl Pane {
         // Inject OSC 7 hook after shell starts
         // Leading space prevents it from appearing in bash history
         if shell_name.contains("bash") {
-            let setup = concat!(
+            let mut setup = concat!(
                 " __renga_osc7() { printf '\\033]7;file://%s%s\\007' \"$HOSTNAME\" \"$PWD\"; };",
                 " PROMPT_COMMAND=\"__renga_osc7;${PROMPT_COMMAND}\";",
-                " clear\n",
-            );
-            let _ = pane.write_input(setup.as_bytes());
+            )
+            .as_bytes()
+            .to_vec();
+            if let Some(probe) = setup_probe {
+                setup.extend_from_slice(probe);
+            }
+            setup.extend_from_slice(b" clear\n");
+            let _ = pane.write_input(&setup);
         } else if shell_name.contains("zsh") {
-            let setup = concat!(
+            let mut setup = concat!(
                 " __renga_osc7() { printf '\\033]7;file://%s%s\\007' \"$HOST\" \"$PWD\"; };",
                 " precmd_functions+=(__renga_osc7);",
-                " clear\n",
-            );
-            let _ = pane.write_input(setup.as_bytes());
+            )
+            .as_bytes()
+            .to_vec();
+            if let Some(probe) = setup_probe {
+                setup.extend_from_slice(probe);
+            }
+            setup.extend_from_slice(b" clear\n");
+            let _ = pane.write_input(&setup);
         }
 
         Ok(pane)
@@ -311,14 +409,16 @@ impl Pane {
         self.last_rows = rows;
         self.last_cols = cols;
 
-        self.master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("Failed to resize PTY")?;
+        if let Some(master) = self.master.as_ref() {
+            master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .context("Failed to resize PTY")?;
+        }
 
         let mut parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
         parser.screen_mut().set_size(rows, cols);
@@ -668,6 +768,10 @@ impl Pane {
     /// rare spawn where job assignment failed, with its known holes
     /// (can't reach children of already-dead intermediates).
     pub fn kill(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            self.exited = true;
+            return;
+        };
         // `try_wait` distinguishes "child still alive, needs killing"
         // from "child already exited, just needs reaping" — important
         // because `pane.exited` only signals PTY EOF was observed, not
@@ -676,7 +780,7 @@ impl Pane {
         // / `child.kill()` path is skipped when the process is already
         // gone so the close+Drop pair doesn't double-spawn taskkill on
         // Windows (#214 review), but `wait()` always runs to reap.
-        let alive = !matches!(self.child.try_wait(), Ok(Some(_)));
+        let alive = !matches!(child.try_wait(), Ok(Some(_)));
         // Terminate the job even when the shell itself already exited:
         // orphaned grandchildren (dev servers, `run_in_background`
         // jobs, mcp-peer, …) stay in the job after their parents die,
@@ -693,7 +797,7 @@ impl Pane {
         if alive {
             #[cfg(windows)]
             if !job_terminated {
-                if let Some(pid) = self.child.process_id() {
+                if let Some(pid) = child.process_id() {
                     let _ = std::process::Command::new("taskkill")
                         .args(["/F", "/T", "/PID", &pid.to_string()])
                         .stdout(std::process::Stdio::null())
@@ -702,9 +806,9 @@ impl Pane {
                         .status();
                 }
             }
-            let _ = self.child.kill();
+            let _ = child.kill();
         }
-        let _ = self.child.wait();
+        let _ = child.wait();
         self.exited = true;
     }
 
@@ -729,7 +833,11 @@ impl Pane {
     /// `exited` lags the shell's death while grandchildren are alive.
     #[cfg(test)]
     pub(crate) fn child_exited_for_test(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
+        let child = self
+            .child
+            .as_mut()
+            .expect("child process is unavailable on a headless pane");
+        matches!(child.try_wait(), Ok(Some(_)))
     }
 
     /// If a startup command is queued and the shell prompt has been
@@ -1516,6 +1624,19 @@ fn detect_shell_unix() -> PathBuf {
 mod tests {
     use super::*;
 
+    static REAL_PANE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn wait_for(mut cond: impl FnMut() -> bool, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
     #[test]
     fn extract_osc7_handles_empty_and_named_hosts() {
         let local = extract_osc7(b"\x1b]7;file:///workspace/project\x07");
@@ -1555,6 +1676,200 @@ mod tests {
     }
 
     #[test]
+    fn real_pane_reader_delivers_output_event() {
+        let _guard = REAL_PANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut pane = Pane::new_real(9910, 24, 80, tx).expect("spawn real pane");
+
+        assert!(
+            wait_for(
+                || {
+                    rx.try_iter()
+                        .any(|event| matches!(event, AppEvent::PtyOutput(9910)))
+                },
+                Duration::from_secs(30)
+            ),
+            "real PTY reader should publish output"
+        );
+        pane.kill();
+    }
+
+    #[test]
+    fn real_pane_latches_shell_prompt() {
+        let _guard = REAL_PANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut pane = Pane::new_real(9911, 24, 80, tx).expect("spawn real pane");
+
+        assert!(
+            wait_for(
+                || pane.prompt_seen.load(Ordering::Acquire),
+                Duration::from_secs(30)
+            ),
+            "real PTY reader should latch the shell prompt"
+        );
+        pane.kill();
+    }
+
+    #[test]
+    fn real_pane_executes_queued_startup_command() {
+        let _guard = REAL_PANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let marker = std::env::temp_dir().join(format!(
+            "renga-real-pane-command-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let marker_fwd = marker.display().to_string().replace('\\', "/");
+        let shell_name = detect_shell()
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let command = if shell_name.contains("powershell") || shell_name == "pwsh.exe" {
+            format!("Set-Content -NoNewline -LiteralPath '{marker_fwd}' -Value renga-smoke")
+        } else {
+            format!("printf renga-smoke > '{marker_fwd}'")
+        };
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut pane = Pane::new_real(9912, 24, 80, tx).expect("spawn real pane");
+        pane.queue_startup_command(&command);
+        assert!(
+            wait_for(
+                || pane.try_flush_startup().unwrap_or(false),
+                Duration::from_secs(30)
+            ),
+            "queued command should flush to the real shell"
+        );
+        assert!(
+            pane.prompt_seen.load(Ordering::Acquire),
+            "startup flush should latch the prompt through the real reader or parser fallback"
+        );
+        assert!(
+            wait_for(
+                || {
+                    std::fs::read_to_string(&marker).is_ok_and(|contents| contents == "renga-smoke")
+                },
+                Duration::from_secs(30)
+            ),
+            "real shell should execute the queued command"
+        );
+        pane.kill();
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn real_pane_injects_osc7_setup_for_supported_shell() {
+        let _guard = REAL_PANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let shell_name = detect_shell()
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if !shell_name.contains("bash") && !shell_name.contains("zsh") {
+            eprintln!("skipping: OSC 7 setup is only injected for bash/zsh, got {shell_name}");
+            return;
+        }
+
+        let marker_path =
+            std::env::temp_dir().join(format!("renga-real-pane-setup-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&marker_path);
+        let marker_fwd = marker_path.display().to_string().replace('\\', "/");
+        let probe = format!(
+            "printf renga-setup-probe > '{marker_fwd}'; printf 'RENGA_PRE_CLEAR_MARKER\\n'\r"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut pane = Pane::new_real_with_setup_probe(9913, 24, 80, tx, probe.as_bytes())
+            .expect("spawn real pane with pre-setup probe");
+        let recorded_input = String::from_utf8_lossy(pane.test_input());
+        assert!(recorded_input.contains("__renga_osc7"));
+        assert!(recorded_input.contains("clear\n"));
+        if shell_name.contains("bash") {
+            assert!(recorded_input.contains("PROMPT_COMMAND"));
+        } else {
+            assert!(recorded_input.contains("precmd_functions"));
+        }
+
+        assert!(
+            wait_for(|| marker_path.exists(), Duration::from_secs(30)),
+            "pre-setup probe should execute in the real shell"
+        );
+        assert!(
+            wait_for(
+                || {
+                    rx.try_iter()
+                        .any(|event| matches!(event, AppEvent::CwdChanged(9913, _)))
+                },
+                Duration::from_secs(30)
+            ),
+            "installed OSC 7 hook should publish the shell cwd"
+        );
+        assert!(
+            wait_for(
+                || {
+                    rx.try_iter().any(|event| {
+                        matches!(event, AppEvent::PtyOutput(9913))
+                            && !pane
+                                .parser
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .screen()
+                                .contents()
+                                .contains("RENGA_PRE_CLEAR_MARKER")
+                    })
+                },
+                Duration::from_secs(30)
+            ),
+            "setup clear should remove output written immediately before setup"
+        );
+
+        let osc7_dir =
+            std::env::temp_dir().join(format!("renga-real-pane-osc7-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&osc7_dir);
+        std::fs::create_dir_all(&osc7_dir).expect("create OSC 7 target directory");
+        let osc7_dir_fwd = osc7_dir.display().to_string().replace('\\', "/");
+        rx.try_iter().for_each(drop);
+        pane.write_input(format!("cd '{osc7_dir_fwd}'\r").as_bytes())
+            .expect("send cd to real shell");
+        assert!(
+            wait_for(
+                || {
+                    rx.try_iter().any(|event| {
+                        matches!(event, AppEvent::CwdChanged(9913, path) if path.file_name() == osc7_dir.file_name())
+                    })
+                },
+                Duration::from_secs(30)
+            ),
+            "installed OSC 7 hook should publish cwd after each prompt"
+        );
+        pane.kill();
+        let _ = std::fs::remove_file(marker_path);
+        let _ = std::fs::remove_dir_all(osc7_dir);
+    }
+
+    #[test]
+    fn real_pane_resize_updates_pty_and_parser() {
+        let _guard = REAL_PANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut pane = Pane::new_real(9914, 24, 80, tx).expect("spawn real pane");
+
+        assert!(pane.resize(30, 100).expect("resize real PTY"));
+        let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(parser.screen().size(), (30, 100));
+        drop(parser);
+        assert!(!pane.resize(30, 100).expect("same-size resize is a no-op"));
+        pane.kill();
+    }
+
+    #[test]
     fn drain_osc52_copies_decodes_bel_terminated_payload() {
         let mut buf = b"\x1b]52;c;aGVsbG8=\x07".to_vec();
         assert_eq!(drain_osc52_copies(&mut buf), vec!["hello"]);
@@ -1590,7 +1905,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn kill_reaps_grandchild_after_shell_natural_exit() {
-        use std::time::{Duration, Instant};
+        let _guard = REAL_PANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // The startup command below is bash syntax (`& disown; exit`).
         // On a machine where detect_shell() falls back to PowerShell
@@ -1603,17 +1920,6 @@ mod tests {
         if !shell_name.contains("bash") {
             eprintln!("skipping: test requires a bash pane shell, got {shell_name}");
             return;
-        }
-
-        fn wait_for(mut cond: impl FnMut() -> bool, budget: Duration) -> bool {
-            let deadline = Instant::now() + budget;
-            while Instant::now() < deadline {
-                if cond() {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            false
         }
 
         /// Removes the listed files on drop, so temp artifacts are
@@ -1646,7 +1952,7 @@ mod tests {
             |path: &std::path::Path| std::fs::OpenOptions::new().write(true).open(path).is_err();
 
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut pane = Pane::new(9901, 24, 80, tx).expect("spawn pane");
+        let mut pane = Pane::new_real(9901, 24, 80, tx).expect("spawn pane");
         // Detach the locker from the shell, then end the shell — the
         // exact "natural exit leaves an orphan" scenario.
         pane.queue_startup_command(&format!(
@@ -2001,6 +2307,9 @@ mod tests {
     /// two tests mutating the slot would race each other.
     #[test]
     fn shell_override_lifecycle() {
+        let _guard = REAL_PANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // A nonexistent path must not install an override (warning +
         // auto-detect fallback), and neither must whitespace.
         set_shell_override_from_config(Some(r"C:\definitely\not\a\shell-xyz.exe"));
