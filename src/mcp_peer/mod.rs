@@ -1343,7 +1343,7 @@ fn handle_spawn_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
             cwd,
         },
     ) {
-        Ok(Response::Ok { data }) => spawn_pane_ok_response(id, &data),
+        Ok(Response::Ok { data }) => spawn_pane_ok_response(id, &data, command.as_deref()),
         Ok(Response::Err { message, code }) => err_response(
             id,
             -32603,
@@ -1354,11 +1354,26 @@ fn handle_spawn_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     }
 }
 
-fn spawn_pane_ok_response(id: &Value, data: &Value) -> Value {
+fn spawn_pane_ok_response(id: &Value, data: &Value, requested_command: Option<&str>) -> Value {
     let new_id = data.get("id").and_then(|v| v.as_u64());
-    let effective_command = data.get("startup_command").and_then(|v| v.as_str());
-    let msg = spawn_pane_created_message(new_id, effective_command);
+    let msg = match data.get("startup_command") {
+        Some(Value::String(command)) => spawn_pane_created_message(new_id, Some(command)),
+        Some(Value::Null) => spawn_pane_created_message(new_id, None),
+        None | Some(_) => spawn_pane_unconfirmed_message(new_id, requested_command),
+    };
     ok_response(id, tool_text_result(&msg))
+}
+
+fn spawn_pane_unconfirmed_message(new_id: Option<u64>, requested_command: Option<&str>) -> String {
+    let pane = match new_id {
+        Some(n) => format!("Created pane id={n}."),
+        None => "Created pane (id not reported).".to_string(),
+    };
+    let status = "Startup command unconfirmed (renga server may predate effective-command reporting; process start not yet confirmed; use inspect_pane to verify)";
+    match requested_command {
+        Some(command) => format!("{pane} {status}: {command}"),
+        None => format!("{pane} {status}."),
+    }
 }
 
 pub(crate) fn spawn_pane_created_message(new_id: Option<u64>, command: Option<&str>) -> String {
@@ -3613,6 +3628,7 @@ Commands:
         let response = spawn_pane_ok_response(
             &json!(41),
             &json!({ "id": 7, "startup_command": "cargo test" }),
+            Some("ignored fallback"),
         );
 
         assert_eq!(
@@ -3633,8 +3649,11 @@ Commands:
 
     #[test]
     fn spawn_pane_success_response_without_command_reports_none_requested() {
-        let response =
-            spawn_pane_ok_response(&json!(42), &json!({ "id": 7, "startup_command": null }));
+        let response = spawn_pane_ok_response(
+            &json!(42),
+            &json!({ "id": 7, "startup_command": null }),
+            None,
+        );
 
         assert_eq!(
             response,
@@ -3650,6 +3669,32 @@ Commands:
                 }
             })
         );
+    }
+
+    #[test]
+    fn spawn_pane_missing_startup_command_is_unconfirmed_for_older_server() {
+        let response = spawn_pane_ok_response(&json!(44), &json!({ "id": 7 }), Some("cargo test"));
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text result");
+
+        assert_eq!(
+            text,
+            "Created pane id=7. Startup command unconfirmed (renga server may predate effective-command reporting; process start not yet confirmed; use inspect_pane to verify): cargo test"
+        );
+        assert!(!text.contains("No startup command requested."));
+    }
+
+    #[test]
+    fn spawn_pane_non_string_startup_command_is_unconfirmed() {
+        let response =
+            spawn_pane_ok_response(&json!(45), &json!({ "id": 7, "startup_command": 42 }), None);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text result");
+
+        assert!(text.contains("Startup command unconfirmed"), "{text}");
+        assert!(!text.contains("No startup command requested."));
     }
 
     #[test]
