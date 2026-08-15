@@ -588,12 +588,16 @@ because downstream is required to read the `[code]` token for branching.
 
 - **Unknown event `type` tags**: ignore, do not abort the stream.
 - **Unknown JSON keys** in config/layout/IPC payloads: ignored on read.
-- **Missing JSON keys** have two contract-defined meanings: keys documented
+- **Missing JSON keys** have three contract-defined meanings: keys documented
   as optional-when-unset (for example `PaneInfo.name` and `Response::Err.code`)
-  are unset when absent; additively introduced keys that an older peer may
+  are unset when absent; keys with a documented default (for example
+  `send.append_enter`, `inspect.include_cursor`, and `PaneInfo` geometry) take
+  that default when absent; additively introduced keys that an older peer may
   predate (for example `split.startup_command` and `peer_send.delivery`) are
   unknown / unverified when absent and must not be interpreted as `false`,
-  `null`, or confirmation that no action occurred.
+  `null`, or confirmation that no action occurred. If a key qualifies as both
+  optional-when-unset and additively introduced, use the conservative latter
+  interpretation and treat its absence as unknown.
 - **Unknown `[code]` tokens**: treat as the equivalent of `internal`.
 
 These rules let renga add fields and variants additively without bumping the
