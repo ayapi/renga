@@ -1406,10 +1406,10 @@ fn spawn_unconfirmed_message(
     requested_command: Option<&str>,
 ) -> String {
     let pane = created_pane_text(new_id);
+    let timing = startup_timing_hint(product);
     let product = product
         .map(|name| format!(" for {name}"))
         .unwrap_or_default();
-    let timing = startup_timing_hint(product.as_str());
     let status = format!(
         "Startup command unconfirmed{product} (renga server may predate effective-command reporting; process start not yet confirmed; allow startup time, then use inspect_pane to verify{timing})"
     );
@@ -1421,19 +1421,19 @@ fn spawn_unconfirmed_message(
 
 fn spawn_queued_message(new_id: Option<u64>, product: Option<&str>, command: &str) -> String {
     let pane = created_pane_text(new_id);
+    let timing = startup_timing_hint(product);
     let product = product
         .map(|name| format!(" for {name}"))
         .unwrap_or_default();
-    let timing = startup_timing_hint(product.as_str());
     format!(
         "{pane} Startup command queued{product} (process start not yet confirmed; allow startup time, then use inspect_pane to verify{timing}): {command}"
     )
 }
 
-fn startup_timing_hint(product_suffix: &str) -> &'static str {
-    match product_suffix {
-        " for Claude" => "; Claude may take 90–150 s",
-        " for Codex" => "; Codex may take 90–150 s",
+fn startup_timing_hint(product: Option<&str>) -> &'static str {
+    match product {
+        Some("Claude") => "; Claude may take 90–150 s",
+        Some("Codex") => "; Codex may take 90–150 s",
         _ => "",
     }
 }
@@ -3767,15 +3767,28 @@ Commands:
 
     #[test]
     fn specialized_spawn_responses_hedge_with_local_command_for_older_server() {
-        for response in [
-            spawn_claude_pane_ok_response(&json!(46), &json!({ "id": 9 }), "claude --model opus"),
-            spawn_codex_pane_ok_response(&json!(47), &json!({ "id": 10 }), "codex --yolo"),
+        for (response, expected) in [
+            (
+                spawn_claude_pane_ok_response(
+                    &json!(46),
+                    &json!({ "id": 9 }),
+                    "claude --model opus",
+                ),
+                "Created pane id=9. Startup command unconfirmed for Claude (renga server may predate effective-command reporting; process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): claude --model opus",
+            ),
+            (
+                spawn_codex_pane_ok_response(
+                    &json!(47),
+                    &json!({ "id": 10 }),
+                    "codex --yolo",
+                ),
+                "Created pane id=10. Startup command unconfirmed for Codex (renga server may predate effective-command reporting; process start not yet confirmed; allow startup time, then use inspect_pane to verify; Codex may take 90–150 s): codex --yolo",
+            ),
         ] {
             let text = response["result"]["content"][0]["text"]
                 .as_str()
                 .expect("text result");
-            assert!(text.contains("Startup command unconfirmed"), "{text}");
-            assert!(!text.contains("No startup command requested."));
+            assert_eq!(text, expected);
         }
     }
 
