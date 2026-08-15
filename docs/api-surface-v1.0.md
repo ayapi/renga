@@ -451,8 +451,12 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | `err` | `message: string`, `code?: string` | Failure. `code` is `Option<String>` with `skip_serializing_if = "Option::is_none"`. |
 
 Request-specific `ok.data` shapes include
+`split: { "id": usize, "startup_command"?: string | null }` and
 `peer_send: { "delivery": "delivered" | "queued" }`; lifecycle setters such
-as `peer_register_client` and `peer_set_ready` return `null`.
+as `peer_register_client` and `peer_set_ready` return `null`. For `split`, a
+string is the effective command queued by the server, explicit `null` confirms
+that no startup command was requested, and a missing key means the server may
+predate effective-command reporting.
 
 `PaneInfo` payload (used by `list` data, `set_pane_identity` ok data, embedded
 in `peer_list` data):
@@ -584,6 +588,10 @@ because downstream is required to read the `[code]` token for branching.
 
 - **Unknown event `type` tags**: ignore, do not abort the stream.
 - **Unknown JSON keys** in config/layout/IPC payloads: ignored on read.
+- **Missing JSON keys** in version-skewed IPC payloads: treat the value as
+  unknown / unverified unless that field's contract specifies a default. Do
+  not interpret absence as `false`, `null`, or confirmation that no action
+  occurred.
 - **Unknown `[code]` tokens**: treat as the equivalent of `internal`.
 
 These rules let renga add fields and variants additively without bumping the
