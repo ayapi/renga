@@ -1369,7 +1369,7 @@ fn spawn_pane_unconfirmed_message(new_id: Option<u64>, requested_command: Option
         Some(n) => format!("Created pane id={n}."),
         None => "Created pane (id not reported).".to_string(),
     };
-    let status = "Startup command unconfirmed (renga server may predate effective-command reporting; process start not yet confirmed; use inspect_pane to verify)";
+    let status = "Startup command unconfirmed (renga server may predate effective-command reporting; process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s)";
     match requested_command {
         Some(command) => format!("{pane} {status}: {command}"),
         None => format!("{pane} {status}."),
@@ -1384,7 +1384,7 @@ pub(crate) fn spawn_pane_created_message(new_id: Option<u64>, command: Option<&s
     match command {
         Some(command) => {
             format!(
-                "{pane} Startup command queued (process start not yet confirmed; use inspect_pane to verify): {command}"
+                "{pane} Startup command queued (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): {command}"
             )
         }
         None => format!("{pane} No startup command requested."),
@@ -1776,10 +1776,10 @@ fn spawn_claude_pane_ok_response(id: &Value, data: &Value, command: &str) -> Val
 fn claude_spawn_queued_message(new_id: Option<u64>, command: &str) -> String {
     match new_id {
         Some(n) => format!(
-            "Created pane id={n}. Startup command queued for Claude (process start not yet confirmed; use inspect_pane to verify): {command}"
+            "Created pane id={n}. Startup command queued for Claude (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): {command}"
         ),
         None => format!(
-            "Created pane (id not reported). Startup command queued for Claude (process start not yet confirmed; use inspect_pane to verify): {command}"
+            "Created pane (id not reported). Startup command queued for Claude (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): {command}"
         ),
     }
 }
@@ -1791,10 +1791,10 @@ fn handle_spawn_codex_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
 fn codex_spawn_queued_message(new_id: Option<u64>, command: &str) -> String {
     match new_id {
         Some(n) => format!(
-            "Created pane id={n}. Startup command queued for Codex (process start not yet confirmed; use inspect_pane to verify): {command}"
+            "Created pane id={n}. Startup command queued for Codex (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): {command}"
         ),
         None => format!(
-            "Created pane (id not reported). Startup command queued for Codex (process start not yet confirmed; use inspect_pane to verify): {command}"
+            "Created pane (id not reported). Startup command queued for Codex (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): {command}"
         ),
     }
 }
@@ -3639,7 +3639,7 @@ Commands:
                 "result": {
                     "content": [{
                         "type": "text",
-                        "text": "Created pane id=7. Startup command queued (process start not yet confirmed; use inspect_pane to verify): cargo test"
+                        "text": "Created pane id=7. Startup command queued (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): cargo test"
                     }],
                     "isError": false
                 }
@@ -3680,7 +3680,7 @@ Commands:
 
         assert_eq!(
             text,
-            "Created pane id=7. Startup command unconfirmed (renga server may predate effective-command reporting; process start not yet confirmed; use inspect_pane to verify): cargo test"
+            "Created pane id=7. Startup command unconfirmed (renga server may predate effective-command reporting; process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): cargo test"
         );
         assert!(!text.contains("No startup command requested."));
     }
@@ -3710,7 +3710,7 @@ Commands:
                 "result": {
                     "content": [{
                         "type": "text",
-                        "text": "Created pane id=9. Startup command queued for Claude (process start not yet confirmed; use inspect_pane to verify): claude --model opus"
+                        "text": "Created pane id=9. Startup command queued for Claude (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): claude --model opus"
                     }],
                     "isError": false
                 }
@@ -3818,7 +3818,7 @@ Commands:
 
         assert_eq!(
             msg,
-            "Created pane id=8. Startup command queued for Codex (process start not yet confirmed; use inspect_pane to verify): codex --yolo"
+            "Created pane id=8. Startup command queued for Codex (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): codex --yolo"
         );
     }
 
