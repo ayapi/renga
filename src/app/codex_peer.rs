@@ -205,11 +205,13 @@ pub(crate) fn codex_prompt_allows_peer_nudge_on_screen(screen: &vt100::Screen) -
     }
     let (_, cols) = screen.size();
     let (cursor_row, cursor_col) = screen.cursor_position();
-    let (prompt_row, _) = codex_live_composer_position(screen)?;
+    let (prompt_row, prompt_col) = codex_live_composer_position(screen)?;
     if cursor_row > prompt_row && !cursor_is_on_codex_footer(screen, prompt_row, cursor_row, cols) {
         return Some(false);
     }
-    if cursor_row == prompt_row && cursor_col > 2 {
+    if cursor_row == prompt_row
+        && cursor_col > codex_composer_editable_start(screen, prompt_row, prompt_col)
+    {
         return Some(false);
     }
     Some(true)
@@ -241,19 +243,24 @@ fn cursor_is_on_codex_footer(
             .all(|row| !screen_row_has_visible_text(screen, row, cols))
 }
 
-pub(crate) fn codex_composer_has_draft_on_screen(screen: &vt100::Screen) -> Option<bool> {
-    let (_, cols) = screen.size();
-    let (cursor_row, cursor_col) = screen.cursor_position();
-    let (row, prompt_col) = codex_live_composer_position(screen)?;
+fn codex_composer_editable_start(screen: &vt100::Screen, row: u16, prompt_col: u16) -> u16 {
     let input_start = prompt_col.saturating_add(1);
-    let editable_start = if screen
+    if screen
         .cell(row, input_start)
         .is_some_and(|cell| cell.contents().trim().is_empty())
     {
         input_start.saturating_add(1)
     } else {
         input_start
-    };
+    }
+}
+
+pub(crate) fn codex_composer_has_draft_on_screen(screen: &vt100::Screen) -> Option<bool> {
+    let (_, cols) = screen.size();
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let (row, prompt_col) = codex_live_composer_position(screen)?;
+    let input_start = prompt_col.saturating_add(1);
+    let editable_start = codex_composer_editable_start(screen, row, prompt_col);
     if cursor_row > row && !cursor_is_on_codex_footer(screen, row, cursor_row, cols) {
         return Some(true);
     }

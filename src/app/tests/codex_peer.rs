@@ -1512,6 +1512,59 @@ fn non_gpt_footer_is_live_with_cursor_parked_on_footer() {
 }
 
 #[test]
+fn indented_empty_composer_accepts_nudge_without_waiting() {
+    let mut app = App::new(40, 160).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(codex_id);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[4;5H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Ho3 high - cwd\x1b[4;7H",
+    );
+    {
+        let pane = app.ws().panes.get(&codex_id).expect("pane");
+        let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            codex_composer_has_draft_on_screen(parser.screen()),
+            Some(false)
+        );
+        assert_eq!(
+            codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+            Some(true)
+        );
+    }
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "indented composer".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt(_))
+    ));
+    app.shutdown();
+}
+
+#[test]
 fn wrapped_legacy_enter_to_send_footer_is_recognized() {
     let mut parser = vt100::Parser::new(20, 12, 0);
     parser.process(b"\x1b[?25h\x1b[2J\x1b[1;1H\xE2\x80\xBA \x1b[3;5Henter to send\x1b[1;3H");
