@@ -1241,6 +1241,82 @@ fn transcript_prompt_separated_from_unknown_output_is_not_live() {
 }
 
 #[test]
+fn single_transcript_output_row_is_not_a_structural_footer() {
+    let mut bottom_parser = vt100::Parser::new(40, 120, 0);
+    bottom_parser.process(
+        b"\x1b[?25h\x1b[2J\x1b[38;1H\xE2\x80\xBA please refactor the parser\x1b[40;1H  reading src/app.rs\x1b[38;3H",
+    );
+    assert_eq!(
+        codex_prompt_allows_peer_nudge_on_screen(bottom_parser.screen()),
+        None,
+        "a transcript ending on the last screen row must still be rejected"
+    );
+
+    let mut app = App::new(40, 160).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(codex_id);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[4;1H\xE2\x80\xBA please refactor the parser\x1b[6;1H  reading src/app.rs\x1b[4;3H",
+    );
+    {
+        let pane = app.ws().panes.get(&codex_id).expect("pane");
+        let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(codex_composer_has_draft_on_screen(parser.screen()), None);
+        assert_eq!(normalized_codex_composer_text(parser.screen()), None);
+        assert_eq!(
+            codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+            None
+        );
+    }
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "do not inject into transcript".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::Draft { .. })
+    ));
+    assert!(
+        app.ws()
+            .panes
+            .get(&codex_id)
+            .expect("pane")
+            .test_input()
+            .is_empty(),
+        "transcript output must not receive PTY input"
+    );
+    app.shutdown();
+}
+
+#[test]
 fn persistently_unknown_screen_surfaces_notification_on_focus() {
     let mut app = App::new(40, 160).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
