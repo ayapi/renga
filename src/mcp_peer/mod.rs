@@ -3271,12 +3271,9 @@ mod tests {
         for name in ["spawn_pane", "spawn_claude_pane", "spawn_codex_pane"] {
             let description = description(name);
             let lower = description.to_ascii_lowercase();
-            assert!(
-                !lower.contains("launches claude")
-                    && !lower.contains("launches codex")
-                    && !lower.contains("launches plain"),
-                "{name} must not claim process startup: {description}"
-            );
+            assert!(!lower.contains("launches claude"), "{name}: {description}");
+            assert!(!lower.contains("launches codex"), "{name}: {description}");
+            assert!(!lower.contains("launches plain"), "{name}: {description}");
         }
 
         let role_description = spec
@@ -3294,6 +3291,13 @@ mod tests {
         for kind in [PeerClientKind::Claude, PeerClientKind::Codex] {
             let instructions = instructions_blob(kind);
             let lower = instructions.to_ascii_lowercase();
+            assert!(!lower.contains("launches claude"), "{instructions}");
+            assert!(!lower.contains("launches codex"), "{instructions}");
+            assert!(!lower.contains("launches plain"), "{instructions}");
+            assert!(
+                !lower.contains("runs a startup command"),
+                "instructions must describe command queueing: {instructions}"
+            );
             assert!(instructions.contains("queues a startup command"));
             assert!(instructions.contains("Process startup is asynchronous"));
             assert!(instructions.contains("process startup is not confirmed"));
@@ -3308,16 +3312,6 @@ mod tests {
             assert!(new_tab_instructions
                 .contains("role `claude` queues the peer-enabled Claude command"));
             assert!(new_tab_instructions.contains("an explicit `command` takes precedence"));
-            assert!(
-                !lower.contains("launches claude")
-                    && !lower.contains("launches codex")
-                    && !lower.contains("launches plain"),
-                "instructions must not claim process startup: {instructions}"
-            );
-            assert!(
-                !instructions.contains("runs a startup command"),
-                "instructions must describe command queueing: {instructions}"
-            );
         }
     }
 
