@@ -1697,7 +1697,7 @@ mod tests {
     }
 
     #[test]
-    fn real_pane_latches_shell_prompt() {
+    fn real_pane_reaches_usable_shell_prompt() {
         let _guard = REAL_PANE_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1706,10 +1706,19 @@ mod tests {
 
         assert!(
             wait_for(
-                || pane.prompt_seen.load(Ordering::Acquire),
+                || {
+                    let prompt_seen = pane.prompt_seen.load(Ordering::Acquire);
+                    let screen_contents = pane
+                        .parser
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .screen()
+                        .contents();
+                    startup_prompt_ready(prompt_seen, &screen_contents)
+                },
                 Duration::from_secs(30)
             ),
-            "real PTY reader should latch the shell prompt"
+            "real shell should reach a prompt usable by startup-command flushing"
         );
         pane.kill();
     }
