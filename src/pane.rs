@@ -1881,6 +1881,110 @@ mod tests {
     }
 
     #[test]
+    fn real_pane_honors_explicit_cwd() {
+        let _guard = REAL_PANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::temp_dir().join(format!("renga-real-pane-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(&cwd).expect("create real pane cwd");
+        let expected = std::fs::canonicalize(&cwd).expect("canonicalize real pane cwd");
+        let shell_name = detect_shell()
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut pane = Pane::new_real_with_cwd(9915, 24, 80, tx, Some(cwd.clone()))
+            .expect("spawn real pane with cwd");
+        pane.queue_startup_command("");
+        assert!(
+            wait_for(
+                || pane.try_flush_startup().unwrap_or(false),
+                Duration::from_secs(30)
+            ),
+            "real shell in the explicit cwd should reach its first prompt"
+        );
+
+        if shell_name.contains("bash") || shell_name.contains("zsh") {
+            let mut observed_cwds = Vec::new();
+            let cwd_name = cwd.file_name().expect("cwd has a final component");
+            assert!(
+                wait_for(
+                    || {
+                        rx.try_iter().any(|event| match event {
+                            AppEvent::CwdChanged(9915, path) => {
+                                // Git Bash reports Windows' temp directory
+                                // through its MSYS alias (`/tmp/...`), which
+                                // cannot be canonicalized by Win32. The unique
+                                // final component identifies the same launch
+                                // directory; the relative marker below proves
+                                // the shell is actually running inside it.
+                                let matches = path.file_name() == Some(cwd_name);
+                                observed_cwds.push(path);
+                                matches
+                            }
+                            _ => false,
+                        })
+                    },
+                    Duration::from_secs(30)
+                ),
+                "first OSC 7 cwd should match the directory passed to the real PTY; observed {observed_cwds:?}"
+            );
+            let relative_marker = cwd.join("cwd-probe.txt");
+            pane.queue_startup_command("printf renga-cwd-probe > cwd-probe.txt");
+            assert!(
+                wait_for(
+                    || pane.try_flush_startup().unwrap_or(false),
+                    Duration::from_secs(30)
+                ),
+                "relative cwd probe should flush to the real shell"
+            );
+            assert!(
+                wait_for(|| relative_marker.exists(), Duration::from_secs(30)),
+                "relative output should be created inside the explicit PTY cwd"
+            );
+            let _ = std::fs::remove_file(relative_marker);
+        } else {
+            let marker = std::env::temp_dir().join(format!(
+                "renga-real-pane-cwd-result-{}.txt",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&marker);
+            let marker_fwd = marker.display().to_string().replace('\\', "/");
+            let command = if shell_name.contains("powershell") || shell_name == "pwsh.exe" {
+                format!("Set-Content -NoNewline -LiteralPath '{marker_fwd}' -Value $PWD.Path")
+            } else {
+                format!("pwd > '{marker_fwd}'")
+            };
+            pane.queue_startup_command(&command);
+            assert!(
+                wait_for(
+                    || pane.try_flush_startup().unwrap_or(false),
+                    Duration::from_secs(30)
+                ),
+                "cwd probe command should flush to the real shell"
+            );
+            assert!(
+                wait_for(
+                    || {
+                        std::fs::read_to_string(&marker).is_ok_and(|reported| {
+                            std::fs::canonicalize(reported.trim())
+                                .is_ok_and(|resolved| resolved == expected)
+                        })
+                    },
+                    Duration::from_secs(30)
+                ),
+                "real shell should start in the directory passed to the PTY"
+            );
+            let _ = std::fs::remove_file(marker);
+        }
+
+        pane.kill();
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[test]
     fn drain_osc52_copies_decodes_bel_terminated_payload() {
         let mut buf = b"\x1b]52;c;aGVsbG8=\x07".to_vec();
         assert_eq!(drain_osc52_copies(&mut buf), vec!["hello"]);
