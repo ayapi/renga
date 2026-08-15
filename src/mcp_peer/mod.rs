@@ -1318,6 +1318,7 @@ fn handle_spawn_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     let name = opt_string(args, "name");
     let role = opt_string(args, "role");
     let cwd = opt_string(args, "cwd");
+    let no_startup_command_possible = command.is_none() && role.is_none();
 
     let (caller_pane, endpoint) = match require_connected(ctx, id, "spawn pane") {
         Ok(t) => t,
@@ -1343,7 +1344,9 @@ fn handle_spawn_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
             cwd,
         },
     ) {
-        Ok(Response::Ok { data }) => spawn_pane_ok_response(id, &data, command.as_deref()),
+        Ok(Response::Ok { data }) => {
+            spawn_pane_ok_response(id, &data, command.as_deref(), no_startup_command_possible)
+        }
         Ok(Response::Err { message, code }) => err_response(
             id,
             -32603,
@@ -1354,9 +1357,23 @@ fn handle_spawn_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     }
 }
 
-fn spawn_pane_ok_response(id: &Value, data: &Value, requested_command: Option<&str>) -> Value {
+fn spawn_pane_ok_response(
+    id: &Value,
+    data: &Value,
+    requested_command: Option<&str>,
+    no_startup_command_possible: bool,
+) -> Value {
     let new_id = data.get("id").and_then(|v| v.as_u64());
-    let msg = spawn_startup_message(new_id, None, data, requested_command);
+    let msg = if no_startup_command_possible
+        && !matches!(data.get("startup_command"), Some(Value::String(_)))
+    {
+        format!(
+            "{} No startup command requested.",
+            created_pane_text(new_id)
+        )
+    } else {
+        spawn_startup_message(new_id, None, data, requested_command)
+    };
     ok_response(id, tool_text_result(&msg))
 }
 
@@ -3650,6 +3667,7 @@ Commands:
             &json!(41),
             &json!({ "id": 7, "startup_command": "cargo test" }),
             Some("ignored fallback"),
+            false,
         );
 
         assert_eq!(
@@ -3674,6 +3692,7 @@ Commands:
             &json!(42),
             &json!({ "id": 7, "startup_command": null }),
             None,
+            false,
         );
 
         assert_eq!(
@@ -3694,7 +3713,8 @@ Commands:
 
     #[test]
     fn spawn_pane_missing_startup_command_is_unconfirmed_for_older_server() {
-        let response = spawn_pane_ok_response(&json!(44), &json!({ "id": 7 }), Some("cargo test"));
+        let response =
+            spawn_pane_ok_response(&json!(44), &json!({ "id": 7 }), Some("cargo test"), false);
         let text = response["result"]["content"][0]["text"]
             .as_str()
             .expect("text result");
@@ -3708,14 +3728,28 @@ Commands:
 
     #[test]
     fn spawn_pane_non_string_startup_command_is_unconfirmed() {
-        let response =
-            spawn_pane_ok_response(&json!(45), &json!({ "id": 7, "startup_command": 42 }), None);
+        let response = spawn_pane_ok_response(
+            &json!(45),
+            &json!({ "id": 7, "startup_command": 42 }),
+            None,
+            false,
+        );
         let text = response["result"]["content"][0]["text"]
             .as_str()
             .expect("text result");
 
         assert!(text.contains("Startup command unconfirmed"), "{text}");
         assert!(!text.contains("No startup command requested."));
+    }
+
+    #[test]
+    fn spawn_pane_without_command_or_role_needs_no_old_server_hedge() {
+        let response = spawn_pane_ok_response(&json!(46), &json!({ "id": 7 }), None, true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text result");
+
+        assert_eq!(text, "Created pane id=7. No startup command requested.");
     }
 
     #[test]
