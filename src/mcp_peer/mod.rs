@@ -1986,6 +1986,13 @@ fn handle_focus_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
 }
 
 fn handle_new_tab(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
+    handle_new_tab_with_request(id, args, ctx, client::send_request)
+}
+
+fn handle_new_tab_with_request<F>(id: &Value, args: &Value, ctx: &PeerCtx, send_request: F) -> Value
+where
+    F: FnOnce(&EndpointName, &Request) -> Result<Response>,
+{
     let command = opt_string(args, "command").map(|c| upgrade_claude_command(&c));
     let name = opt_string(args, "name");
     let label = opt_string(args, "label");
@@ -2000,29 +2007,17 @@ fn handle_new_tab(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
         Ok(v) => v,
         Err(msg) => return err_response(id, -32602, &msg),
     };
-    match client::send_request(
+    match send_request(
         endpoint,
         &Request::NewTab {
-            command,
+            command: command.clone(),
             id: name,
             label,
             role,
             cwd,
         },
     ) {
-        Ok(Response::Ok { data }) => {
-            // The IPC contract for `Request::NewTab` replies with the
-            // id of the single pane that was created inside the new
-            // tab — that pane is also the focused one after the
-            // switch, so surfacing it as "new pane id" is both
-            // accurate and what a caller needs to address it later.
-            let new_id = data.get("id").and_then(|v| v.as_u64());
-            let msg = match new_id {
-                Some(n) => format!("Opened new tab; new pane id={n} (now focused)."),
-                None => "Opened new tab.".to_string(),
-            };
-            ok_response(id, tool_text_result(&msg))
-        }
+        Ok(Response::Ok { data }) => new_tab_ok_response(id, &data, command.as_deref()),
         Ok(Response::Err { message, code }) => err_response(
             id,
             -32603,
@@ -2031,6 +2026,28 @@ fn handle_new_tab(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
         Ok(other) => err_response(id, -32603, &format!("unexpected renga response: {other:?}")),
         Err(e) => err_response(id, -32603, &format!("renga call failed: {e}")),
     }
+}
+
+fn new_tab_ok_response(id: &Value, data: &Value, requested_command: Option<&str>) -> Value {
+    let new_id = data.get("id").and_then(|v| v.as_u64());
+    let tab = match new_id {
+        Some(n) => format!("Opened new tab; new pane id={n} (now focused)."),
+        None => "Opened new tab.".to_string(),
+    };
+    let msg = match data.get("startup_command") {
+        Some(Value::String(command)) => format!(
+            "{tab} Startup command queued (process start not yet confirmed; allow startup time, then use inspect_pane to verify): {command}"
+        ),
+        Some(Value::Null) => format!("{tab} No startup command requested."),
+        None | Some(_) => {
+            let status = "Startup command unconfirmed (renga server may predate effective-command reporting; process start not yet confirmed; allow startup time, then use inspect_pane to verify)";
+            match requested_command {
+                Some(command) => format!("{tab} {status}: {command}"),
+                None => format!("{tab} {status}."),
+            }
+        }
+    };
+    ok_response(id, tool_text_result(&msg))
 }
 
 // ── set_pane_identity (rename / re-assign role) ──────────────
@@ -3764,6 +3781,105 @@ Commands:
                 }
             })
         );
+    }
+
+    #[test]
+    fn new_tab_handler_reports_server_confirmed_startup_command() {
+        let ctx = connected_ctx_with(new_event_sink());
+        let response = handle_new_tab_with_request(
+            &json!(51),
+            &json!({ "command": "cargo test" }),
+            &ctx,
+            |_, request| {
+                assert!(matches!(
+                    request,
+                    Request::NewTab {
+                        command: Some(command),
+                        ..
+                    } if command == "cargo test"
+                ));
+                Ok(Response::Ok {
+                    data: json!({ "id": 12, "startup_command": "cargo test --locked" }),
+                })
+            },
+        );
+
+        assert_eq!(
+            response,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 51,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": "Opened new tab; new pane id=12 (now focused). Startup command queued (process start not yet confirmed; allow startup time, then use inspect_pane to verify): cargo test --locked"
+                    }],
+                    "isError": false
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn new_tab_handler_reports_explicit_null_as_no_command() {
+        let ctx = connected_ctx_with(new_event_sink());
+        let response = handle_new_tab_with_request(&json!(52), &json!({}), &ctx, |_, _| {
+            Ok(Response::Ok {
+                data: json!({ "id": 13, "startup_command": null }),
+            })
+        });
+
+        assert_eq!(
+            response,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 52,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": "Opened new tab; new pane id=13 (now focused). No startup command requested."
+                    }],
+                    "isError": false
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn new_tab_handler_hedges_missing_or_non_string_startup_command() {
+        let ctx = connected_ctx_with(new_event_sink());
+        for (id, data) in [
+            (53, json!({ "id": 14 })),
+            (
+                54,
+                json!({
+                    "id": 14,
+                    "startup_command": 42
+                }),
+            ),
+        ] {
+            let response = handle_new_tab_with_request(
+                &json!(id),
+                &json!({ "command": "cargo test" }),
+                &ctx,
+                |_, _| Ok(Response::Ok { data }),
+            );
+
+            assert_eq!(
+                response,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [{
+                            "type": "text",
+                            "text": "Opened new tab; new pane id=14 (now focused). Startup command unconfirmed (renga server may predate effective-command reporting; process start not yet confirmed; allow startup time, then use inspect_pane to verify): cargo test"
+                        }],
+                        "isError": false
+                    }
+                })
+            );
+        }
     }
 
     #[test]

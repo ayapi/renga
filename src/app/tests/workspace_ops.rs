@@ -766,15 +766,17 @@ fn handle_new_tab_emits_pane_started_with_attached_name_and_role() {
     let mut app = App::new(40, 80).expect("App::new");
     let (_sub_id, rx) = app.event_bus.subscribe();
 
-    let id = app
+    let outcome = app
         .handle_new_tab(
-            None,
+            Some("cargo test".into()),
             Some("tab-pane".into()),
             Some("tab label".into()),
             Some("tab-role".into()),
             None,
         )
         .expect("new tab succeeds");
+    assert_eq!(outcome.startup_command.as_deref(), Some("cargo test"));
+    let id = outcome.id;
 
     let mut observed: Option<(Option<String>, Option<String>)> = None;
     while let Ok(ev) = rx.try_recv() {

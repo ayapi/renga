@@ -473,7 +473,7 @@ impl App {
         label: Option<String>,
         role: Option<String>,
         cwd: Option<String>,
-    ) -> std::result::Result<usize, ipc::CodedError> {
+    ) -> std::result::Result<SplitOutcome, ipc::CodedError> {
         let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let cwd_override = resolve_optional_cwd(cwd.as_deref(), &base)?;
         let new_pane_id = self
@@ -481,8 +481,8 @@ impl App {
             .map_err(|e| ipc::CodedError::new(ipc::err_code::IO_ERROR, e.to_string()))?;
         let effective_command = command.or_else(|| default_command_for_role(role.as_deref()));
         if let Some(pane) = self.ws_mut().panes.get_mut(&new_pane_id) {
-            if let Some(cmd) = effective_command {
-                pane.queue_startup_command(&cmd);
+            if let Some(cmd) = effective_command.as_deref() {
+                pane.queue_startup_command(cmd);
             }
             if let Some(r) = role {
                 pane.role = Some(r);
@@ -500,7 +500,10 @@ impl App {
         }
         self.dirty = true;
         self.emit_pane_started(new_pane_id);
-        Ok(new_pane_id)
+        Ok(SplitOutcome {
+            id: new_pane_id,
+            startup_command: effective_command,
+        })
     }
 
     pub(crate) fn handle_send(

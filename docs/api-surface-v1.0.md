@@ -461,11 +461,12 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 
 Request-specific `ok.data` shapes include
 `split: { "id": usize, "startup_command"?: string | null }` and
+`new_tab: { "id": usize, "startup_command"?: string | null }` and
 `peer_send: { "delivery": "delivered" | "queued" }`; lifecycle setters such
-as `peer_register_client` and `peer_set_ready` return `null`. For `split`, a
-string is the effective command queued by the server, explicit `null` confirms
-that no startup command was requested, and a missing key means the server may
-predate effective-command reporting.
+as `peer_register_client` and `peer_set_ready` return `null`. For `split` and
+`new_tab`, a string is the effective command queued by the server, explicit
+`null` confirms that no startup command was requested, and a missing key means
+the server may predate effective-command reporting.
 
 `PaneInfo` payload (used by `list` data, `set_pane_identity` ok data, embedded
 in `peer_list` data):

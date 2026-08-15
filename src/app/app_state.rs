@@ -44,14 +44,14 @@ pub enum AppCommand {
     },
     /// Open a new tab with a fresh single pane. Focus switches to the
     /// new tab (mirrors the Alt+T keybinding). Returns the new pane's
-    /// id on success.
+    /// id and effective startup command on success.
     NewTab {
         command: Option<String>,
         name: Option<String>,
         label: Option<String>,
         role: Option<String>,
         cwd: Option<String>,
-        reply: oneshot::Sender<std::result::Result<usize, ipc::CodedError>>,
+        reply: oneshot::Sender<std::result::Result<SplitOutcome, ipc::CodedError>>,
     },
     /// Snapshot the visible screen of the target pane. See
     /// [`ipc::Request::Inspect`] for the response shape.

@@ -569,7 +569,8 @@ fn handle_peer_send_silently_drops_cross_tab_target() {
     // Open a fresh tab; its pane id is distinct from sender's.
     let other_tab_pane = app
         .handle_new_tab(None, None, None, None, None)
-        .expect("new tab succeeds");
+        .expect("new tab succeeds")
+        .id;
     assert_ne!(
         other_tab_pane, sender_id,
         "new_tab must allocate a fresh pane id"
