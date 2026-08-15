@@ -476,60 +476,65 @@ send_message calls may need approval before peer messaging becomes reliable.\n\n
     };
     format!(
         "You are connected to the renga-peers network. Other peer-enabled agent instances \
-running in the same renga tab can see you and send you messages.\n\n\
-{receive_guidance}\
-Peer messaging tools:\n\
-- list_peers: Discover other peer-enabled agent instances in the same renga tab.\n\
-- send_message: Send a message to another instance by peer ID or name.\n\
-- set_summary: Set a 1-2 sentence summary of what you're working on; surfaced on list_panes / list_peers for other peers.\n\
-- check_messages: Drain any queued peer messages still waiting for this client.\n\n\
-Pane control tools (all scoped to the current renga tab, except new_tab which is the one \
-cross-tab tool):\n\
-- list_panes: Inspect all panes in the current tab, including geometry and the focus flag.\n\
-- spawn_pane: Split an existing pane to create a new one. Optionally runs a startup command, \
-assigns a stable name, attaches a role label, or sets an explicit working directory via \
-`cwd` (absolute, or relative to the caller pane's cwd). Use `cwd` instead of `cd <dir> && ...` \
-inside `command` so the claude auto-upgrade keeps working.\n\
-- spawn_claude_pane: Higher-level convenience when the target process is Claude Code. Takes \
-structured `permission_mode` / `model` / `args[]` fields instead of a free-form command \
-string, and always enables the peer channel. Prefer this over `spawn_pane(command=\"claude ...\")` \
-for orchestrator flows — keeps Claude launch policy in renga instead of in every prompt.\n\
-- spawn_codex_pane: Higher-level convenience when the target process is Codex. Takes \
-structured `args[]` instead of a free-form command string and launches plain `codex`. Prefer \
-this over `spawn_pane(command=\"codex ...\")` so orchestrator prompts do not have to synthesize \
-shell-quoted Codex commands.\n\
-- close_pane: Close a pane by id or name. Refuses when it's the last pane of the last tab.\n\
-- focus_pane: Move keyboard focus to another pane in the same tab.\n\
-- new_tab: Open a brand-new tab with a fresh pane and switch focus to it. Unlike the other \
-pane-control tools, this reaches outside the current tab. Accepts the same `cwd` option \
-as spawn_pane for setting the new pane's working directory.\n\
-- inspect_pane: Snapshot the visible screen of a pane so you can detect interactive \
-prompts, banners, or mode indicators in another pane without asking it. Returns plain \
-text by default; pass format=\"grid\" for row-addressable JSON or lines=N to trim to \
-the last N rows.\n\
-- send_keys: Send raw key input (y/n, Shift+Tab, Esc, arrow keys, Ctrl+letters, etc.) to a \
-pane's PTY. Use this to answer interactive prompts or drive a TUI when the target isn't a \
-peer-enabled agent that can read send_message. DISTINCT from send_message, which delivers \
-logical peer messages rather than PTY bytes.\n\n\
-Event monitoring:\n\
-- poll_events: Long-poll for pane lifecycle events (pane_started, pane_exited, \
-events_dropped). First call (no `since`) starts at \"right now\" — no historical replay. \
-Each response includes a `next_since` cursor to pass back on the next call. Optional \
-`types` filter narrows returned events without losing the cursor advance, but it does \
-not extend the long-poll: a non-matching event still returns early with events=[] \
-and an advanced cursor, so the caller should re-poll for the next window.\n\n\
-Launching Claude Code: prefer spawn_claude_pane for Claude launches — it takes structured \
-`permission_mode` / `model` / `args[]` fields, always enables the peer channel, and keeps \
-launch policy in renga so orchestrator prompts never have to synthesize shell-quoted command \
-strings. For arbitrary shell commands (non-Claude), use spawn_pane / new_tab. When those \
-are asked to run a bare `claude` invocation the MCP still auto-upgrades it to the \
-peer-enabled form (`claude --dangerously-load-development-channels server:renga-peers \
---permission-mode bypassPermissions`), but \
-spawn_claude_pane is the recommended API for agent harnesses. For Codex launches, prefer \
-spawn_codex_pane once `renga mcp install --client codex` has been run for that user.\n\n\
-IMPORTANT about pane control: these tools affect the user's live layout. Use them with \
-restraint — don't close or focus panes you don't own unless the user asked you to. When in \
-doubt, ask first."
+    running in the same renga tab can see you and send you messages.\n\n\
+    {receive_guidance}\
+    Peer messaging tools:\n\
+    - list_peers: Discover other peer-enabled agent instances in the same renga tab.\n\
+    - send_message: Send a message to another instance by peer ID or name.\n\
+    - set_summary: Set a 1-2 sentence summary of what you're working on; surfaced on list_panes / list_peers for other peers.\n\
+    - check_messages: Drain any queued peer messages still waiting for this client.\n\n\
+    Pane control tools (all scoped to the current renga tab, except new_tab which is the one \
+    cross-tab tool):\n\
+    - list_panes: Inspect all panes in the current tab, including geometry and the focus flag.\n\
+    - spawn_pane: Split an existing pane to create a new one. Optionally queues a startup command \
+    for asynchronous execution; process startup is not confirmed when the tool returns. With no \
+    explicit `command`, `role="claude"` queues the peer-enabled Claude command. The tool can also \
+    assign a stable name or set an explicit working directory via \
+    `cwd` (absolute, or relative to the caller pane's cwd). Use `cwd` instead of `cd <dir> && ...` \
+    inside `command` so the claude auto-upgrade keeps working.\n\
+    - spawn_claude_pane: Higher-level convenience when the target process is Claude Code. Takes \
+    structured `permission_mode` / `model` / `args[]` fields instead of a free-form command \
+    string and queues the peer-enabled Claude startup command. Process startup is asynchronous and \
+    not confirmed when the tool returns; allow startup time, then use inspect_pane to verify. Prefer \
+    this over `spawn_pane(command=\"claude ...\")` \
+    for orchestrator flows — keeps Claude launch policy in renga instead of in every prompt.\n\
+    - spawn_codex_pane: Higher-level convenience when the target process is Codex. Takes \
+    structured `args[]` instead of a free-form command string and queues a plain `codex` startup \
+    command. Process startup is asynchronous and not confirmed when the tool returns; allow startup \
+    time, then use inspect_pane to verify. Prefer this over `spawn_pane(command=\"codex ...\")` so \
+    orchestrator prompts do not have to synthesize shell-quoted Codex commands.\n\
+    - close_pane: Close a pane by id or name. Refuses when it's the last pane of the last tab.\n\
+    - focus_pane: Move keyboard focus to another pane in the same tab.\n\
+    - new_tab: Open a brand-new tab with a fresh pane and switch focus to it. Unlike the other \
+    pane-control tools, this reaches outside the current tab. Accepts the same `cwd` option \
+    as spawn_pane for setting the new pane's working directory.\n\
+    - inspect_pane: Snapshot the visible screen of a pane so you can detect interactive \
+    prompts, banners, or mode indicators in another pane without asking it. Returns plain \
+    text by default; pass format=\"grid\" for row-addressable JSON or lines=N to trim to \
+    the last N rows.\n\
+    - send_keys: Send raw key input (y/n, Shift+Tab, Esc, arrow keys, Ctrl+letters, etc.) to a \
+    pane's PTY. Use this to answer interactive prompts or drive a TUI when the target isn't a \
+    peer-enabled agent that can read send_message. DISTINCT from send_message, which delivers \
+    logical peer messages rather than PTY bytes.\n\n\
+    Event monitoring:\n\
+    - poll_events: Long-poll for pane lifecycle events (pane_started, pane_exited, \
+    events_dropped). First call (no `since`) starts at \"right now\" — no historical replay. \
+    Each response includes a `next_since` cursor to pass back on the next call. Optional \
+    `types` filter narrows returned events without losing the cursor advance, but it does \
+    not extend the long-poll: a non-matching event still returns early with events=[] \
+    and an advanced cursor, so the caller should re-poll for the next window.\n\n\
+    Queuing Claude Code startup: prefer spawn_claude_pane — it takes structured \
+    `permission_mode` / `model` / `args[]` fields, always enables the peer channel, and keeps \
+    launch policy in renga so orchestrator prompts never have to synthesize shell-quoted command \
+    strings. For arbitrary shell commands (non-Claude), use spawn_pane / new_tab. When those \
+    are asked to run a bare `claude` invocation the MCP still auto-upgrades it to the \
+    peer-enabled form (`claude --dangerously-load-development-channels server:renga-peers \
+    --permission-mode bypassPermissions`), but \
+    spawn_claude_pane is the recommended API for agent harnesses. For Codex launches, prefer \
+    spawn_codex_pane once `renga mcp install --client codex` has been run for that user.\n\n\
+    IMPORTANT about pane control: these tools affect the user's live layout. Use them with \
+    restraint — don't close or focus panes you don't own unless the user asked you to. When in \
+    doubt, ask first."
     )
 }
 
@@ -605,7 +610,7 @@ fn tools_spec() -> Value {
                     },
                     "role": {
                         "type": "string",
-                        "description": "Optional free-form role label (e.g. 'worker', 'leader'). Shown in the UI and in list_panes output."
+                        "description": "Optional free-form role label (e.g. 'worker', 'leader'). Shown in the UI and in list_panes output. When `command` is omitted and `role` is exactly `claude`, renga queues the peer-enabled Claude startup command for automatic execution; an explicit `command` takes precedence."
                     },
                     "cwd": {
                         "type": "string",
