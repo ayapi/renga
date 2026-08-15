@@ -24,11 +24,11 @@ fn seed_codex_draft(app: &mut App, pane_id: usize) {
     );
 }
 
-fn seed_codex_ready_placeholder(app: &mut App, pane_id: usize) {
+fn seed_codex_live_ready_placeholder(app: &mut App, pane_id: usize) {
     seed_pane_screen(
         app,
         pane_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\r\n\r\nenter to send\x1b[1;3H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\r\n\r\n  gpt-5.6-sol medium \xC2\xB7 cwd\x1b[1;3H",
     );
 }
 
@@ -42,7 +42,7 @@ fn seed_codex_busy_placeholder(app: &mut App, pane_id: usize) {
 
 fn seed_codex_busy_composer(app: &mut App, pane_id: usize, text: &str) {
     let screen = format!(
-        "\x1b[?25h\x1b[2J\x1b[3;1H\u{25e6} Working (1m 03s \u{2022} esc to interrupt)\x1b[5;1H\u{203a} {text}\x1b[10;1H  tab to queue message  51% context left\x1b[7;20H"
+        "\x1b[?25h\x1b[2J\x1b[3;1H\u{25e6} Working (1m 03s \u{2022} esc to interrupt)\x1b[6;1H\u{203a} {text}\x1b[10;1H  tab to queue message  51% context left\x1b[8;20H"
     );
     seed_pane_screen(app, pane_id, screen.as_bytes());
 }
@@ -861,11 +861,7 @@ fn handle_peer_send_defers_codex_nudge_while_target_is_focused() {
         Some(1),
         "unfocused Codex target should regain a queued nudge"
     );
-    {
-        let pane = app.ws_mut().panes.get_mut(&sibling_id).expect("pane");
-        let mut parser = pane.parser.lock().unwrap();
-        parser.process(b"\x1b[?25h\x1b[2J\x1b[Hready for input\r\n\r\nenter to send");
-    }
+    seed_codex_live_ready_placeholder(&mut app, sibling_id);
     app.flush_pending_codex_peer_messages();
     assert_eq!(
         app.pending_codex_peer_messages
@@ -1049,11 +1045,7 @@ fn flush_pending_codex_peer_messages_requires_ready_screen() {
         "busy Codex pane should keep the message queued"
     );
 
-    {
-        let pane = app.ws_mut().panes.get_mut(&sibling_id).expect("pane");
-        let mut parser = pane.parser.lock().unwrap();
-        parser.process(b"\x1b[?25h\x1b[2J\x1b[Hready for input\r\n\r\nenter to send");
-    }
+    seed_codex_live_ready_placeholder(&mut app, sibling_id);
     app.flush_pending_codex_peer_messages();
     assert_eq!(
         app.pending_codex_peer_messages
@@ -1760,7 +1752,7 @@ fn focused_codex_without_draft_auto_submits_when_ready() {
     app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sibling_id))
         .expect("focus sibling");
-    seed_codex_ready_placeholder(&mut app, sibling_id);
+    seed_codex_live_ready_placeholder(&mut app, sibling_id);
 
     app.handle_peer_send(
         sender_id,
@@ -2223,7 +2215,7 @@ fn unfocused_idle_codex_without_draft_advances_to_submit_stage() {
     app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sender_id))
         .expect("refocus sender");
-    seed_codex_ready_placeholder(&mut app, sibling_id);
+    seed_codex_live_ready_placeholder(&mut app, sibling_id);
 
     app.handle_peer_send(
         sender_id,
@@ -2248,7 +2240,7 @@ fn idle_transcript_queue_hint_does_not_select_native_queue() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[HI explained that Tab to queue message is how Codex queues\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Henter to send\x1b[4;3H",
+        b"\x1b[?25h\x1b[2J\x1b[HI explained that Tab to queue message is how Codex queues\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1H  gpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
     );
 
     app.handle_peer_send(
@@ -2282,7 +2274,7 @@ fn native_queue_commit_does_not_send_changed_user_draft() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA what happens if I\x1b[3;1Henter to send\x1b[1;20H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA what happens if I\x1b[3;1H  gpt-5.6-sol medium \xC2\xB7 cwd\x1b[1;20H",
     );
     app.ws_mut()
         .panes
@@ -2585,7 +2577,7 @@ fn await_focus_nudge_resumes_when_unfocused_pane_becomes_idle() {
             0,
         )]),
     );
-    seed_codex_ready_placeholder(&mut app, codex_id);
+    seed_codex_live_ready_placeholder(&mut app, codex_id);
     app.ws_mut()
         .panes
         .get_mut(&codex_id)
@@ -2641,7 +2633,7 @@ fn await_focus_resume_preserves_retry_budget() {
             CODEX_PEER_NUDGE_MAX_RETRIES,
         )]),
     );
-    seed_codex_ready_placeholder(&mut app, codex_id);
+    seed_codex_live_ready_placeholder(&mut app, codex_id);
 
     app.flush_pending_codex_peer_messages();
 
@@ -2968,7 +2960,7 @@ fn focused_codex_pending_queue_auto_submits_after_draft_clears_to_unknown_placeh
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Write tests for @filename\r\n\r\nenter to send\x1b[1;3H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Write tests for @filename\r\n\r\n  gpt-5.6-sol medium \xC2\xB7 cwd\x1b[1;3H",
     );
     app.flush_pending_codex_peer_messages();
 
@@ -3024,7 +3016,7 @@ fn focused_codex_pending_overlay_requeues_when_typing_then_auto_submits_after_dr
         Some(PendingCodexPeerDelivery::Draft { .. })
     ));
 
-    seed_codex_ready_placeholder(&mut app, codex_id);
+    seed_codex_live_ready_placeholder(&mut app, codex_id);
     app.flush_pending_codex_peer_messages();
     assert!(matches!(
         app.pending_codex_peer_messages
@@ -3078,7 +3070,7 @@ fn focus_transition_routes_pending_codex_by_draft_state() {
     app.peer_delivery_ready.insert(ready_id);
     app.handle_focus(&ipc::PaneRef::Id(sender_id))
         .expect("refocus sender");
-    seed_codex_ready_placeholder(&mut app, ready_id);
+    seed_codex_live_ready_placeholder(&mut app, ready_id);
     app.handle_peer_send(sender_id, &ipc::PaneRef::Id(ready_id), "ready".to_string())
         .expect("peer send");
 
