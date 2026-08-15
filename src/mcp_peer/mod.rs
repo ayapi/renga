@@ -1368,7 +1368,9 @@ pub(crate) fn spawn_pane_created_message(new_id: Option<u64>, command: Option<&s
     };
     match command {
         Some(command) => {
-            format!("{pane} Startup command queued (process start not yet confirmed): {command}")
+            format!(
+                "{pane} Startup command queued (process start not yet confirmed; use inspect_pane to verify): {command}"
+            )
         }
         None => format!("{pane} No startup command requested."),
     }
@@ -1759,10 +1761,10 @@ fn spawn_claude_pane_ok_response(id: &Value, data: &Value, command: &str) -> Val
 fn claude_spawn_queued_message(new_id: Option<u64>, command: &str) -> String {
     match new_id {
         Some(n) => format!(
-            "Created pane id={n}. Claude startup command queued (process start not yet confirmed): {command}"
+            "Created pane id={n}. Startup command queued for Claude (process start not yet confirmed; use inspect_pane to verify): {command}"
         ),
         None => format!(
-            "Created pane (id not reported). Claude startup command queued (process start not yet confirmed): {command}"
+            "Created pane (id not reported). Startup command queued for Claude (process start not yet confirmed; use inspect_pane to verify): {command}"
         ),
     }
 }
@@ -1774,10 +1776,10 @@ fn handle_spawn_codex_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
 fn codex_spawn_queued_message(new_id: Option<u64>, command: &str) -> String {
     match new_id {
         Some(n) => format!(
-            "Created pane id={n}. Codex startup command queued (process start not yet confirmed): {command}"
+            "Created pane id={n}. Startup command queued for Codex (process start not yet confirmed; use inspect_pane to verify): {command}"
         ),
         None => format!(
-            "Created pane (id not reported). Codex startup command queued (process start not yet confirmed): {command}"
+            "Created pane (id not reported). Startup command queued for Codex (process start not yet confirmed; use inspect_pane to verify): {command}"
         ),
     }
 }
@@ -3621,7 +3623,7 @@ Commands:
                 "result": {
                     "content": [{
                         "type": "text",
-                        "text": "Created pane id=7. Startup command queued (process start not yet confirmed): cargo test"
+                        "text": "Created pane id=7. Startup command queued (process start not yet confirmed; use inspect_pane to verify): cargo test"
                     }],
                     "isError": false
                 }
@@ -3663,7 +3665,7 @@ Commands:
                 "result": {
                     "content": [{
                         "type": "text",
-                        "text": "Created pane id=9. Claude startup command queued (process start not yet confirmed): claude --model opus"
+                        "text": "Created pane id=9. Startup command queued for Claude (process start not yet confirmed; use inspect_pane to verify): claude --model opus"
                     }],
                     "isError": false
                 }
@@ -3771,7 +3773,7 @@ Commands:
 
         assert_eq!(
             msg,
-            "Created pane id=8. Codex startup command queued (process start not yet confirmed): codex --yolo"
+            "Created pane id=8. Startup command queued for Codex (process start not yet confirmed; use inspect_pane to verify): codex --yolo"
         );
     }
 
