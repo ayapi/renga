@@ -177,17 +177,6 @@ fn seed_scrollback(app: &mut App) -> usize {
     // 12-row frame → 10 content rows after the borders.
     app.ws_mut().last_pane_rects = vec![(pane_id, ratatui::layout::Rect::new(0, 0, 40, 12))];
     let pane = app.ws().panes.get(&pane_id).expect("focused pane");
-    // Let the real shell finish printing its startup banner/prompt
-    // first: vt100 auto-shifts a scrolled-back offset when new lines
-    // arrive, so late shell output between two assertions would skew
-    // the exact-offset checks below.
-    let start = std::time::Instant::now();
-    while !pane.prompt_seen.load(std::sync::atomic::Ordering::Relaxed)
-        && start.elapsed() < std::time::Duration::from_secs(5)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    std::thread::sleep(std::time::Duration::from_millis(50));
     let mut parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
     for i in 0..100 {
         parser.process(format!("line {i}\r\n").as_bytes());

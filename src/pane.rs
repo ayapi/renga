@@ -1781,7 +1781,7 @@ mod tests {
         let _ = std::fs::remove_file(&marker_path);
         let marker_fwd = marker_path.display().to_string().replace('\\', "/");
         let probe = format!(
-            "printf renga-setup-probe > '{marker_fwd}'; printf 'RENGA_PRE_CLEAR_MARKER\\n'\r"
+            "printf renga-setup-probe > '{marker_fwd}'; printf 'RENGA_PRE_CLEAR_MARKER\\n'; sleep 1\r"
         );
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1803,30 +1803,41 @@ mod tests {
         assert!(
             wait_for(
                 || {
+                    pane.parser
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .screen()
+                        .contents()
+                        .contains("RENGA_PRE_CLEAR_MARKER")
+                },
+                Duration::from_secs(30)
+            ),
+            "pre-clear marker should become visible before clear runs"
+        );
+        assert!(
+            wait_for(
+                || {
+                    !pane
+                        .parser
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .screen()
+                        .contents()
+                        .contains("RENGA_PRE_CLEAR_MARKER")
+                },
+                Duration::from_secs(30)
+            ),
+            "setup clear should remove output written immediately before setup"
+        );
+        assert!(
+            wait_for(
+                || {
                     rx.try_iter()
                         .any(|event| matches!(event, AppEvent::CwdChanged(9913, _)))
                 },
                 Duration::from_secs(30)
             ),
             "installed OSC 7 hook should publish the shell cwd"
-        );
-        assert!(
-            wait_for(
-                || {
-                    rx.try_iter().any(|event| {
-                        matches!(event, AppEvent::PtyOutput(9913))
-                            && !pane
-                                .parser
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .screen()
-                                .contents()
-                                .contains("RENGA_PRE_CLEAR_MARKER")
-                    })
-                },
-                Duration::from_secs(30)
-            ),
-            "setup clear should remove output written immediately before setup"
         );
 
         let osc7_dir =
