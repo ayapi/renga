@@ -153,10 +153,14 @@ Result: text describing every pane in the **current tab** (Q4): `id`, `name`,
 | `target` | string | no | Numeric id, name, or `"focused"`. Default `"focused"`. |
 | `command` | string | no | Startup command. **Bare `claude [...]` is auto-rewritten to the Alt+P peer-enabled form** — see contract note below (Q3). |
 | `name` | string | no | Stable pane name, must satisfy `[A-Za-z0-9_-]`, not all-digits. |
-| `role` | string | no | Free-form label. Non-unique. |
+| `role` | string | no | Free-form label. Non-unique. When `command` is omitted and `role` is exactly `"claude"`, renga preloads the peer-enabled Claude startup command; an explicit `command` takes precedence. |
 | `cwd` | string | no | Absolute or relative-to-caller. Validated **before** layout mutation; failure is `cwd_invalid`. |
 
 Returns: text containing the new pane's numeric id.
+For `spawn_pane`, `spawn_claude_pane`, and `spawn_codex_pane`, the response
+confirms pane creation and startup-command queueing only; process startup is
+asynchronous and is not yet confirmed, so allow startup time and use
+`inspect_pane` to verify.
 
 **`command` rewrite contract (Q3)**: when `command` starts with the bare token
 `claude` (no `--dangerously-load-development-channels`), renga injects the

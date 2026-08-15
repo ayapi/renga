@@ -582,7 +582,7 @@ fn tools_spec() -> Value {
         },
         {
             "name": "spawn_pane",
-            "description": "Split a pane to create a new one in the same renga tab. Returns the new pane's numeric id so you can address it from later tool calls. Refuses if the target is already at minimum size or the tab has hit its pane cap.",
+            "description": "Split a pane to create a new one in the same renga tab. When `command` is provided, renga queues it for asynchronous startup; the process has not been confirmed started when this tool returns, so allow startup time and use `inspect_pane` to verify. When `command` is omitted and `role` is exactly `claude`, renga preloads and queues the peer-enabled Claude startup command; an explicit `command` takes precedence. Returns the new pane's numeric id so you can address it from later tool calls. Refuses if the target is already at minimum size or the tab has hit its pane cap.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -617,7 +617,7 @@ fn tools_spec() -> Value {
         },
         {
             "name": "spawn_claude_pane",
-            "description": "Higher-level convenience over `spawn_pane`: splits a pane and launches Claude Code with the renga-peers channel enabled by construction, so the orchestrating caller never has to synthesize the `--dangerously-load-development-channels server:renga-peers` flag. Structured fields (`permission_mode`, `model`) are rendered into the final command exactly once; extra `args[]` are appended after them. renga applies POSIX-style shell quoting for values that contain whitespace or shell metacharacters, targeting bash / zsh / Git Bash — values containing single quotes may not round-trip cleanly on PowerShell-fallback Windows hosts, so prefer alphanumerics + `_-./:@+%=` in structured values. Conflicting overrides inside `args[]` (--dangerously-load-development-channels / --permission-mode / --model) are rejected with `invalid-params` — use the structured fields instead. Pane creation semantics (split refusal, cwd validation, name / role attachment) match `spawn_pane`.",
+            "description": "Higher-level convenience over `spawn_pane`: creates a split pane and queues a Claude Code startup command with the renga-peers channel enabled by construction, so the orchestrating caller never has to synthesize the `--dangerously-load-development-channels server:renga-peers` flag. Process startup is asynchronous and has not been confirmed when this tool returns; allow startup time, then use `inspect_pane` to verify (Claude may take 90–150 s). Structured fields (`permission_mode`, `model`) are rendered into the final command exactly once; extra `args[]` are appended after them. renga applies POSIX-style shell quoting for values that contain whitespace or shell metacharacters, targeting bash / zsh / Git Bash — values containing single quotes may not round-trip cleanly on PowerShell-fallback Windows hosts, so prefer alphanumerics + `_-./:@+%=` in structured values. Conflicting overrides inside `args[]` (--dangerously-load-development-channels / --permission-mode / --model) are rejected with `invalid-params` — use the structured fields instead. Pane creation semantics (split refusal, cwd validation, name / role attachment) match `spawn_pane`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -661,7 +661,7 @@ fn tools_spec() -> Value {
         },
         {
             "name": "spawn_codex_pane",
-            "description": "Higher-level convenience over `spawn_pane`: splits a pane and launches Codex without the orchestrating caller having to synthesize a shell-quoted `codex ...` command string. This helper assumes the user has already run `renga mcp install --client codex`; that registration injects the `RENGA_PEER_CLIENT_KIND=codex` env into Codex's MCP server subprocess, so a plain `codex` launch is enough for the new pane to register as a pull-based peer. Extra `args[]` are appended after the `codex` token using the same POSIX-style shell quoting as spawn_claude_pane. Pane creation semantics (split refusal, cwd validation, name / role attachment) match `spawn_pane`.",
+            "description": "Higher-level convenience over `spawn_pane`: creates a split pane and queues a Codex startup command without the orchestrating caller having to synthesize a shell-quoted `codex ...` command string. Process startup is asynchronous and has not been confirmed when this tool returns; allow startup time, then use `inspect_pane` to verify (Codex may take 90–150 s). This helper assumes the user has already run `renga mcp install --client codex`; that registration injects the `RENGA_PEER_CLIENT_KIND=codex` env into Codex's MCP server subprocess, so the queued plain `codex` command is configured to register the new pane as a pull-based peer. Extra `args[]` are appended after the `codex` token using the same POSIX-style shell quoting as spawn_claude_pane. Pane creation semantics (split refusal, cwd validation, name / role attachment) match `spawn_pane`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3222,6 +3222,39 @@ mod tests {
             names.contains(&"spawn_codex_pane"),
             "spawn_codex_pane missing from tools list: {names:?}"
         );
+    }
+
+    #[test]
+    fn spawn_tool_descriptions_report_queued_unconfirmed_startup() {
+        let spec = tools_spec();
+        let description = |name| {
+            spec.as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+                .and_then(|tool| tool.get("description"))
+                .and_then(Value::as_str)
+                .expect("spawn tool description")
+        };
+
+        let spawn = description("spawn_pane");
+        assert!(spawn.contains("queues it for asynchronous startup"));
+        assert!(spawn.contains("has not been confirmed started"));
+        assert!(spawn.contains("`role` is exactly `claude`"));
+        assert!(spawn.contains("preloads and queues"));
+
+        for name in ["spawn_claude_pane", "spawn_codex_pane"] {
+            let description = description(name);
+            assert!(description.contains("queues a"), "{name}: {description}");
+            assert!(
+                description.contains("startup is asynchronous and has not been confirmed"),
+                "{name}: {description}"
+            );
+            assert!(
+                description.contains("use `inspect_pane` to verify"),
+                "{name}: {description}"
+            );
+        }
     }
 
     #[test]
