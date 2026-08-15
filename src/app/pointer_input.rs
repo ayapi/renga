@@ -175,7 +175,8 @@ impl App {
             }
             let max_scroll = total_lines.saturating_sub(visible_rows);
             let relative_y = click_row.saturating_sub(inner.y) as f32;
-            let ratio = relative_y / inner.height.max(1) as f32;
+            let track_height = inner.height.saturating_sub(1).max(1) as f32;
+            let ratio = (relative_y / track_height).clamp(0.0, 1.0);
             let target_scroll = ((1.0 - ratio) * max_scroll as f32) as usize;
             let mut parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
             parser.screen_mut().set_scrollback(target_scroll);

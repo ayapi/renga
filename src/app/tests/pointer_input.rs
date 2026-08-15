@@ -581,18 +581,20 @@ fn repeated_visible_scrollbar_click_does_not_split_outer_edge() {
 }
 
 #[test]
-fn dedicated_scrollbar_click_and_drag_change_scrollback() {
+fn dedicated_scrollbar_click_and_drag_reach_scrollback_extremes() {
     let (mut app, a_id, _b_id) = two_pane_vertical_app();
     seed_real_scrollback(&app, a_id);
     let rect = pane_rect(&app, a_id);
+    let inner = Rect::new(rect.x + 1, rect.y + 1, rect.width - 3, rect.height - 2);
     let scrollbar_col = rect.x + rect.width - 2;
+    let max_scroll = app.ws().panes.get(&a_id).unwrap().scrollbar_info().1 - inner.height as usize;
 
     app.handle_mouse_event(boundary_mouse(
         MouseEventKind::Down(MouseButton::Left),
         scrollbar_col,
-        2,
+        inner.y,
     ));
-    let after_click = app
+    let after_top_click = app
         .ws()
         .panes
         .get(&a_id)
@@ -602,14 +604,17 @@ fn dedicated_scrollbar_click_and_drag_change_scrollback() {
         .unwrap_or_else(|e| e.into_inner())
         .screen()
         .scrollback();
-    assert!(after_click > 0, "track click should enter scrollback");
+    assert_eq!(
+        after_top_click, max_scroll,
+        "top track click should reach maximum scrollback"
+    );
 
     app.handle_mouse_event(boundary_mouse(
         MouseEventKind::Drag(MouseButton::Left),
         scrollbar_col,
-        38,
+        inner.y + inner.height - 1,
     ));
-    let after_drag = app
+    let after_bottom_drag = app
         .ws()
         .panes
         .get(&a_id)
@@ -619,10 +624,60 @@ fn dedicated_scrollbar_click_and_drag_change_scrollback() {
         .unwrap_or_else(|e| e.into_inner())
         .screen()
         .scrollback();
-    assert!(
-        after_drag < after_click,
-        "dragging down should approach live output"
+    assert_eq!(
+        after_bottom_drag, 0,
+        "bottom drag should return to live output"
     );
+    app.shutdown();
+}
+
+#[test]
+fn one_row_scrollbar_click_uses_top_position_without_dividing_by_zero() {
+    let (mut app, pane_id, _b_id) = two_pane_vertical_app();
+    seed_real_scrollback(&app, pane_id);
+    let rect = app
+        .ws_mut()
+        .last_pane_rects
+        .iter_mut()
+        .find(|(id, _)| *id == pane_id)
+        .map(|(_, rect)| {
+            rect.height = 3;
+            *rect
+        })
+        .expect("pane rect exists");
+    let inner = Rect::new(rect.x + 1, rect.y + 1, rect.width - 3, 1);
+    let maximum_available = {
+        let mut parser = app
+            .ws()
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .parser
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let maximum = parser.screen().scrollback();
+        parser.screen_mut().set_scrollback(0);
+        maximum
+    };
+
+    app.handle_mouse_event(boundary_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        rect.x + rect.width - 2,
+        inner.y,
+    ));
+
+    let scrollback = app
+        .ws()
+        .panes
+        .get(&pane_id)
+        .unwrap()
+        .parser
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .screen()
+        .scrollback();
+    assert_eq!(scrollback, maximum_available);
     app.shutdown();
 }
 
