@@ -1675,7 +1675,14 @@ mod tests {
         pane.kill();
     }
 
+    // Ignored by default: these smoke tests drive a real PTY and real shell,
+    // so they depend on OS process-creation latency. On Windows, 20 idle runs
+    // had a 4.6 s median, 5.5 s maximum, and no failures; with other test
+    // suites running concurrently, 7/20 exceeded the 30 s budget. CI runs
+    // them via `--include-ignored`, where only these tests spawn real shells
+    // and conditions are closer to the idle measurement.
     #[test]
+    #[ignore]
     fn real_pane_reader_delivers_output_event() {
         let _guard = REAL_PANE_TEST_LOCK
             .lock()
@@ -1696,7 +1703,9 @@ mod tests {
         pane.kill();
     }
 
+    // Ignored by default for the real-PTY latency reason documented above.
     #[test]
+    #[ignore]
     fn real_pane_reaches_usable_shell_prompt() {
         let _guard = REAL_PANE_TEST_LOCK
             .lock()
@@ -1723,7 +1732,9 @@ mod tests {
         pane.kill();
     }
 
+    // Ignored by default for the real-PTY latency reason documented above.
     #[test]
+    #[ignore]
     fn real_pane_executes_queued_startup_command() {
         let _guard = REAL_PANE_TEST_LOCK
             .lock()
@@ -1771,7 +1782,9 @@ mod tests {
         let _ = std::fs::remove_file(marker);
     }
 
+    // Ignored by default for the real-PTY latency reason documented above.
     #[test]
+    #[ignore]
     fn real_pane_injects_osc7_setup_for_supported_shell() {
         let _guard = REAL_PANE_TEST_LOCK
             .lock()
@@ -1873,7 +1886,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(osc7_dir);
     }
 
+    // Ignored by default for the real-PTY latency reason documented above.
     #[test]
+    #[ignore]
     fn real_pane_resize_updates_pty_and_parser() {
         let _guard = REAL_PANE_TEST_LOCK
             .lock()
@@ -1889,7 +1904,9 @@ mod tests {
         pane.kill();
     }
 
+    // Ignored by default for the real-PTY latency reason documented above.
     #[test]
+    #[ignore]
     fn real_pane_honors_explicit_cwd() {
         let _guard = REAL_PANE_TEST_LOCK
             .lock()
@@ -2028,6 +2045,8 @@ mod tests {
     /// signal-based probes don't work in sandboxed environments).
     #[cfg(windows)]
     #[test]
+    // Ignored by default for the real-PTY latency reason documented above.
+    #[ignore]
     fn kill_reaps_grandchild_after_shell_natural_exit() {
         let _guard = REAL_PANE_TEST_LOCK
             .lock()
