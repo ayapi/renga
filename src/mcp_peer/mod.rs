@@ -1343,12 +1343,7 @@ fn handle_spawn_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
             cwd,
         },
     ) {
-        Ok(Response::Ok { data }) => {
-            let new_id = data.get("id").and_then(|v| v.as_u64());
-            let effective_command = data.get("startup_command").and_then(|v| v.as_str());
-            let msg = spawn_pane_created_message(new_id, effective_command);
-            ok_response(id, tool_text_result(&msg))
-        }
+        Ok(Response::Ok { data }) => spawn_pane_ok_response(id, &data),
         Ok(Response::Err { message, code }) => err_response(
             id,
             -32603,
@@ -1357,6 +1352,13 @@ fn handle_spawn_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
         Ok(other) => err_response(id, -32603, &format!("unexpected renga response: {other:?}")),
         Err(e) => err_response(id, -32603, &format!("renga call failed: {e}")),
     }
+}
+
+fn spawn_pane_ok_response(id: &Value, data: &Value) -> Value {
+    let new_id = data.get("id").and_then(|v| v.as_u64());
+    let effective_command = data.get("startup_command").and_then(|v| v.as_str());
+    let msg = spawn_pane_created_message(new_id, effective_command);
+    ok_response(id, tool_text_result(&msg))
 }
 
 pub(crate) fn spawn_pane_created_message(new_id: Option<u64>, command: Option<&str>) -> String {
@@ -1734,11 +1736,7 @@ fn handle_spawn_claude_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
             cwd,
         },
     ) {
-        Ok(Response::Ok { data }) => {
-            let new_id = data.get("id").and_then(|v| v.as_u64());
-            let msg = claude_spawn_queued_message(new_id, &command);
-            ok_response(id, tool_text_result(&msg))
-        }
+        Ok(Response::Ok { data }) => spawn_claude_pane_ok_response(id, &data, &command),
         Ok(Response::Err { message, code }) => err_response(
             id,
             -32603,
@@ -1750,6 +1748,12 @@ fn handle_spawn_claude_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
         Ok(other) => err_response(id, -32603, &format!("unexpected renga response: {other:?}")),
         Err(e) => err_response(id, -32603, &format!("renga call failed: {e}")),
     }
+}
+
+fn spawn_claude_pane_ok_response(id: &Value, data: &Value, command: &str) -> Value {
+    let new_id = data.get("id").and_then(|v| v.as_u64());
+    let msg = claude_spawn_queued_message(new_id, command);
+    ok_response(id, tool_text_result(&msg))
 }
 
 fn claude_spawn_queued_message(new_id: Option<u64>, command: &str) -> String {
@@ -3603,29 +3607,67 @@ Commands:
     }
 
     #[test]
-    fn spawn_pane_success_text_reports_queued_not_started() {
-        let msg = spawn_pane_created_message(Some(7), Some("cargo test"));
+    fn spawn_pane_success_response_reports_queued_not_started() {
+        let response = spawn_pane_ok_response(
+            &json!(41),
+            &json!({ "id": 7, "startup_command": "cargo test" }),
+        );
 
         assert_eq!(
-            msg,
-            "Created pane id=7. Startup command queued (process start not yet confirmed): cargo test"
+            response,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 41,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": "Created pane id=7. Startup command queued (process start not yet confirmed): cargo test"
+                    }],
+                    "isError": false
+                }
+            })
         );
     }
 
     #[test]
-    fn spawn_pane_success_text_without_command_reports_none_requested() {
-        let msg = spawn_pane_created_message(Some(7), None);
+    fn spawn_pane_success_response_without_command_reports_none_requested() {
+        let response =
+            spawn_pane_ok_response(&json!(42), &json!({ "id": 7, "startup_command": null }));
 
-        assert_eq!(msg, "Created pane id=7. No startup command requested.");
+        assert_eq!(
+            response,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": "Created pane id=7. No startup command requested."
+                    }],
+                    "isError": false
+                }
+            })
+        );
     }
 
     #[test]
-    fn spawn_claude_pane_success_text_reports_queued_not_started() {
-        let msg = claude_spawn_queued_message(Some(9), "claude --model opus");
+    fn spawn_claude_pane_success_response_reports_queued_not_started() {
+        let response =
+            spawn_claude_pane_ok_response(&json!(43), &json!({ "id": 9 }), "claude --model opus");
 
         assert_eq!(
-            msg,
-            "Created pane id=9. Claude startup command queued (process start not yet confirmed): claude --model opus"
+            response,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 43,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": "Created pane id=9. Claude startup command queued (process start not yet confirmed): claude --model opus"
+                    }],
+                    "isError": false
+                }
+            })
         );
     }
 
