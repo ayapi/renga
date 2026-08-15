@@ -233,7 +233,7 @@ use sparingly.
 | `command` | string | no | Same `claude` auto-rewrite as `spawn_pane`. |
 | `name` | string | no | Stable pane name for the new tab's initial pane. |
 | `label` | string | no | Tab label override (default: derived from cwd). |
-| `role` | string | no | Free-form. |
+| `role` | string | no | Free-form. When `command` is omitted, `"claude"` selects the same peer-enabled Claude startup command as `spawn_pane`; the command is queued and process start is not confirmed. |
 | `cwd` | string | no | Absolute or relative-to-caller. Defaults to the renga server's cwd. |
 
 Returns: numeric pane id of the new tab's initial pane. Focus switches to the
