@@ -1374,15 +1374,13 @@ pub(crate) fn spawn_pane_ok_response(
     no_startup_command_possible: bool,
 ) -> Value {
     let new_id = data.get("id").and_then(|v| v.as_u64());
+    let pane = created_pane_text(new_id);
     let msg = if no_startup_command_possible
         && !matches!(data.get("startup_command"), Some(Value::String(_)))
     {
-        format!(
-            "{} No startup command requested.",
-            created_pane_text(new_id)
-        )
+        format!("{pane} No startup command requested.")
     } else {
-        spawn_startup_message(new_id, None, data, requested_command)
+        spawn_startup_message(&pane, None, data, requested_command)
     };
     ok_response(id, tool_text_result(&msg))
 }
@@ -1395,27 +1393,23 @@ fn created_pane_text(new_id: Option<u64>) -> String {
 }
 
 fn spawn_startup_message(
-    new_id: Option<u64>,
+    pane: &str,
     product: Option<&str>,
     data: &Value,
     requested_command: Option<&str>,
 ) -> String {
     match data.get("startup_command") {
-        Some(Value::String(command)) => spawn_queued_message(new_id, product, command),
-        Some(Value::Null) => format!(
-            "{} No startup command requested.",
-            created_pane_text(new_id)
-        ),
-        None | Some(_) => spawn_unconfirmed_message(new_id, product, requested_command),
+        Some(Value::String(command)) => spawn_queued_message(pane, product, command),
+        Some(Value::Null) => format!("{pane} No startup command requested."),
+        None | Some(_) => spawn_unconfirmed_message(pane, product, requested_command),
     }
 }
 
 fn spawn_unconfirmed_message(
-    new_id: Option<u64>,
+    pane: &str,
     product: Option<&str>,
     requested_command: Option<&str>,
 ) -> String {
-    let pane = created_pane_text(new_id);
     let timing = startup_timing_hint(product);
     let product = product
         .map(|name| format!(" for {name}"))
@@ -1429,8 +1423,7 @@ fn spawn_unconfirmed_message(
     }
 }
 
-fn spawn_queued_message(new_id: Option<u64>, product: Option<&str>, command: &str) -> String {
-    let pane = created_pane_text(new_id);
+fn spawn_queued_message(pane: &str, product: Option<&str>, command: &str) -> String {
     let timing = startup_timing_hint(product);
     let product = product
         .map(|name| format!(" for {name}"))
@@ -1826,7 +1819,8 @@ fn handle_spawn_claude_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
 
 fn spawn_claude_pane_ok_response(id: &Value, data: &Value, command: &str) -> Value {
     let new_id = data.get("id").and_then(|v| v.as_u64());
-    let msg = spawn_startup_message(new_id, Some("Claude"), data, Some(command));
+    let pane = created_pane_text(new_id);
+    let msg = spawn_startup_message(&pane, Some("Claude"), data, Some(command));
     ok_response(id, tool_text_result(&msg))
 }
 
@@ -1836,7 +1830,8 @@ fn handle_spawn_codex_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
 
 fn spawn_codex_pane_ok_response(id: &Value, data: &Value, command: &str) -> Value {
     let new_id = data.get("id").and_then(|v| v.as_u64());
-    let msg = spawn_startup_message(new_id, Some("Codex"), data, Some(command));
+    let pane = created_pane_text(new_id);
+    let msg = spawn_startup_message(&pane, Some("Codex"), data, Some(command));
     ok_response(id, tool_text_result(&msg))
 }
 
@@ -1998,6 +1993,7 @@ where
     let label = opt_string(args, "label");
     let role = opt_string(args, "role");
     let cwd = opt_string(args, "cwd");
+    let no_startup_command_possible = command.is_none() && role.is_none();
 
     let (caller_pane, endpoint) = match require_connected(ctx, id, "open new tab") {
         Ok(t) => t,
@@ -2017,7 +2013,9 @@ where
             cwd,
         },
     ) {
-        Ok(Response::Ok { data }) => new_tab_ok_response(id, &data, command.as_deref()),
+        Ok(Response::Ok { data }) => {
+            new_tab_ok_response(id, &data, command.as_deref(), no_startup_command_possible)
+        }
         Ok(Response::Err { message, code }) => err_response(
             id,
             -32603,
@@ -2028,24 +2026,23 @@ where
     }
 }
 
-fn new_tab_ok_response(id: &Value, data: &Value, requested_command: Option<&str>) -> Value {
+fn new_tab_ok_response(
+    id: &Value,
+    data: &Value,
+    requested_command: Option<&str>,
+    no_startup_command_possible: bool,
+) -> Value {
     let new_id = data.get("id").and_then(|v| v.as_u64());
     let tab = match new_id {
         Some(n) => format!("Opened new tab; new pane id={n} (now focused)."),
         None => "Opened new tab.".to_string(),
     };
-    let msg = match data.get("startup_command") {
-        Some(Value::String(command)) => format!(
-            "{tab} Startup command queued (process start not yet confirmed; allow startup time, then use inspect_pane to verify): {command}"
-        ),
-        Some(Value::Null) => format!("{tab} No startup command requested."),
-        None | Some(_) => {
-            let status = "Startup command unconfirmed (renga server may predate effective-command reporting; process start not yet confirmed; allow startup time, then use inspect_pane to verify)";
-            match requested_command {
-                Some(command) => format!("{tab} {status}: {command}"),
-                None => format!("{tab} {status}."),
-            }
-        }
+    let msg = if no_startup_command_possible
+        && !matches!(data.get("startup_command"), Some(Value::String(_)))
+    {
+        format!("{tab} No startup command requested.")
+    } else {
+        spawn_startup_message(&tab, None, data, requested_command)
     };
     ok_response(id, tool_text_result(&msg))
 }
@@ -3838,6 +3835,31 @@ Commands:
                     "content": [{
                         "type": "text",
                         "text": "Opened new tab; new pane id=13 (now focused). No startup command requested."
+                    }],
+                    "isError": false
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn new_tab_without_command_or_role_needs_no_old_server_hedge() {
+        let ctx = connected_ctx_with(new_event_sink());
+        let response = handle_new_tab_with_request(&json!(55), &json!({}), &ctx, |_, _| {
+            Ok(Response::Ok {
+                data: json!({ "id": 15 }),
+            })
+        });
+
+        assert_eq!(
+            response,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 55,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": "Opened new tab; new pane id=15 (now focused). No startup command requested."
                     }],
                     "isError": false
                 }
