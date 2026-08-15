@@ -1675,12 +1675,15 @@ mod tests {
         pane.kill();
     }
 
-    // Ignored by default: these smoke tests drive a real PTY and real shell,
-    // so they depend on OS process-creation latency. On Windows, 20 idle runs
-    // had a 4.6 s median, 5.5 s maximum, and no failures; with other test
-    // suites running concurrently, 7/20 exceeded the 30 s budget. CI runs
-    // them via `--include-ignored`, where only these tests spawn real shells
-    // and conditions are closer to the idle measurement.
+    // Ignored by default: these smoke tests drive a real PTY and a real shell,
+    // so they depend on OS process-creation latency, not on renga's logic.
+    // Measured on Windows against this code: 0/20 failures when the machine is
+    // otherwise idle, but 7/20 exceed the 30 s budget when other test suites run
+    // concurrently — the reader thread is starved and the shell's output arrives
+    // too late. The exact load is not reproducible enough to quote; what matters
+    // is that the failure is caused by machine contention, not by the code under
+    // test. CI runs them via `--include-ignored`, where this suite spawns only
+    // these panes and so approximates the idle condition.
     #[test]
     #[ignore]
     fn real_pane_reader_delivers_output_event() {
