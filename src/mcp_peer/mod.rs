@@ -507,7 +507,10 @@ send_message calls may need approval before peer messaging becomes reliable.\n\n
     - focus_pane: Move keyboard focus to another pane in the same tab.\n\
     - new_tab: Open a brand-new tab with a fresh pane and switch focus to it. Unlike the other \
     pane-control tools, this reaches outside the current tab. Accepts the same `cwd` option \
-    as spawn_pane for setting the new pane's working directory.\n\
+    as spawn_pane for setting the new pane's working directory. Any effective startup command is \
+    queued for asynchronous execution, and process startup is not confirmed when the tool returns. \
+    With no explicit `command`, role `claude` queues the peer-enabled Claude command for automatic \
+    execution; an explicit `command` takes precedence.\n\
     - inspect_pane: Snapshot the visible screen of a pane so you can detect interactive \
     prompts, banners, or mode indicators in another pane without asking it. Returns plain \
     text by default; pass format=\"grid\" for row-addressable JSON or lines=N to trim to \
@@ -526,8 +529,8 @@ send_message calls may need approval before peer messaging becomes reliable.\n\n
     Queuing Claude Code startup: prefer spawn_claude_pane — it takes structured \
     `permission_mode` / `model` / `args[]` fields, always enables the peer channel, and keeps \
     launch policy in renga so orchestrator prompts never have to synthesize shell-quoted command \
-    strings. For arbitrary shell commands (non-Claude), use spawn_pane / new_tab. When those \
-    are asked to run a bare `claude` invocation the MCP still auto-upgrades it to the \
+    strings. For arbitrary shell commands (non-Claude), use spawn_pane / new_tab. When the \
+    requested command starts with a bare `claude` invocation, the MCP rewrites the queued command to the \
     peer-enabled form (`claude --dangerously-load-development-channels server:renga-peers \
     --permission-mode bypassPermissions`), but \
     spawn_claude_pane is the recommended API for agent harnesses. For Codex startup commands, prefer \
@@ -3288,6 +3291,17 @@ mod tests {
             assert!(instructions.contains("queues a startup command"));
             assert!(instructions.contains("Process startup is asynchronous"));
             assert!(instructions.contains("process startup is not confirmed"));
+            assert!(instructions.contains("MCP rewrites the queued command"));
+            let new_tab_instructions = instructions
+                .split_once("- new_tab:")
+                .and_then(|(_, tail)| tail.split_once("- inspect_pane:"))
+                .map(|(section, _)| section)
+                .expect("new_tab instructions section");
+            assert!(new_tab_instructions.contains("queued for asynchronous execution"));
+            assert!(new_tab_instructions.contains("process startup is not confirmed"));
+            assert!(new_tab_instructions
+                .contains("role `claude` queues the peer-enabled Claude command"));
+            assert!(new_tab_instructions.contains("an explicit `command` takes precedence"));
             assert!(
                 !instructions.contains("launches"),
                 "instructions must not claim process startup: {instructions}"
