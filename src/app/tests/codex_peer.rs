@@ -1,7 +1,7 @@
 use super::super::*;
 use crate::app::codex_peer::{
     codex_composer_has_draft_on_screen, normalized_codex_composer_text,
-    CODEX_PEER_NUDGE_MAX_RETRIES,
+    CODEX_PEER_DRAFT_STALL_TIMEOUT, CODEX_PEER_NUDGE_MAX_RETRIES,
 };
 
 fn seed_focused_pane_screen(app: &mut App, bytes: &[u8]) -> usize {
@@ -1276,16 +1276,22 @@ fn persistently_unknown_screen_surfaces_notification_on_focus() {
     )
     .expect("peer send");
 
-    app.flush_pending_codex_peer_messages();
+    for _ in 0..8 {
+        app.flush_pending_codex_peer_messages();
+    }
     assert!(matches!(
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|queue| queue.front()),
-        Some(PendingCodexPeerDelivery::Draft {
-            unknown_screen_checks: 1,
-            ..
-        })
+        Some(PendingCodexPeerDelivery::Draft { .. })
     ));
+    if let Some(PendingCodexPeerDelivery::Draft { stalled_since, .. }) = app
+        .pending_codex_peer_messages
+        .get_mut(&codex_id)
+        .and_then(|queue| queue.front_mut())
+    {
+        *stalled_since = Instant::now() - CODEX_PEER_DRAFT_STALL_TIMEOUT;
+    }
     app.flush_pending_codex_peer_messages();
     assert!(matches!(
         app.pending_codex_peer_messages
@@ -1310,7 +1316,7 @@ fn persistently_unknown_screen_surfaces_notification_on_focus() {
 }
 
 #[test]
-fn recognized_screen_resets_unknown_check_count() {
+fn recognized_unactionable_screen_eventually_surfaces_on_focus() {
     let mut app = App::new(40, 160).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
     let codex_id = app
@@ -1328,28 +1334,94 @@ fn recognized_screen_resets_unknown_check_count() {
     app.peer_delivery_ready.insert(codex_id);
     app.handle_focus(&ipc::PaneRef::Id(sender_id))
         .expect("refocus sender");
-    seed_pane_screen(&mut app, codex_id, b"\x1b[?25h\x1b[2J\x1b[Hunknown");
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Thinking (12s - esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium - cwd\x1b[4;3H",
+    );
+    {
+        let pane = app.ws().panes.get(&codex_id).expect("pane");
+        let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            codex_composer_has_draft_on_screen(parser.screen()),
+            Some(false)
+        );
+        assert_eq!(
+            codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+            Some(true)
+        );
+    }
     app.handle_peer_send(
         sender_id,
         &ipc::PaneRef::Id(codex_id),
-        "reset count".to_string(),
+        "recognized stall".to_string(),
     )
     .expect("peer send");
-    app.flush_pending_codex_peer_messages();
-
-    seed_codex_draft(&mut app, codex_id);
-    app.flush_pending_codex_peer_messages();
-    seed_pane_screen(&mut app, codex_id, b"\x1b[?25h\x1b[2J\x1b[Hunknown again");
+    if let Some(PendingCodexPeerDelivery::Draft { stalled_since, .. }) = app
+        .pending_codex_peer_messages
+        .get_mut(&codex_id)
+        .and_then(|queue| queue.front_mut())
+    {
+        *stalled_since = Instant::now() - CODEX_PEER_DRAFT_STALL_TIMEOUT;
+    }
     app.flush_pending_codex_peer_messages();
 
     assert!(matches!(
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|queue| queue.front()),
-        Some(PendingCodexPeerDelivery::Draft {
-            unknown_screen_checks: 1,
-            ..
-        })
+        Some(PendingCodexPeerDelivery::AwaitFocus(_))
+    ));
+    app.handle_focus(&ipc::PaneRef::Id(codex_id))
+        .expect("focus stalled Codex pane");
+    assert!(app.visible_codex_peer_notification().is_some());
+    app.shutdown();
+}
+
+#[test]
+fn transient_unknown_frames_preserve_native_queue_path() {
+    let mut app = App::new(40, 160).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(codex_id);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    seed_pane_screen(&mut app, codex_id, b"\x1b[?25h\x1b[2J");
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "survive partial frames".to_string(),
+    )
+    .expect("peer send");
+
+    for _ in 0..8 {
+        app.flush_pending_codex_peer_messages();
+    }
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::Draft { .. })
+    ));
+
+    seed_codex_busy_placeholder(&mut app, codex_id);
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::QueueAt { .. })
     ));
     app.shutdown();
 }
