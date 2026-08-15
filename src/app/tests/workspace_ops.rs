@@ -418,7 +418,7 @@ fn split_role_default_response_reports_the_command_actually_queued() {
     assert_eq!(
         response,
         format!(
-            "Created pane id={}. Startup command queued (process start not yet confirmed; allow startup time, then use inspect_pane to verify; Claude may take 90–150 s): {pending}",
+            "Created pane id={}. Startup command queued (process start not yet confirmed; allow startup time, then use inspect_pane to verify): {pending}",
             outcome.id
         )
     );
