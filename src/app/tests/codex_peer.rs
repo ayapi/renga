@@ -2425,17 +2425,27 @@ fn submit_commit_does_not_send_changed_composer() {
         "guard delayed submit".to_string(),
     )
     .expect("peer send");
-    let expected = format_codex_peer_message(&PendingCodexPeerMessage {
-        from_pane: sender_id,
-        from_name: None,
-        from_kind: None,
-    });
-    seed_codex_idle_composer(&mut app, codex_id, &format!("{expected}ABC"));
     app.ws_mut()
         .panes
         .get_mut(&codex_id)
         .expect("pane")
         .clear_test_input();
+    let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: None,
+        from_kind: None,
+    });
+    let changed = format!("{expected}ABC");
+    seed_codex_idle_composer(&mut app, codex_id, &changed);
+    {
+        let pane = app.ws().panes.get(&codex_id).expect("pane");
+        let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            normalized_codex_composer_text(parser.screen()),
+            Some(changed.chars().filter(|ch| !ch.is_whitespace()).collect()),
+            "fixture must expose the changed composer before commit"
+        );
+    }
     make_codex_submit_ready(&mut app, codex_id);
 
     app.flush_pending_codex_peer_messages();
