@@ -4,6 +4,8 @@ pub(crate) const CODEX_APPEND_ENTER_DELAY: Duration = Duration::from_millis(75);
 pub(crate) const CODEX_PEER_NUDGE_COMMIT_DELAY: Duration = Duration::from_millis(1000);
 pub(crate) const CODEX_PEER_NUDGE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const CODEX_PEER_NUDGE_MAX_RETRIES: u8 = 1;
+static CODEX_PEER_DEBUG_RECORD_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 // A 1.5-second grace period spans many 30-fps redraws, so transient partial
 // frames can settle while a genuinely stalled delivery still becomes visible.
 pub(crate) const CODEX_PEER_DRAFT_STALL_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -77,6 +79,8 @@ pub(crate) enum PendingCodexPeerDelivery {
         expires_at: Instant,
         message: PendingCodexPeerMessage,
         expected_composer: String,
+        expected_composer_raw: Option<String>,
+        delivery_sequence: Option<u64>,
         retries_remaining: u8,
     },
     AwaitFocus(PendingCodexPeerMessage, u8),
@@ -520,12 +524,17 @@ fn instant_offset_millis(now: Instant, target: Instant) -> i128 {
 
 struct CodexPeerQueueDecision<'a> {
     pane_id: usize,
+    delivery_sequence: Option<u64>,
     now: Instant,
     ready_at: Instant,
     expires_at: Instant,
     expected_composer: &'a str,
+    expected_composer_raw: Option<&'a str>,
     screen: Option<&'a CodexPeerScreenSnapshot>,
-    composer_matches: bool,
+    composer_matches: Option<bool>,
+    retries_remaining: u8,
+    queue_entries_total: usize,
+    other_queue_entries: usize,
     action: &'a str,
 }
 
@@ -534,14 +543,21 @@ fn log_codex_peer_queue_decision(path: &std::ffi::OsStr, decision: CodexPeerQueu
 
     let CodexPeerQueueDecision {
         pane_id,
+        delivery_sequence,
         now,
         ready_at,
         expires_at,
         expected_composer,
+        expected_composer_raw,
         screen,
         composer_matches,
+        retries_remaining,
+        queue_entries_total,
+        other_queue_entries,
         action,
     } = decision;
+    let record_sequence =
+        CODEX_PEER_DEBUG_RECORD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let timestamp_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis());
@@ -556,11 +572,18 @@ fn log_codex_peer_queue_decision(path: &std::ffi::OsStr, decision: CodexPeerQueu
     let record = serde_json::json!({
         "timestamp_unix_ms": timestamp_unix_ms,
         "process_id": std::process::id(),
+        "record_sequence": record_sequence,
         "pane_id": pane_id,
+        "delivery_sequence": delivery_sequence,
         "composer_matches": composer_matches,
+        "retries_remaining": retries_remaining,
         "expected_composer": expected_composer,
+        "expected_composer_raw": expected_composer_raw,
         "screen_composer": screen.and_then(|state| state.composer.as_deref()),
         "screen_composer_raw": debug.and_then(|state| state.composer_raw.as_deref()),
+        "has_draft": screen.and_then(|state| state.has_draft),
+        "ready_for_nudge": screen.map(|state| state.ready_for_nudge),
+        "can_queue_message": screen.map(|state| state.can_queue_message),
         "hide_cursor": screen.map(|state| state.hide_cursor),
         "native_queue_busy": screen.map(|state| state.native_queue_busy),
         "busy_queue_available": screen.map(|state| state.busy_queue_available),
@@ -570,6 +593,8 @@ fn log_codex_peer_queue_decision(path: &std::ffi::OsStr, decision: CodexPeerQueu
         "timing": timing,
         "now_minus_ready_at_ms": instant_offset_millis(now, ready_at),
         "now_minus_expires_at_ms": instant_offset_millis(now, expires_at),
+        "queue_entries_total": queue_entries_total,
+        "other_queue_entries": other_queue_entries,
         "action": action,
     });
     let Ok(mut line) = serde_json::to_vec(&record) else {
@@ -1104,6 +1129,7 @@ impl App {
         self.materialize_unfocused_codex_peer_notification();
         let now = Instant::now();
         let codex_peer_debug_log_path = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+        let codex_peer_delivery_sequences = &mut self.codex_peer_delivery_sequences;
         let mut empty_panes = Vec::new();
         let mut focused_notifications = Vec::new();
         let active_tab = self.active_tab;
@@ -1157,16 +1183,52 @@ impl App {
                                 )
                                 .expect("codex peer draft payload");
                                 if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
+                                    let ready_at = now + CODEX_PEER_NUDGE_COMMIT_DELAY;
+                                    let expires_at = now + CODEX_PEER_NUDGE_COMMIT_TIMEOUT;
+                                    let expected_composer =
+                                        normalize_codex_composer_expected(&payload_text);
+                                    let delivery_sequence =
+                                        codex_peer_debug_log_path.as_ref().map(|_| {
+                                            let sequence = codex_peer_delivery_sequences
+                                                .entry(pane_id)
+                                                .or_default();
+                                            *sequence = sequence.saturating_add(1);
+                                            *sequence
+                                        });
+                                    if let Some(path) = codex_peer_debug_log_path.as_deref() {
+                                        let queue_entries_total = queue.len();
+                                        log_codex_peer_queue_decision(
+                                            path,
+                                            CodexPeerQueueDecision {
+                                                pane_id,
+                                                delivery_sequence,
+                                                now,
+                                                ready_at,
+                                                expires_at,
+                                                expected_composer: &expected_composer,
+                                                expected_composer_raw: Some(&payload_text),
+                                                screen: screen.as_ref(),
+                                                composer_matches: None,
+                                                retries_remaining,
+                                                queue_entries_total,
+                                                other_queue_entries: queue_entries_total
+                                                    .saturating_sub(1),
+                                                action: "draft_write_succeeded_queue_at_created",
+                                            },
+                                        );
+                                    }
                                     queue.pop_front();
                                     queue.push_front(PendingCodexPeerDelivery::QueueAt {
                                         // Keep the commit key in a later PTY write so Codex
                                         // does not interpret text plus Tab/Enter as a paste.
-                                        ready_at: now + CODEX_PEER_NUDGE_COMMIT_DELAY,
-                                        expires_at: now + CODEX_PEER_NUDGE_COMMIT_TIMEOUT,
+                                        ready_at,
+                                        expires_at,
                                         message,
-                                        expected_composer: normalize_codex_composer_expected(
-                                            &payload_text,
-                                        ),
+                                        expected_composer,
+                                        expected_composer_raw: codex_peer_debug_log_path
+                                            .as_ref()
+                                            .map(|_| payload_text),
+                                        delivery_sequence,
                                         retries_remaining,
                                     });
                                     self.dirty = true;
@@ -1236,23 +1298,32 @@ impl App {
                             expires_at,
                             message,
                             expected_composer,
+                            expected_composer_raw,
+                            delivery_sequence,
                             retries_remaining,
                         } => {
                             let composer_matches =
                                 screen.as_ref().and_then(|state| state.composer.as_ref())
                                     == Some(&expected_composer);
+                            let queue_entries_total = queue.len();
                             let log_decision = |action| {
                                 if let Some(path) = codex_peer_debug_log_path.as_deref() {
                                     log_codex_peer_queue_decision(
                                         path,
                                         CodexPeerQueueDecision {
                                             pane_id,
+                                            delivery_sequence,
                                             now,
                                             ready_at,
                                             expires_at,
                                             expected_composer: &expected_composer,
+                                            expected_composer_raw: expected_composer_raw.as_deref(),
                                             screen: screen.as_ref(),
-                                            composer_matches,
+                                            composer_matches: Some(composer_matches),
+                                            retries_remaining,
+                                            queue_entries_total,
+                                            other_queue_entries: queue_entries_total
+                                                .saturating_sub(1),
                                             action,
                                         },
                                     );

@@ -274,6 +274,10 @@ pub struct App {
     /// One-shot nudges waiting to be injected into Codex panes so the
     /// pane runs `check_messages` once it looks ready for PTY input.
     pub(crate) pending_codex_peer_messages: HashMap<usize, VecDeque<PendingCodexPeerDelivery>>,
+    /// Per-pane sequence assigned to Codex peer nudges when their draft text
+    /// is successfully written. Used only by opt-in diagnostics to correlate
+    /// the injection snapshot with every later QueueAt observation.
+    pub(crate) codex_peer_delivery_sequences: HashMap<usize, u64>,
     /// Focused Codex panes show a local notification overlay instead
     /// of receiving an immediate PTY nudge.
     pub(crate) codex_peer_notification: Option<CodexPeerNotificationState>,
