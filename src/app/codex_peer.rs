@@ -68,7 +68,10 @@ pub(crate) enum PendingCodexPeerDelivery {
         retries_remaining: u8,
         stalled_since: Instant,
     },
-    SubmitAt(Instant),
+    SubmitAt {
+        ready_at: Instant,
+        expected_composer: String,
+    },
     QueueAt {
         ready_at: Instant,
         expires_at: Instant,
@@ -738,12 +741,9 @@ impl App {
             self.push_pending_codex_peer_nudge(pane_id, message);
             return Ok(());
         }
-        let payload = crate::mcp_peer::build_send_keys_payload(
-            &format_codex_peer_message(&message),
-            None,
-            false,
-        )
-        .expect("codex peer draft payload");
+        let payload_text = format_codex_peer_message(&message);
+        let payload = crate::mcp_peer::build_send_keys_payload(&payload_text, None, false)
+            .expect("codex peer draft payload");
         let pane =
             self.ws_mut().panes.get_mut(&pane_id).ok_or_else(|| {
                 ipc::CodedError::new(ipc::err_code::PANE_VANISHED, "pane vanished")
@@ -751,9 +751,10 @@ impl App {
         write_input_to_pane(pane, payload.as_bytes(), false)?;
         let queue = self.pending_codex_peer_messages.entry(pane_id).or_default();
         queue.clear();
-        queue.push_back(PendingCodexPeerDelivery::SubmitAt(
-            Instant::now() + CODEX_PEER_NUDGE_COMMIT_DELAY,
-        ));
+        queue.push_back(PendingCodexPeerDelivery::SubmitAt {
+            ready_at: Instant::now() + CODEX_PEER_NUDGE_COMMIT_DELAY,
+            expected_composer: normalize_codex_composer_expected(&payload_text),
+        });
         self.codex_peer_notification = None;
         self.dirty = true;
         Ok(())
@@ -839,20 +840,37 @@ impl App {
         if !self.codex_peer_notification_is_visible() {
             return Ok(false);
         }
-        let payload = crate::mcp_peer::build_send_keys_payload(
-            &format_codex_peer_message(&notification.message),
-            None,
-            false,
-        )
-        .expect("codex peer notification payload");
+        // Accept is deliberately unavailable while a draft is present. Writing
+        // the nudge would append it to the draft, and the delayed Enter below
+        // would silently submit both as one user turn. Keep the overlay visible
+        // so the user can send, save, or clear the draft before accepting.
+        let composer_is_empty = self
+            .ws()
+            .panes
+            .get(&notification.target_pane)
+            .and_then(codex_composer_has_draft)
+            == Some(false);
+        if !composer_is_empty {
+            return Ok(true);
+        }
+        let payload_text = format_codex_peer_message(&notification.message);
+        let payload = crate::mcp_peer::build_send_keys_payload(&payload_text, None, false)
+            .expect("codex peer notification payload");
         let pane = self
             .ws_mut()
             .panes
             .get_mut(&notification.target_pane)
             .ok_or_else(|| ipc::CodedError::new(ipc::err_code::PANE_VANISHED, "pane vanished"))?;
         write_input_to_pane(pane, payload.as_bytes(), false)?;
-        self.pending_codex_peer_messages
-            .remove(&notification.target_pane);
+        let queue = self
+            .pending_codex_peer_messages
+            .entry(notification.target_pane)
+            .or_default();
+        queue.clear();
+        queue.push_back(PendingCodexPeerDelivery::SubmitAt {
+            ready_at: Instant::now() + CODEX_PEER_NUDGE_COMMIT_DELAY,
+            expected_composer: normalize_codex_composer_expected(&payload_text),
+        });
         self.codex_peer_notification = None;
         self.dirty = true;
         Ok(true)
@@ -977,9 +995,12 @@ impl App {
                                 .expect("codex peer draft payload");
                                 if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
                                     queue.pop_front();
-                                    queue.push_front(PendingCodexPeerDelivery::SubmitAt(
-                                        now + CODEX_PEER_NUDGE_COMMIT_DELAY,
-                                    ));
+                                    queue.push_front(PendingCodexPeerDelivery::SubmitAt {
+                                        ready_at: now + CODEX_PEER_NUDGE_COMMIT_DELAY,
+                                        expected_composer: normalize_codex_composer_expected(
+                                            &payload_text,
+                                        ),
+                                    });
                                     self.dirty = true;
                                     continue;
                                 }
@@ -1003,8 +1024,17 @@ impl App {
                                 self.dirty = true;
                             }
                         }
-                        PendingCodexPeerDelivery::SubmitAt(ready_at) => {
+                        PendingCodexPeerDelivery::SubmitAt {
+                            ready_at,
+                            expected_composer,
+                        } => {
                             if now < ready_at {
+                                continue;
+                            }
+                            let composer_matches =
+                                screen.as_ref().and_then(|state| state.composer.as_ref())
+                                    == Some(&expected_composer);
+                            if !composer_matches {
                                 continue;
                             }
                             let payload = crate::mcp_peer::build_send_keys_payload("", None, true)

@@ -167,6 +167,12 @@ self.codex_peer_notification = None;
 
 `src/app/tests/codex_peer.rs` に、accept 後にキューへ `SubmitAt` が積まれることと、`CODEX_PEER_NUDGE_COMMIT_DELAY` 経過後の `flush_pending_codex_peer_messages` で `\r` が PTY へ書かれることを検証するケースを追加する。
 
+### renga-19x の実装方針 (2026-08-20)
+
+既存の下書きがある場合は accept を拒否し、通知を表示したままにする。下書きを編集するキーでは従来どおり通知を配送キューへ戻し、ユーザーが下書きを送信・退避・消去して composer が空になると、保留中の nudge を安全に配送する。composer が空の状態で accept した場合は、nudge を書き込み、遅延後に自動送信する。下書きと nudge を連結して送信することはない。
+
+また、すべての `SubmitAt` に書き込み直後の正規化済み composer を `expected_composer` として保持する。遅延中に composer が変化した場合は Enter を送らず、キューを維持する。これにより、accept 後を含むすべての自動送信経路で、ユーザーの追加入力を nudge の一部として黙って送信しない。
+
 ---
 
 ## 3. 問題② — `send_message` の戻り値が受領を保証しない

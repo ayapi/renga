@@ -67,6 +67,34 @@ fn seed_codex_long_busy_composer(app: &mut App, pane_id: usize, text: &str) {
     seed_pane_screen(app, pane_id, screen.as_bytes());
 }
 
+fn seed_codex_idle_composer(app: &mut App, pane_id: usize, text: &str) {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut screen = String::from("\x1b[?25h\x1b[2J");
+    for (index, chunk) in chars.chunks(20).enumerate() {
+        let row = 1 + index;
+        let text = chunk.iter().collect::<String>();
+        let prefix = if index == 0 { "\u{203a} " } else { "  " };
+        screen.push_str(&format!("\x1b[{row};1H{prefix}{text}"));
+    }
+    let blank_row = 1 + chars.chunks(20).len();
+    let footer_row = blank_row + 1;
+    let cursor_row = blank_row - 1;
+    let cursor_col = chars.chunks(20).last().map_or(3, |chunk| chunk.len() + 3);
+    screen.push_str(&format!(
+        "\x1b[{footer_row};1H  gpt-5.6-sol medium \u{b7} cwd\x1b[{cursor_row};{cursor_col}H"
+    ));
+    seed_pane_screen(app, pane_id, screen.as_bytes());
+}
+
+fn seed_expected_codex_peer_composer(app: &mut App, pane_id: usize, from_pane: usize) {
+    let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane,
+        from_name: None,
+        from_kind: None,
+    });
+    seed_codex_idle_composer(app, pane_id, &expected);
+}
+
 fn make_codex_native_queue_ready(app: &mut App, pane_id: usize) {
     let queue = app
         .pending_codex_peer_messages
@@ -75,6 +103,17 @@ fn make_codex_native_queue_ready(app: &mut App, pane_id: usize) {
     match queue.front_mut().expect("pending delivery") {
         PendingCodexPeerDelivery::QueueAt { ready_at, .. } => *ready_at = Instant::now(),
         other => panic!("expected native queue stage, got {other:?}"),
+    }
+}
+
+fn make_codex_submit_ready(app: &mut App, pane_id: usize) {
+    let queue = app
+        .pending_codex_peer_messages
+        .get_mut(&pane_id)
+        .expect("pending nudge");
+    match queue.front_mut().expect("pending delivery") {
+        PendingCodexPeerDelivery::SubmitAt { ready_at, .. } => *ready_at = Instant::now(),
+        other => panic!("expected submit stage, got {other:?}"),
     }
 }
 
@@ -871,9 +910,8 @@ fn handle_peer_send_defers_codex_nudge_while_target_is_focused() {
         Some(1),
         "first unfocused flush should advance the deferred nudge to submit stage"
     );
-    if let Some(queue) = app.pending_codex_peer_messages.get_mut(&sibling_id) {
-        queue[0] = PendingCodexPeerDelivery::SubmitAt(Instant::now());
-    }
+    seed_expected_codex_peer_composer(&mut app, sibling_id, sender_id);
+    make_codex_submit_ready(&mut app, sibling_id);
     app.flush_pending_codex_peer_messages();
     assert!(
         !app.pending_codex_peer_messages.contains_key(&sibling_id),
@@ -969,7 +1007,7 @@ fn focused_codex_notification_esc_dismisses_without_queueing_nudge() {
 }
 
 #[test]
-fn focused_codex_notification_commit_clears_notification() {
+fn focused_codex_notification_accept_with_empty_composer_submits_nudge() {
     let mut app = App::new(40, 80).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
     let sibling_id = app
@@ -995,14 +1033,86 @@ fn focused_codex_notification_commit_clears_notification() {
     )
     .expect("peer send");
 
+    seed_codex_live_ready_placeholder(&mut app, sibling_id);
+    app.ws_mut()
+        .panes
+        .get_mut(&sibling_id)
+        .expect("pane")
+        .clear_test_input();
+
     let commit = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
     let consumed = app.handle_key_event(commit).expect("commit notification");
     assert!(consumed);
     assert!(app.visible_codex_peer_notification().is_none());
-    assert!(
-        !app.pending_codex_peer_messages.contains_key(&sibling_id),
-        "manual insert should consume the focused notification without requeueing"
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&sibling_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
+    ));
+
+    seed_expected_codex_peer_composer(&mut app, sibling_id, sender_id);
+    app.ws_mut()
+        .panes
+        .get_mut(&sibling_id)
+        .expect("pane")
+        .clear_test_input();
+    make_codex_submit_ready(&mut app, sibling_id);
+    app.flush_pending_codex_peer_messages();
+
+    assert_eq!(
+        app.ws().panes.get(&sibling_id).expect("pane").test_input(),
+        b"\r"
     );
+    assert!(!app.pending_codex_peer_messages.contains_key(&sibling_id));
+    app.shutdown();
+}
+
+#[test]
+fn focused_codex_notification_accept_refuses_existing_draft() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
+    app.handle_focus(&ipc::PaneRef::Id(sibling_id))
+        .expect("focus sibling");
+    seed_codex_draft(&mut app, sibling_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "do not send my draft".to_string(),
+    )
+    .expect("peer send");
+    app.ws_mut()
+        .panes
+        .get_mut(&sibling_id)
+        .expect("pane")
+        .clear_test_input();
+
+    let commit = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+    let consumed = app.handle_key_event(commit).expect("refuse notification");
+
+    assert!(consumed);
+    assert!(app.visible_codex_peer_notification().is_some());
+    assert!(app
+        .ws()
+        .panes
+        .get(&sibling_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
+    assert!(!app.pending_codex_peer_messages.contains_key(&sibling_id));
     app.shutdown();
 }
 
@@ -1055,9 +1165,8 @@ fn flush_pending_codex_peer_messages_requires_ready_screen() {
         Some(1),
         "first ready flush should advance to submit stage"
     );
-    if let Some(queue) = app.pending_codex_peer_messages.get_mut(&sibling_id) {
-        queue[0] = PendingCodexPeerDelivery::SubmitAt(Instant::now());
-    }
+    seed_expected_codex_peer_composer(&mut app, sibling_id, sender_id);
+    make_codex_submit_ready(&mut app, sibling_id);
     app.flush_pending_codex_peer_messages();
     assert!(
         !app.pending_codex_peer_messages.contains_key(&sibling_id),
@@ -1101,12 +1210,7 @@ fn flush_pending_codex_peer_messages_waits_for_non_blank_codex_screen() {
         "blank Codex screen should keep the nudge queued"
     );
 
-    {
-        let pane = app.ws_mut().panes.get_mut(&sibling_id).expect("pane");
-        let mut parser = pane.parser.lock().unwrap();
-        parser
-            .process(b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Explain this codebase\n\n  gpt-5.4 high \xC2\xB7 cwd");
-    }
+    seed_codex_live_ready_placeholder(&mut app, sibling_id);
     app.flush_pending_codex_peer_messages();
     assert_eq!(
         app.pending_codex_peer_messages
@@ -1115,9 +1219,8 @@ fn flush_pending_codex_peer_messages_waits_for_non_blank_codex_screen() {
         Some(1),
         "non-blank Codex screen should advance to submit stage first"
     );
-    if let Some(queue) = app.pending_codex_peer_messages.get_mut(&sibling_id) {
-        queue[0] = PendingCodexPeerDelivery::SubmitAt(Instant::now());
-    }
+    seed_expected_codex_peer_composer(&mut app, sibling_id, sender_id);
+    make_codex_submit_ready(&mut app, sibling_id);
     app.flush_pending_codex_peer_messages();
     assert!(
         !app.pending_codex_peer_messages.contains_key(&sibling_id),
@@ -1558,7 +1661,7 @@ fn live_idle_prompt_with_distant_footer_accepts_nudge() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|queue| queue.front()),
-        Some(PendingCodexPeerDelivery::SubmitAt(_))
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
     ));
     assert!(
         !app.ws()
@@ -1637,7 +1740,7 @@ fn indented_empty_composer_accepts_nudge_without_waiting() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|queue| queue.front()),
-        Some(PendingCodexPeerDelivery::SubmitAt(_))
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
     ));
     app.shutdown();
 }
@@ -1708,13 +1811,7 @@ fn flush_pending_codex_peer_messages_does_not_interrupt_existing_codex_draft() {
         "Codex pane with an existing draft should keep the nudge queued"
     );
 
-    {
-        let pane = app.ws_mut().panes.get_mut(&sibling_id).expect("pane");
-        let mut parser = pane.parser.lock().unwrap();
-        parser.process(
-            b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Run /review on my current changes\n\n  gpt-5.4 high \xC2\xB7 cwd\x1b[1;3H",
-        );
-    }
+    seed_codex_live_ready_placeholder(&mut app, sibling_id);
     app.flush_pending_codex_peer_messages();
     assert_eq!(
         app.pending_codex_peer_messages
@@ -1723,9 +1820,8 @@ fn flush_pending_codex_peer_messages_does_not_interrupt_existing_codex_draft() {
         Some(1),
         "placeholder prompt should advance to submit stage once the pane is clean"
     );
-    if let Some(queue) = app.pending_codex_peer_messages.get_mut(&sibling_id) {
-        queue[0] = PendingCodexPeerDelivery::SubmitAt(Instant::now());
-    }
+    seed_expected_codex_peer_composer(&mut app, sibling_id, sender_id);
+    make_codex_submit_ready(&mut app, sibling_id);
     app.flush_pending_codex_peer_messages();
     assert!(
         !app.pending_codex_peer_messages.contains_key(&sibling_id),
@@ -1769,7 +1865,7 @@ fn focused_codex_without_draft_auto_submits_when_ready() {
         .expect("submit should be delayed");
     assert!(matches!(
         queued.front(),
-        Some(PendingCodexPeerDelivery::SubmitAt(_))
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
     ));
     app.shutdown();
 }
@@ -2119,7 +2215,7 @@ fn distant_transcript_interrupt_hint_does_not_mark_prompt_busy() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::SubmitAt(_))
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
     ));
     app.shutdown();
 }
@@ -2230,7 +2326,7 @@ fn unfocused_idle_codex_without_draft_advances_to_submit_stage() {
         app.pending_codex_peer_messages
             .get(&sibling_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::SubmitAt(_))
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
     ));
     app.shutdown();
 }
@@ -2256,7 +2352,7 @@ fn idle_transcript_queue_hint_does_not_select_native_queue() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::SubmitAt(_))
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
     ));
     app.shutdown();
 }
@@ -2298,6 +2394,64 @@ fn native_queue_commit_does_not_send_changed_user_draft() {
             .get(&codex_id)
             .and_then(|q| q.front()),
         Some(PendingCodexPeerDelivery::QueueAt { .. })
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn submit_commit_does_not_send_changed_composer() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(codex_id);
+    app.handle_focus(&ipc::PaneRef::Id(codex_id))
+        .expect("focus codex");
+    seed_codex_live_ready_placeholder(&mut app, codex_id);
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "guard delayed submit".to_string(),
+    )
+    .expect("peer send");
+    let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: None,
+        from_kind: None,
+    });
+    seed_codex_idle_composer(&mut app, codex_id, &format!("{expected}ABC"));
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    make_codex_submit_ready(&mut app, codex_id);
+
+    app.flush_pending_codex_peer_messages();
+
+    assert!(app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
     ));
     app.shutdown();
 }
@@ -2608,7 +2762,7 @@ fn await_focus_nudge_resumes_when_unfocused_pane_becomes_idle() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::SubmitAt(_))
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
     ));
     assert!(!app
         .ws()
@@ -2970,7 +3124,7 @@ fn focused_codex_pending_queue_auto_submits_after_draft_clears_to_unknown_placeh
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::SubmitAt(_))
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
     ));
     app.shutdown();
 }
@@ -3023,7 +3177,7 @@ fn focused_codex_pending_overlay_requeues_when_typing_then_auto_submits_after_dr
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::SubmitAt(_))
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
     ));
     app.shutdown();
 }
@@ -3082,7 +3236,7 @@ fn focus_transition_routes_pending_codex_by_draft_state() {
         app.pending_codex_peer_messages
             .get(&ready_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::SubmitAt(_))
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
     ));
     app.shutdown();
 }

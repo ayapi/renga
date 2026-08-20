@@ -252,12 +252,12 @@ fn render_codex_peer_notification(app: &mut App, frame: &mut Frame, area: Rect) 
         )),
         Line::from(Span::styled(sender, Style::default().fg(TEXT_DIM))),
         Line::from(Span::styled(
-            "Alt+Enter/Ctrl+Enter inserts the check_messages prompt. Press Enter yourself to send it.",
+            "Clear any draft first; the pending nudge sends once the composer is empty.",
             Style::default().fg(TEXT_DIM),
         )),
     ];
     let hint = Line::from(Span::styled(
-        " Alt+Enter/Ctrl+Enter insert nudge · Esc ignore ",
+        " Alt+Enter/Ctrl+Enter send nudge · Esc ignore ",
         Style::default().fg(TEXT_DIM),
     ));
     let block = Block::default()
