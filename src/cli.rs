@@ -504,7 +504,7 @@ impl IpcCommand {
                     role: role_change,
                 })
             }
-            IpcCommand::Events { .. } => Ok(Request::Subscribe),
+            IpcCommand::Events { .. } => Ok(Request::Subscribe { pane_id: None }),
             IpcCommand::Inspect {
                 name,
                 id,
@@ -919,7 +919,10 @@ mod tests {
     fn events_to_request_is_subscribe() {
         let cli = Cli::try_parse_from(["renga", "events", "--count", "3"]).unwrap();
         let req = cli.command.unwrap().to_request().unwrap();
-        assert!(matches!(req, crate::ipc::Request::Subscribe));
+        assert!(matches!(
+            req,
+            crate::ipc::Request::Subscribe { pane_id: None }
+        ));
     }
 
     #[test]

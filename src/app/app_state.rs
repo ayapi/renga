@@ -100,6 +100,10 @@ pub enum AppCommand {
         ready: bool,
         reply: oneshot::Sender<std::result::Result<(), ipc::CodedError>>,
     },
+    /// The IPC server observed the last pane-associated event stream
+    /// terminate. Unlike `PeerSetReady`, this is authoritative server
+    /// state and does not need client-kind metadata or a reply.
+    PeerSubscriberGone { pane_id: usize },
     /// Rename or clear the `name` / `role` of an existing pane. See
     /// [`ipc::Request::SetPaneIdentity`] for the three-state semantics
     /// of each field. Success returns the pane's updated [`PaneInfo`]

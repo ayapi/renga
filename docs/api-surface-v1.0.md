@@ -442,7 +442,7 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | `focus` | `target: PaneRef` | |
 | `close` | `target: PaneRef` | |
 | `new_tab` | `command?`, `id?`, `label?`, `role?`, `cwd?` | |
-| `subscribe` | — | Switches to event-stream mode after ack. |
+| `subscribe` | `pane_id?: usize` | Switches to event-stream mode after ack. Bundled MCP peers identify their pane; generic consumers omit the additively introduced key. |
 | `inspect` | `target: PaneRef`, `lines?`, `include_cursor: bool` (default false) | |
 | `peer_list` | `from_pane: usize` | |
 | `peer_send` | `from_pane: usize`, `target: PaneRef`, `body: string` | Cross-tab silently no-ops (Q5). Ok data is `{ "delivery": "delivered"\|"queued" }`. |
@@ -608,8 +608,8 @@ because downstream is required to read the `[code]` token for branching.
   are unset when absent; keys with a documented default (for example
   `send.append_enter`, `inspect.include_cursor`, and `PaneInfo` geometry) take
   that default when absent; additively introduced keys that an older peer may
-  predate (for example `split.startup_command`, `new_tab.startup_command`, and
-  `peer_send.delivery`) are
+  predate (for example `split.startup_command`, `new_tab.startup_command`,
+  `subscribe.pane_id`, and `peer_send.delivery`) are
   unknown / unverified when absent and must not be interpreted as `false`,
   `null`, or confirmation that no action occurred. If a key qualifies as both
   optional-when-unset and additively introduced, use the conservative latter

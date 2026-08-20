@@ -128,7 +128,14 @@ pub enum Request {
     /// server acknowledges with [`Response::Subscribed`], it emits
     /// [`Event`] JSON Lines until the client disconnects. No further
     /// [`Request`]s are accepted on this connection.
-    Subscribe,
+    Subscribe {
+        /// Pane whose bundled MCP peer owns this subscription. Generic
+        /// event consumers (including `renga events`) omit the key.
+        /// Added after the initial v1 wire contract, so absence means
+        /// the subscriber identity is unknown rather than "not a peer".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<usize>,
+    },
     /// Snapshot the current visible screen of the target pane.
     /// Returns the plain-text contents in row-addressable form so
     /// orchestrators can detect prompts like "Allow this tool use?",
@@ -973,7 +980,17 @@ mod tests {
 
     #[test]
     fn subscribe_request_roundtrips() {
-        assert_eq!(roundtrip(&Request::Subscribe), Request::Subscribe);
+        let request = Request::Subscribe { pane_id: Some(7) };
+        assert_eq!(roundtrip(&request), request);
+    }
+
+    #[test]
+    fn subscribe_request_without_additive_pane_id_stays_compatible() {
+        let parsed: Request = serde_json::from_str(r#"{"cmd":"subscribe"}"#).unwrap();
+        assert_eq!(parsed, Request::Subscribe { pane_id: None });
+
+        let serialized = serde_json::to_value(Request::Subscribe { pane_id: None }).unwrap();
+        assert_eq!(serialized, serde_json::json!({ "cmd": "subscribe" }));
     }
 
     #[test]

@@ -2678,8 +2678,9 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                 let attempt_started = Instant::now();
                 let subscribed = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let subscribed_on_ready = subscribed.clone();
-                let result = client::subscribe_events_with_ready(
+                let result = client::subscribe_peer_events_with_ready(
                 &endpoint_clone,
+                pane_id,
                 || {
                     subscribed_on_ready.store(true, std::sync::atomic::Ordering::Release);
                     register_client_kind(&registration_ctx);

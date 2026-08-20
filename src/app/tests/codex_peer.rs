@@ -3472,6 +3472,23 @@ fn spawned_codex_command_without_peer_registration_reports_queued() {
 }
 
 #[test]
+fn subscriber_gone_revokes_pull_and_push_readiness_without_erasing_kind() {
+    for kind in [PeerClientKind::Claude, PeerClientKind::Codex] {
+        let mut app = App::new(40, 80).expect("App::new");
+        let pane_id = app.ws().focused_pane_id;
+        app.handle_peer_set_ready(pane_id, kind, true)
+            .expect("peer readiness");
+        assert!(app.peer_delivery_ready.contains(&pane_id));
+
+        app.handle_peer_subscriber_gone(pane_id);
+
+        assert!(!app.peer_delivery_ready.contains(&pane_id));
+        assert_eq!(app.peer_client_kinds.get(&pane_id), Some(&kind));
+        app.shutdown();
+    }
+}
+
+#[test]
 fn delivered_duplicate_replays_delivered_after_disconnect() {
     let mut app = App::new(40, 80).expect("App::new");
     let sender_id = app.ws().focused_pane_id;

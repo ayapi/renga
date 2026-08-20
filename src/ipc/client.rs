@@ -109,15 +109,29 @@ pub fn subscribe_events<F>(endpoint: &EndpointName, mut on_event: F) -> Result<(
 where
     F: FnMut(Event) -> bool,
 {
-    subscribe_events_with_ready(endpoint, || {}, &mut on_event)
+    subscribe_events_inner(endpoint, None, || {}, &mut on_event)
 }
 
-/// Like [`subscribe_events`], but invokes `on_ready` after the server
-/// acknowledges the subscription and before any events are read.
-/// The callback may safely publish client readiness: the server has
-/// already installed this subscriber before sending the acknowledgement.
-pub fn subscribe_events_with_ready<R, F>(
+/// Like [`subscribe_events`], but associates the stream with the pane
+/// whose bundled MCP peer owns it and invokes `on_ready` after the server
+/// acknowledges the subscription. The server uses this identity to revoke
+/// delivery readiness when the last stream for the pane dies.
+pub fn subscribe_peer_events_with_ready<R, F>(
     endpoint: &EndpointName,
+    pane_id: usize,
+    on_ready: R,
+    mut on_event: F,
+) -> Result<()>
+where
+    R: FnOnce(),
+    F: FnMut(Event) -> bool,
+{
+    subscribe_events_inner(endpoint, Some(pane_id), on_ready, &mut on_event)
+}
+
+fn subscribe_events_inner<R, F>(
+    endpoint: &EndpointName,
+    pane_id: Option<usize>,
     on_ready: R,
     mut on_event: F,
 ) -> Result<()>
@@ -150,7 +164,7 @@ where
     }
 
     // Switch into event-stream mode.
-    write_request_line(reader.get_mut(), &Request::Subscribe)?;
+    write_request_line(reader.get_mut(), &Request::Subscribe { pane_id })?;
     match read_response_line(&mut reader)? {
         Response::Subscribed => on_ready(),
         Response::Err { message, code } => {

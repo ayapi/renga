@@ -17,10 +17,11 @@
 //!   with a timeout, so an unresponsive App can never hang a worker
 //!   indefinitely.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -47,6 +48,53 @@ pub struct IpcServer {
     /// Signaled once the accept thread returns. Using a channel rather
     /// than `JoinHandle::join` so Drop can wait with a timeout.
     done_rx: Option<mpsc::Receiver<()>>,
+}
+
+#[derive(Default)]
+struct PeerSubscriptionState {
+    counts: HashMap<usize, usize>,
+    /// Panes seen with the additive `subscribe.pane_id` key. A pane not
+    /// in this set may be served by an older peer which predates the key,
+    /// so its readiness requests retain the legacy behavior.
+    managed_panes: HashSet<usize>,
+}
+
+/// Server-owned view of live MCP event streams. Generic subscribers such
+/// as `renga events` never enter this registry.
+#[derive(Clone, Default)]
+struct PeerSubscriptionRegistry {
+    state: Arc<Mutex<PeerSubscriptionState>>,
+}
+
+impl PeerSubscriptionRegistry {
+    fn register(&self, pane_id: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.managed_panes.insert(pane_id);
+        *state.counts.entry(pane_id).or_default() += 1;
+    }
+
+    /// Decrement a pane's stream count and run `on_last` while still
+    /// holding the registry lock. Keeping the zero notification inside
+    /// the lock is what orders it before a later registration and its
+    /// post-ack readiness request.
+    fn unregister_with(&self, pane_id: usize, on_last: impl FnOnce()) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(count) = state.counts.get_mut(&pane_id) else {
+            return;
+        };
+        if *count > 1 {
+            *count -= 1;
+            return;
+        }
+        state.counts.remove(&pane_id);
+        on_last();
+    }
+
+    fn unregister(&self, pane_id: usize, command_tx: &Sender<AppCommand>) {
+        self.unregister_with(pane_id, || {
+            let _ = command_tx.send(AppCommand::PeerSubscriberGone { pane_id });
+        });
+    }
 }
 
 impl Drop for IpcServer {
@@ -109,6 +157,7 @@ impl IpcServer {
         let token_for_thread = session_token.clone();
         let endpoint_for_log = endpoint.as_str().to_string();
         let (done_tx, done_rx) = mpsc::channel();
+        let peer_subscriptions = PeerSubscriptionRegistry::default();
         thread::Builder::new()
             .name("renga-ipc-accept".into())
             .spawn(move || {
@@ -119,6 +168,7 @@ impl IpcServer {
                     endpoint_for_log,
                     stop_for_thread,
                     event_bus,
+                    peer_subscriptions,
                 );
                 // Signal Drop that the accept loop has returned. If the
                 // receiver is already gone (Drop finished first because
@@ -170,6 +220,7 @@ fn accept_loop(
     endpoint_for_log: String,
     stop: Arc<AtomicBool>,
     event_bus: EventBus,
+    peer_subscriptions: PeerSubscriptionRegistry,
 ) {
     for conn in listener.incoming() {
         // The self-connect triggered by IpcServer::drop returns here;
@@ -195,10 +246,11 @@ fn accept_loop(
         let tx = command_tx.clone();
         let token = session_token.clone();
         let bus = event_bus.clone();
+        let subscriptions = peer_subscriptions.clone();
         if let Err(e) = thread::Builder::new()
             .name("renga-ipc-worker".into())
             .spawn(move || {
-                if let Err(e) = handle_connection(conn, tx, &token, bus) {
+                if let Err(e) = handle_connection(conn, tx, &token, bus, subscriptions) {
                     eprintln!("renga IPC: connection error: {e}");
                 }
             })
@@ -218,6 +270,7 @@ fn handle_connection(
     command_tx: Sender<AppCommand>,
     session_token: &str,
     event_bus: EventBus,
+    peer_subscriptions: PeerSubscriptionRegistry,
 ) -> Result<()> {
     // The stream is split by wrapping in BufReader for line-buffered
     // reads; writes go through BufReader::get_mut. We can't construct
@@ -269,23 +322,51 @@ fn handle_connection(
             );
         }
     };
-    if matches!(req, Request::Subscribe) {
-        // Register the subscriber *before* acking so no event emitted
-        // after `Response::Subscribed` hits the wire can be lost
-        // between the ack and `EventBus::subscribe`. The contract is
-        // "any event that occurs after the client sees Subscribed is
-        // observable", which requires the registration to happen
-        // first.
-        let (sub_id, rx) = event_bus.subscribe();
-        if let Err(e) = write_response_line(reader.get_mut(), &Response::Subscribed) {
-            event_bus.unsubscribe(sub_id);
-            return Err(e);
+    let req = match req {
+        Request::Subscribe { pane_id } => {
+            let (sub_id, rx) = begin_subscription(
+                reader.get_mut(),
+                &event_bus,
+                pane_id,
+                &peer_subscriptions,
+                &command_tx,
+            )?;
+            return stream_events(
+                reader.into_inner(),
+                event_bus,
+                sub_id,
+                rx,
+                pane_id,
+                peer_subscriptions,
+                command_tx,
+            );
         }
-        return stream_events(reader.into_inner(), event_bus, sub_id, rx);
-    }
-    let resp = dispatch_request(req, &command_tx);
+        other => other,
+    };
+    let resp = dispatch_request_with_registry(req, &command_tx, Some(&peer_subscriptions));
     write_response_line(reader.get_mut(), &resp)?;
     Ok(())
+}
+
+fn begin_subscription<W: Write>(
+    sink: &mut W,
+    event_bus: &EventBus,
+    pane_id: Option<usize>,
+    peer_subscriptions: &PeerSubscriptionRegistry,
+    command_tx: &Sender<AppCommand>,
+) -> Result<(super::events::SubId, std::sync::mpsc::Receiver<Event>)> {
+    // Both registrations happen before the ack. Consequently an MCP
+    // client's on_ready callback can only publish true while its pane
+    // count is already non-zero.
+    let (sub_id, rx) = event_bus.subscribe();
+    if let Some(pane_id) = pane_id {
+        peer_subscriptions.register(pane_id);
+    }
+    if let Err(e) = write_response_line(sink, &Response::Subscribed) {
+        end_subscription(event_bus, sub_id, pane_id, peer_subscriptions, command_tx);
+        return Err(e);
+    }
+    Ok((sub_id, rx))
 }
 
 /// Drain events from the bus into the wire until the connection dies
@@ -306,10 +387,32 @@ fn stream_events(
     event_bus: EventBus,
     sub_id: super::events::SubId,
     rx: std::sync::mpsc::Receiver<super::Event>,
+    pane_id: Option<usize>,
+    peer_subscriptions: PeerSubscriptionRegistry,
+    command_tx: Sender<AppCommand>,
 ) -> Result<()> {
     stream_events_inner(conn, rx, HEARTBEAT_INTERVAL);
-    event_bus.unsubscribe(sub_id);
+    end_subscription(
+        &event_bus,
+        sub_id,
+        pane_id,
+        &peer_subscriptions,
+        &command_tx,
+    );
     Ok(())
+}
+
+fn end_subscription(
+    event_bus: &EventBus,
+    sub_id: super::events::SubId,
+    pane_id: Option<usize>,
+    peer_subscriptions: &PeerSubscriptionRegistry,
+    command_tx: &Sender<AppCommand>,
+) {
+    event_bus.unsubscribe(sub_id);
+    if let Some(pane_id) = pane_id {
+        peer_subscriptions.unregister(pane_id, command_tx);
+    }
 }
 
 /// Inner loop split out so tests can drive it with a `Vec<u8>` sink
@@ -365,7 +468,16 @@ fn write_response_line<W: Write>(w: &mut W, resp: &Response) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn dispatch_request(req: Request, command_tx: &Sender<AppCommand>) -> Response {
+    dispatch_request_with_registry(req, command_tx, None)
+}
+
+fn dispatch_request_with_registry(
+    req: Request,
+    command_tx: &Sender<AppCommand>,
+    peer_subscriptions: Option<&PeerSubscriptionRegistry>,
+) -> Response {
     match req {
         Request::Hello { .. } => {
             Response::err_coded(err_code::PROTOCOL, "unexpected duplicate hello")
@@ -494,7 +606,7 @@ fn dispatch_request(req: Request, command_tx: &Sender<AppCommand>) -> Response {
         // switches the wire into event-stream mode rather than
         // round-tripping through App commands. If we see it here, the
         // handler called us by mistake; refuse rather than hang.
-        Request::Subscribe => {
+        Request::Subscribe { .. } => {
             Response::err_coded(err_code::PROTOCOL, "subscribe should be handled inline")
         }
         Request::Inspect {
@@ -584,12 +696,7 @@ fn dispatch_request(req: Request, command_tx: &Sender<AppCommand>) -> Response {
             pane_id,
             kind,
             ready,
-        } => forward_unit(command_tx, |reply| AppCommand::PeerSetReady {
-            pane_id,
-            kind,
-            ready,
-            reply,
-        }),
+        } => forward_peer_set_ready(command_tx, peer_subscriptions, pane_id, kind, ready),
         Request::SetSummary { from_pane, summary } => {
             let (reply_tx, reply_rx) = oneshot::channel();
             if command_tx
@@ -641,6 +748,52 @@ fn dispatch_request(req: Request, command_tx: &Sender<AppCommand>) -> Response {
                 }
             }
         }
+    }
+}
+
+fn forward_peer_set_ready(
+    command_tx: &Sender<AppCommand>,
+    peer_subscriptions: Option<&PeerSubscriptionRegistry>,
+    pane_id: usize,
+    kind: super::PeerClientKind,
+    ready: bool,
+) -> Response {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let command = AppCommand::PeerSetReady {
+        pane_id,
+        kind,
+        ready,
+        reply: reply_tx,
+    };
+
+    let send_result = if let Some(registry) = peer_subscriptions {
+        let state = registry.state.lock().unwrap_or_else(|p| p.into_inner());
+        let managed = state.managed_panes.contains(&pane_id);
+        let active = state.counts.get(&pane_id).copied().unwrap_or(0) > 0;
+        // Missing subscribe.pane_id means an older peer may own the
+        // stream, so preserve the legacy behavior until the pane has
+        // participated in the managed protocol. For managed panes,
+        // true is valid only while a stream is live. A cooperative
+        // false from an old overlapping process must not clear a newer
+        // live subscription.
+        if managed && ((ready && !active) || (!ready && active)) {
+            return Response::ok_unit();
+        }
+        // Enqueue while the registry lock is held. This serializes the
+        // separate readiness connection with stream registration and
+        // teardown workers.
+        command_tx.send(command)
+    } else {
+        command_tx.send(command)
+    };
+
+    if send_result.is_err() {
+        return Response::err_coded(err_code::SHUTTING_DOWN, "app shutting down");
+    }
+    match reply_rx.recv_timeout(APP_REPLY_TIMEOUT) {
+        Ok(Ok(_)) => Response::ok_unit(),
+        Ok(Err(err)) => err.into_response(),
+        Err(e) => Response::err_coded(err_code::APP_TIMEOUT, format!("app did not respond: {e}")),
     }
 }
 
@@ -910,6 +1063,253 @@ mod tests {
         let bytes = handle.join().unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("\"heartbeat\""), "no heartbeat in {text:?}");
+    }
+
+    #[test]
+    fn peer_subscription_is_registered_before_subscribed_ack() {
+        struct AckObserver {
+            registry: PeerSubscriptionRegistry,
+            pane_id: usize,
+            saw_registered: bool,
+        }
+
+        impl Write for AckObserver {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let state = self
+                    .registry
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                self.saw_registered = state.counts.get(&self.pane_id) == Some(&1);
+                assert!(
+                    self.saw_registered,
+                    "subscribe.pane_id must be counted before the ack is written"
+                );
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let registry = PeerSubscriptionRegistry::default();
+        let event_bus = EventBus::new();
+        let (command_tx, _command_rx) = mpsc::channel();
+        let mut writer = AckObserver {
+            registry: registry.clone(),
+            pane_id: 7,
+            saw_registered: false,
+        };
+
+        let (sub_id, _rx) =
+            begin_subscription(&mut writer, &event_bus, Some(7), &registry, &command_tx).unwrap();
+
+        assert!(writer.saw_registered);
+        end_subscription(&event_bus, sub_id, Some(7), &registry, &command_tx);
+    }
+
+    #[test]
+    fn failed_subscribed_ack_rolls_back_peer_registration() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "subscriber disconnected before ack",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let registry = PeerSubscriptionRegistry::default();
+        let event_bus = EventBus::new();
+        let (command_tx, command_rx) = mpsc::channel();
+
+        assert!(begin_subscription(
+            &mut FailingWriter,
+            &event_bus,
+            Some(17),
+            &registry,
+            &command_tx,
+        )
+        .is_err());
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(AppCommand::PeerSubscriberGone { pane_id: 17 })
+        ));
+        let state = registry.state.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(!state.counts.contains_key(&17));
+    }
+
+    #[test]
+    fn generic_subscription_disconnect_does_not_touch_peer_readiness() {
+        let registry = PeerSubscriptionRegistry::default();
+        let event_bus = EventBus::new();
+        let (command_tx, command_rx) = mpsc::channel();
+        let mut ack = Vec::new();
+        let (sub_id, _rx) =
+            begin_subscription(&mut ack, &event_bus, None, &registry, &command_tx).unwrap();
+
+        end_subscription(&event_bus, sub_id, None, &registry, &command_tx);
+
+        assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn server_teardown_alone_enqueues_peer_gone() {
+        let registry = PeerSubscriptionRegistry::default();
+        let event_bus = EventBus::new();
+        let (command_tx, command_rx) = mpsc::channel();
+        let mut ack = Vec::new();
+        let (sub_id, _rx) =
+            begin_subscription(&mut ack, &event_bus, Some(8), &registry, &command_tx).unwrap();
+
+        // No PeerSetReady(false) is sent: stream teardown is sufficient.
+        end_subscription(&event_bus, sub_id, Some(8), &registry, &command_tx);
+
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(AppCommand::PeerSubscriberGone { pane_id: 8 })
+        ));
+    }
+
+    #[test]
+    fn only_last_peer_subscription_disconnect_enqueues_gone() {
+        let registry = PeerSubscriptionRegistry::default();
+        let (command_tx, command_rx) = mpsc::channel();
+        registry.register(9);
+        registry.register(9);
+
+        registry.unregister(9, &command_tx);
+        assert!(command_rx.try_recv().is_err());
+
+        registry.unregister(9, &command_tx);
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(AppCommand::PeerSubscriberGone { pane_id: 9 })
+        ));
+    }
+
+    #[test]
+    fn zero_notification_precedes_new_ack_and_ready() {
+        let registry = PeerSubscriptionRegistry::default();
+        registry.register(11);
+        let (command_tx, command_rx) = mpsc::channel();
+        let (inside_tx, inside_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let old_registry = registry.clone();
+        let old_command_tx = command_tx.clone();
+        let old = thread::spawn(move || {
+            old_registry.unregister_with(11, || {
+                inside_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                old_command_tx
+                    .send(AppCommand::PeerSubscriberGone { pane_id: 11 })
+                    .unwrap();
+            });
+        });
+        inside_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let new_registry = registry.clone();
+        let (acked_tx, acked_rx) = mpsc::channel();
+        let (attempted_tx, attempted_rx) = mpsc::channel();
+        let new = thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            new_registry.register(11);
+            // Models the Subscribed ack: production also sends it only
+            // after register returns.
+            acked_tx.send(()).unwrap();
+        });
+        attempted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            acked_rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "new subscription must wait until zero notification is enqueued"
+        );
+
+        release_tx.send(()).unwrap();
+        old.join().unwrap();
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(AppCommand::PeerSubscriberGone { pane_id: 11 })
+        ));
+        acked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        new.join().unwrap();
+
+        let responder = thread::spawn(move || match command_rx.recv().unwrap() {
+            AppCommand::PeerSetReady {
+                pane_id,
+                ready,
+                reply,
+                ..
+            } => {
+                assert_eq!(pane_id, 11);
+                assert!(ready);
+                reply.send(Ok(())).unwrap();
+            }
+            other => panic!("expected readiness after gone, got {other:?}"),
+        });
+        let response = dispatch_request_with_registry(
+            Request::PeerSetReady {
+                pane_id: 11,
+                kind: super::super::PeerClientKind::Claude,
+                ready: true,
+            },
+            &command_tx,
+            Some(&registry),
+        );
+        assert!(matches!(response, Response::Ok { .. }));
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn late_ready_after_server_observed_disconnect_is_rejected() {
+        let registry = PeerSubscriptionRegistry::default();
+        let (command_tx, command_rx) = mpsc::channel();
+        registry.register(13);
+        registry.unregister(13, &command_tx);
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(AppCommand::PeerSubscriberGone { pane_id: 13 })
+        ));
+
+        let response = dispatch_request_with_registry(
+            Request::PeerSetReady {
+                pane_id: 13,
+                kind: super::super::PeerClientKind::Codex,
+                ready: true,
+            },
+            &command_tx,
+            Some(&registry),
+        );
+
+        assert!(matches!(response, Response::Ok { .. }));
+        assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn cooperative_false_does_not_clear_overlapping_live_subscription() {
+        let registry = PeerSubscriptionRegistry::default();
+        let (command_tx, command_rx) = mpsc::channel();
+        registry.register(15);
+
+        let response = dispatch_request_with_registry(
+            Request::PeerSetReady {
+                pane_id: 15,
+                kind: super::super::PeerClientKind::Claude,
+                ready: false,
+            },
+            &command_tx,
+            Some(&registry),
+        );
+
+        assert!(matches!(response, Response::Ok { .. }));
+        assert!(command_rx.try_recv().is_err());
     }
 
     #[test]

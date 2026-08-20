@@ -669,6 +669,14 @@ impl App {
         Ok(())
     }
 
+    /// Revoke delivery readiness after the IPC server observes that the
+    /// pane's last identified event stream has ended. Client kind is
+    /// intentionally irrelevant: pull and push subscribers share the
+    /// same transport-liveness requirement.
+    pub(crate) fn handle_peer_subscriber_gone(&mut self, pane_id: usize) {
+        self.peer_delivery_ready.remove(&pane_id);
+    }
+
     fn push_pending_codex_peer_nudge(&mut self, pane_id: usize, message: PendingCodexPeerMessage) {
         self.push_pending_codex_peer_nudge_with_retries(
             pane_id,
