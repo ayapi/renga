@@ -88,8 +88,18 @@ struct CodexPeerScreenSnapshot {
     composer: Option<String>,
     ready_for_nudge: bool,
     can_queue_message: bool,
+    hide_cursor: bool,
+    native_queue_busy: bool,
     busy_queue_available: bool,
     can_submit_injected_message: bool,
+    debug: Option<CodexPeerDebugScreenSnapshot>,
+}
+
+#[derive(Debug)]
+struct CodexPeerDebugScreenSnapshot {
+    composer_raw: Option<String>,
+    status_raw: String,
+    footer_raw: String,
 }
 
 #[cfg(test)]
@@ -303,6 +313,38 @@ pub(crate) fn codex_composer_has_draft_on_screen(screen: &vt100::Screen) -> Opti
     Some(has_normal_input_text)
 }
 
+fn raw_codex_composer_text(screen: &vt100::Screen) -> Option<String> {
+    let (rows, cols) = screen.size();
+    let (prompt_row, prompt_col) = codex_live_composer_position(screen)?;
+    let input_start = prompt_col.saturating_add(1);
+    let editable_start = if screen
+        .cell(prompt_row, input_start)
+        .is_some_and(|cell| cell.contents().trim().is_empty())
+    {
+        input_start.saturating_add(1)
+    } else {
+        input_start
+    };
+    let mut text = String::new();
+    for row in prompt_row..rows {
+        let col_start = if row == prompt_row { editable_start } else { 0 };
+        let mut line = String::new();
+        for col in col_start..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                line.push_str(cell.contents());
+            }
+        }
+        if row > prompt_row && line.trim().is_empty() {
+            break;
+        }
+        if row > prompt_row {
+            text.push('\n');
+        }
+        text.push_str(&line);
+    }
+    Some(text)
+}
+
 pub(crate) fn normalized_codex_composer_text(screen: &vt100::Screen) -> Option<String> {
     let (rows, cols) = screen.size();
     let (prompt_row, prompt_col) = codex_live_composer_position(screen)?;
@@ -359,9 +401,37 @@ fn normalized_screen_rows(screen: &vt100::Screen, start: u16, end: u16) -> Strin
         .join("\n")
 }
 
-fn analyze_codex_peer_screen(screen: &vt100::Screen) -> CodexPeerScreenSnapshot {
+fn raw_screen_rows(screen: &vt100::Screen, start: u16, end: u16) -> String {
+    let (_, cols) = screen.size();
+    (start..end)
+        .map(|row| {
+            let mut text = String::new();
+            for col in 0..cols {
+                if let Some(cell) = screen.cell(row, col) {
+                    text.push_str(cell.contents());
+                }
+            }
+            text
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn analyze_codex_peer_screen(
+    screen: &vt100::Screen,
+    capture_debug: bool,
+) -> CodexPeerScreenSnapshot {
     let has_draft = codex_composer_has_draft_on_screen(screen);
-    let composer = normalized_codex_composer_text(screen);
+    let composer_raw = capture_debug
+        .then(|| raw_codex_composer_text(screen))
+        .flatten();
+    let composer = if capture_debug {
+        composer_raw
+            .as_deref()
+            .map(normalize_codex_composer_expected)
+    } else {
+        normalized_codex_composer_text(screen)
+    };
     let (rows, _) = screen.size();
     let prompt_row = codex_live_composer_position(screen).map(|(row, _)| row);
     let (status, footer) = prompt_row.map_or_else(
@@ -381,6 +451,21 @@ fn analyze_codex_peer_screen(screen: &vt100::Screen) -> CodexPeerScreenSnapshot 
             )
         },
     );
+    let (status_raw, footer_raw) = if capture_debug {
+        prompt_row.map_or_else(
+            || (String::new(), String::new()),
+            |prompt_row| {
+                let status_start = prompt_row.saturating_sub(4);
+                let footer_end = prompt_row.saturating_add(8).min(rows);
+                (
+                    raw_screen_rows(screen, status_start, prompt_row),
+                    raw_screen_rows(screen, prompt_row.saturating_add(1), footer_end),
+                )
+            },
+        )
+    } else {
+        (String::new(), String::new())
+    };
     // Positive detection controls whether renga may inject and press Tab, so
     // anchor the busy signal above the composer and the queue action below it.
     // Transcript mentions and unknown future UI safely remain pending.
@@ -413,8 +498,90 @@ fn analyze_codex_peer_screen(screen: &vt100::Screen) -> CodexPeerScreenSnapshot 
         composer,
         ready_for_nudge,
         can_queue_message,
+        hide_cursor: screen.hide_cursor(),
+        native_queue_busy,
         busy_queue_available,
         can_submit_injected_message,
+        debug: capture_debug.then_some(CodexPeerDebugScreenSnapshot {
+            composer_raw,
+            status_raw,
+            footer_raw,
+        }),
+    }
+}
+
+fn instant_offset_millis(now: Instant, target: Instant) -> i128 {
+    if now >= target {
+        now.duration_since(target).as_millis() as i128
+    } else {
+        -(target.duration_since(now).as_millis() as i128)
+    }
+}
+
+struct CodexPeerQueueDecision<'a> {
+    pane_id: usize,
+    now: Instant,
+    ready_at: Instant,
+    expires_at: Instant,
+    expected_composer: &'a str,
+    screen: Option<&'a CodexPeerScreenSnapshot>,
+    composer_matches: bool,
+    action: &'a str,
+}
+
+fn log_codex_peer_queue_decision(path: &std::ffi::OsStr, decision: CodexPeerQueueDecision<'_>) {
+    use std::io::Write;
+
+    let CodexPeerQueueDecision {
+        pane_id,
+        now,
+        ready_at,
+        expires_at,
+        expected_composer,
+        screen,
+        composer_matches,
+        action,
+    } = decision;
+    let timestamp_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let timing = if now >= expires_at {
+        "expired"
+    } else if now < ready_at {
+        "waiting_ready_at"
+    } else {
+        "ready_before_expiry"
+    };
+    let debug = screen.and_then(|state| state.debug.as_ref());
+    let record = serde_json::json!({
+        "timestamp_unix_ms": timestamp_unix_ms,
+        "process_id": std::process::id(),
+        "pane_id": pane_id,
+        "composer_matches": composer_matches,
+        "expected_composer": expected_composer,
+        "screen_composer": screen.and_then(|state| state.composer.as_deref()),
+        "screen_composer_raw": debug.and_then(|state| state.composer_raw.as_deref()),
+        "hide_cursor": screen.map(|state| state.hide_cursor),
+        "native_queue_busy": screen.map(|state| state.native_queue_busy),
+        "busy_queue_available": screen.map(|state| state.busy_queue_available),
+        "can_submit_injected_message": screen.map(|state| state.can_submit_injected_message),
+        "footer_raw": debug.map(|state| state.footer_raw.as_str()),
+        "status_raw": debug.map(|state| state.status_raw.as_str()),
+        "timing": timing,
+        "now_minus_ready_at_ms": instant_offset_millis(now, ready_at),
+        "now_minus_expires_at_ms": instant_offset_millis(now, expires_at),
+        "action": action,
+    });
+    let Ok(mut line) = serde_json::to_vec(&record) else {
+        return;
+    };
+    line.push(b'\n');
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::PathBuf::from(path))
+    {
+        let _ = file.write_all(&line);
     }
 }
 
@@ -916,12 +1083,13 @@ impl App {
         let Ok(parser) = pane.parser.lock() else {
             return false;
         };
-        analyze_codex_peer_screen(parser.screen()).ready_for_nudge
+        analyze_codex_peer_screen(parser.screen(), false).ready_for_nudge
     }
 
     fn codex_peer_screen_snapshot(
         registered_codex: bool,
         pane: &Pane,
+        capture_debug: bool,
     ) -> Option<CodexPeerScreenSnapshot> {
         if !registered_codex && !pane.is_codex_running() {
             return None;
@@ -929,12 +1097,13 @@ impl App {
         let Ok(parser) = pane.parser.lock() else {
             return None;
         };
-        Some(analyze_codex_peer_screen(parser.screen()))
+        Some(analyze_codex_peer_screen(parser.screen(), capture_debug))
     }
 
     pub(crate) fn flush_pending_codex_peer_messages(&mut self) {
         self.materialize_unfocused_codex_peer_notification();
         let now = Instant::now();
+        let codex_peer_debug_log_path = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
         let mut empty_panes = Vec::new();
         let mut focused_notifications = Vec::new();
         let active_tab = self.active_tab;
@@ -954,7 +1123,11 @@ impl App {
                 if let Some(pane) = ws.panes.get_mut(&pane_id) {
                     let registered_codex =
                         self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex);
-                    let screen = Self::codex_peer_screen_snapshot(registered_codex, pane);
+                    let screen = Self::codex_peer_screen_snapshot(
+                        registered_codex,
+                        pane,
+                        codex_peer_debug_log_path.is_some(),
+                    );
                     match delivery {
                         PendingCodexPeerDelivery::Draft {
                             message,
@@ -1068,9 +1241,29 @@ impl App {
                             let composer_matches =
                                 screen.as_ref().and_then(|state| state.composer.as_ref())
                                     == Some(&expected_composer);
+                            let log_decision = |action| {
+                                if let Some(path) = codex_peer_debug_log_path.as_deref() {
+                                    log_codex_peer_queue_decision(
+                                        path,
+                                        CodexPeerQueueDecision {
+                                            pane_id,
+                                            now,
+                                            ready_at,
+                                            expires_at,
+                                            expected_composer: &expected_composer,
+                                            screen: screen.as_ref(),
+                                            composer_matches,
+                                            action,
+                                        },
+                                    );
+                                }
+                            };
                             if pane_is_focused {
                                 if composer_matches {
                                     let _ = write_input_to_pane(pane, b"\x15", false);
+                                    log_decision("focused_cleared_and_notified");
+                                } else {
+                                    log_decision("focused_notified_without_clear");
                                 }
                                 queue.pop_front();
                                 focused_notifications.push((
@@ -1084,6 +1277,9 @@ impl App {
                             if now >= expires_at {
                                 if composer_matches {
                                     let _ = write_input_to_pane(pane, b"\x15", false);
+                                    log_decision("expired_cleared_and_requeued");
+                                } else {
+                                    log_decision("expired_discarded_without_ctrl_u");
                                 }
                                 queue.pop_front();
                                 if retries_remaining > 0 {
@@ -1100,25 +1296,34 @@ impl App {
                                 self.dirty = true;
                                 continue;
                             }
-                            if now < ready_at || !composer_matches {
+                            if now < ready_at {
+                                log_decision("continued_waiting_ready_at");
                                 continue;
                             }
-                            let payload = if screen
+                            if !composer_matches {
+                                log_decision("continued_composer_mismatch");
+                                continue;
+                            }
+                            let (payload, success_action, failure_action) = if screen
                                 .as_ref()
                                 .is_some_and(|state| state.busy_queue_available)
                             {
-                                b"\t".as_slice()
+                                (b"\t".as_slice(), "tab_pressed", "tab_write_failed")
                             } else if screen
                                 .as_ref()
                                 .is_some_and(|state| state.can_submit_injected_message)
                             {
-                                b"\r".as_slice()
+                                (b"\r".as_slice(), "enter_pressed", "enter_write_failed")
                             } else {
+                                log_decision("continued_no_commit_key_available");
                                 continue;
                             };
                             if write_input_to_pane(pane, payload, false).is_ok() {
+                                log_decision(success_action);
                                 queue.pop_front();
                                 self.dirty = true;
+                            } else {
+                                log_decision(failure_action);
                             }
                         }
                         PendingCodexPeerDelivery::AwaitFocus(message, retries_remaining) => {
