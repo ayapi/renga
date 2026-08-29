@@ -45,7 +45,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
 use crate::app::CLAUDE_PEER_LAUNCH_CMD;
-use crate::ipc::endpoint::{endpoint_from_env, EndpointName, ENV_SOCKET};
+use crate::ipc::endpoint::{endpoint_from_env, EndpointName, ENV_SOCKET, ENV_TOKEN};
 use crate::ipc::{
     self, client, Direction, PaneInfo, PaneRef, PeerClientKind, PeerInfo, Request, Response,
 };
@@ -54,6 +54,8 @@ const SERVER_NAME: &str = "renga-peers";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ENV_PANE_ID: &str = "RENGA_PANE_ID";
 pub(crate) const ENV_CLIENT_KIND: &str = "RENGA_PEER_CLIENT_KIND";
+static CLIENT_KIND_DEBUG_RECORD_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 fn log_stderr(msg: &str) {
     eprintln!("[renga-mcp-peer] {msg}");
@@ -255,10 +257,13 @@ impl PeerCtx {
         let events = new_event_sink();
         let inbox = new_inbox_sink();
         let push = Arc::new(Mutex::new(PushState::default()));
-        let client_kind = std::env::var(ENV_CLIENT_KIND)
+        let client_kind_raw = std::env::var(ENV_CLIENT_KIND);
+        let client_kind = client_kind_raw
+            .as_ref()
             .ok()
-            .and_then(|s| parse_client_kind(&s))
+            .and_then(|s| parse_client_kind(s))
             .unwrap_or(PeerClientKind::Claude);
+        log_client_kind_resolution(&client_kind_raw, client_kind);
         let pane_id = match std::env::var(ENV_PANE_ID) {
             Ok(s) => match s.parse::<usize>() {
                 Ok(v) => v,
@@ -314,6 +319,64 @@ fn parse_client_kind(raw: &str) -> Option<PeerClientKind> {
         "claude" => Some(PeerClientKind::Claude),
         "codex" => Some(PeerClientKind::Codex),
         _ => None,
+    }
+}
+
+fn log_client_kind_resolution(
+    client_kind_raw: &std::result::Result<String, std::env::VarError>,
+    client_kind: PeerClientKind,
+) {
+    let Some(path) = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG") else {
+        return;
+    };
+
+    let (client_kind_env_state, client_kind_raw_value, client_kind_raw_is_unicode) =
+        match client_kind_raw {
+            Ok(raw) if parse_client_kind(raw).is_some() => {
+                ("parsed", Some(raw.clone()), Some(true))
+            }
+            Ok(raw) => ("present-but-unparseable", Some(raw.clone()), Some(true)),
+            Err(std::env::VarError::NotPresent) => ("absent", None, None),
+            Err(std::env::VarError::NotUnicode(raw)) => (
+                "present-but-unparseable",
+                Some(format!("{raw:?}")),
+                Some(false),
+            ),
+        };
+    let pane_id_raw = std::env::var(ENV_PANE_ID).ok();
+    let pane_id = pane_id_raw
+        .as_deref()
+        .and_then(|raw| raw.parse::<usize>().ok());
+    let timestamp_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let record_sequence =
+        CLIENT_KIND_DEBUG_RECORD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let record = json!({
+        "timestamp_unix_ms": timestamp_unix_ms,
+        "process_id": std::process::id(),
+        "record_sequence": record_sequence,
+        "action": "client_kind_resolved",
+        "pane_id": pane_id,
+        "renga_peer_client_kind_state": client_kind_env_state,
+        "renga_peer_client_kind_raw": client_kind_raw_value,
+        "renga_peer_client_kind_raw_is_unicode": client_kind_raw_is_unicode,
+        "resolved_client_kind": kind_label(client_kind),
+        "receive_mode": receive_mode_label(client_kind.receive_mode()),
+        "renga_pane_id_present": std::env::var_os(ENV_PANE_ID).is_some(),
+        "renga_socket_present": std::env::var_os(ENV_SOCKET).is_some(),
+        "renga_token_present": std::env::var_os(ENV_TOKEN).is_some(),
+    });
+    let Ok(mut line) = serde_json::to_vec(&record) else {
+        return;
+    };
+    line.push(b'\n');
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::PathBuf::from(path))
+    {
+        let _ = file.write_all(&line);
     }
 }
 
