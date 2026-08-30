@@ -274,10 +274,13 @@ pub struct App {
     /// One-shot nudges waiting to be injected into Codex panes so the
     /// pane runs `check_messages` once it looks ready for PTY input.
     pub(crate) pending_codex_peer_messages: HashMap<usize, VecDeque<PendingCodexPeerDelivery>>,
-    /// Per-pane sequence assigned to Codex peer nudges when their draft text
-    /// is successfully written. Used only by opt-in diagnostics to correlate
-    /// the injection snapshot with every later QueueAt observation.
+    /// Per-pane sequence assigned to Codex peer delivery attempts. Used only
+    /// by opt-in diagnostics to correlate enqueue, injection, and later state
+    /// observations.
     pub(crate) codex_peer_delivery_sequences: HashMap<usize, u64>,
+    /// Last debug-only decision state emitted for each pane. Empty unless
+    /// `RENGA_DEBUG_CODEX_PEER_LOG` is enabled.
+    pub(crate) codex_peer_debug_observations: HashMap<usize, CodexPeerDebugObservation>,
     /// Focused Codex panes show a local notification overlay instead
     /// of receiving an immediate PTY nudge.
     pub(crate) codex_peer_notification: Option<CodexPeerNotificationState>,

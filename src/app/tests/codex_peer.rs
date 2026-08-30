@@ -1515,7 +1515,7 @@ fn persistently_unknown_screen_surfaces_notification_on_focus() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|queue| queue.front()),
-        Some(PendingCodexPeerDelivery::AwaitFocus(_, retries_remaining))
+        Some(PendingCodexPeerDelivery::AwaitFocus { retries_remaining, .. })
             if *retries_remaining == CODEX_PEER_NUDGE_MAX_RETRIES
     ));
     assert!(
@@ -1589,7 +1589,7 @@ fn recognized_unactionable_screen_eventually_surfaces_on_focus() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|queue| queue.front()),
-        Some(PendingCodexPeerDelivery::AwaitFocus(..))
+        Some(PendingCodexPeerDelivery::AwaitFocus { .. })
     ));
     app.handle_focus(&ipc::PaneRef::Id(codex_id))
         .expect("focus stalled Codex pane");
@@ -2785,7 +2785,7 @@ fn native_queue_commit_stops_after_one_retry_and_waits_for_focus() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::AwaitFocus(..))
+        Some(PendingCodexPeerDelivery::AwaitFocus { .. })
     ));
 
     seed_codex_busy_placeholder(&mut app, codex_id);
@@ -2808,7 +2808,7 @@ fn native_queue_commit_stops_after_one_retry_and_waits_for_focus() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::AwaitFocus(..))
+        Some(PendingCodexPeerDelivery::AwaitFocus { .. })
     ));
 
     app.handle_focus(&ipc::PaneRef::Id(codex_id))
@@ -2875,14 +2875,15 @@ fn await_focus_nudge_resumes_when_unfocused_pane_becomes_idle() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     app.pending_codex_peer_messages.insert(
         codex_id,
-        VecDeque::from([PendingCodexPeerDelivery::AwaitFocus(
-            PendingCodexPeerMessage {
+        VecDeque::from([PendingCodexPeerDelivery::AwaitFocus {
+            message: PendingCodexPeerMessage {
                 from_pane: sender_id,
                 from_name: None,
                 from_kind: None,
             },
-            0,
-        )]),
+            retries_remaining: 0,
+            delivery_sequence: None,
+        }]),
     );
     seed_codex_live_ready_placeholder(&mut app, codex_id);
     app.ws_mut()
@@ -2931,14 +2932,15 @@ fn await_focus_resume_preserves_retry_budget() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     app.pending_codex_peer_messages.insert(
         codex_id,
-        VecDeque::from([PendingCodexPeerDelivery::AwaitFocus(
-            PendingCodexPeerMessage {
+        VecDeque::from([PendingCodexPeerDelivery::AwaitFocus {
+            message: PendingCodexPeerMessage {
                 from_pane: sender_id,
                 from_name: None,
                 from_kind: None,
             },
-            CODEX_PEER_NUDGE_MAX_RETRIES,
-        )]),
+            retries_remaining: CODEX_PEER_NUDGE_MAX_RETRIES,
+            delivery_sequence: None,
+        }]),
     );
     seed_codex_live_ready_placeholder(&mut app, codex_id);
 
@@ -2961,14 +2963,15 @@ fn await_focus_nudge_does_not_resume_over_footer_parked_draft() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     app.pending_codex_peer_messages.insert(
         codex_id,
-        VecDeque::from([PendingCodexPeerDelivery::AwaitFocus(
-            PendingCodexPeerMessage {
+        VecDeque::from([PendingCodexPeerDelivery::AwaitFocus {
+            message: PendingCodexPeerMessage {
                 from_pane: sender_id,
                 from_name: None,
                 from_kind: None,
             },
-            0,
-        )]),
+            retries_remaining: 0,
+            delivery_sequence: None,
+        }]),
     );
     seed_pane_screen(
         &mut app,
@@ -2987,7 +2990,7 @@ fn await_focus_nudge_does_not_resume_over_footer_parked_draft() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::AwaitFocus(..))
+        Some(PendingCodexPeerDelivery::AwaitFocus { .. })
     ));
     assert!(app
         .ws()
@@ -3004,14 +3007,15 @@ fn exhausted_notification_stays_parked_after_focus_leaves() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     app.pending_codex_peer_messages.insert(
         codex_id,
-        VecDeque::from([PendingCodexPeerDelivery::AwaitFocus(
-            PendingCodexPeerMessage {
+        VecDeque::from([PendingCodexPeerDelivery::AwaitFocus {
+            message: PendingCodexPeerMessage {
                 from_pane: sender_id,
                 from_name: None,
                 from_kind: None,
             },
-            0,
-        )]),
+            retries_remaining: 0,
+            delivery_sequence: None,
+        }]),
     );
     seed_codex_busy_placeholder(&mut app, codex_id);
     app.ws_mut()
@@ -3035,7 +3039,7 @@ fn exhausted_notification_stays_parked_after_focus_leaves() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::AwaitFocus(..))
+        Some(PendingCodexPeerDelivery::AwaitFocus { .. })
     ));
     assert!(app
         .ws()
@@ -3064,14 +3068,15 @@ fn coalesced_notification_keeps_largest_retry_budget() {
     });
     app.pending_codex_peer_messages.insert(
         codex_id,
-        VecDeque::from([PendingCodexPeerDelivery::AwaitFocus(
-            PendingCodexPeerMessage {
+        VecDeque::from([PendingCodexPeerDelivery::AwaitFocus {
+            message: PendingCodexPeerMessage {
                 from_pane: sender_id,
                 from_name: Some("later".to_string()),
                 from_kind: None,
             },
-            0,
-        )]),
+            retries_remaining: 0,
+            delivery_sequence: None,
+        }]),
     );
 
     app.flush_pending_codex_peer_messages();

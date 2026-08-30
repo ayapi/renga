@@ -141,6 +141,7 @@ impl App {
         self.pending_peer_inbox.clear();
         self.pending_codex_peer_messages.clear();
         self.codex_peer_delivery_sequences.clear();
+        self.codex_peer_debug_observations.clear();
     }
 
     /// Drain any pending IPC commands and dispatch them. Safe to call

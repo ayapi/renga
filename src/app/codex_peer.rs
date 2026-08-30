@@ -69,10 +69,13 @@ pub(crate) enum PendingCodexPeerDelivery {
         message: PendingCodexPeerMessage,
         retries_remaining: u8,
         stalled_since: Instant,
+        delivery_sequence: Option<u64>,
     },
     SubmitAt {
         ready_at: Instant,
         expected_composer: String,
+        expected_composer_raw: Option<String>,
+        delivery_sequence: Option<u64>,
     },
     QueueAt {
         ready_at: Instant,
@@ -83,7 +86,30 @@ pub(crate) enum PendingCodexPeerDelivery {
         delivery_sequence: Option<u64>,
         retries_remaining: u8,
     },
-    AwaitFocus(PendingCodexPeerMessage, u8),
+    AwaitFocus {
+        message: PendingCodexPeerMessage,
+        retries_remaining: u8,
+        delivery_sequence: Option<u64>,
+    },
+}
+
+impl PendingCodexPeerDelivery {
+    fn delivery_sequence(&self) -> Option<u64> {
+        match self {
+            Self::Draft {
+                delivery_sequence, ..
+            }
+            | Self::SubmitAt {
+                delivery_sequence, ..
+            }
+            | Self::QueueAt {
+                delivery_sequence, ..
+            }
+            | Self::AwaitFocus {
+                delivery_sequence, ..
+            } => *delivery_sequence,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -104,6 +130,21 @@ struct CodexPeerDebugScreenSnapshot {
     composer_raw: Option<String>,
     status_raw: String,
     footer_raw: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexPeerDebugObservation {
+    action: &'static str,
+    delivery_sequence: Option<u64>,
+    composer: Option<String>,
+    composer_matches: Option<bool>,
+    has_draft: Option<bool>,
+    ready_for_nudge: Option<bool>,
+    can_queue_message: Option<bool>,
+    hide_cursor: Option<bool>,
+    native_queue_busy: Option<bool>,
+    busy_queue_available: Option<bool>,
+    can_submit_injected_message: Option<bool>,
 }
 
 #[cfg(test)]
@@ -522,26 +563,107 @@ fn instant_offset_millis(now: Instant, target: Instant) -> i128 {
     }
 }
 
-struct CodexPeerQueueDecision<'a> {
+struct CodexPeerDecision<'a> {
     pane_id: usize,
     delivery_sequence: Option<u64>,
     now: Instant,
-    ready_at: Instant,
-    expires_at: Instant,
-    expected_composer: &'a str,
+    ready_at: Option<Instant>,
+    expires_at: Option<Instant>,
+    expected_composer: Option<&'a str>,
     expected_composer_raw: Option<&'a str>,
     screen: Option<&'a CodexPeerScreenSnapshot>,
     composer_matches: Option<bool>,
-    retries_remaining: u8,
+    retries_remaining: Option<u8>,
     queue_entries_total: usize,
     other_queue_entries: usize,
-    action: &'a str,
+    action: &'static str,
 }
 
-fn log_codex_peer_queue_decision(path: &std::ffi::OsStr, decision: CodexPeerQueueDecision<'_>) {
+impl CodexPeerDebugObservation {
+    fn from_decision(decision: &CodexPeerDecision<'_>) -> Self {
+        let screen = decision.screen;
+        Self {
+            action: decision.action,
+            delivery_sequence: decision.delivery_sequence,
+            composer: screen.and_then(|state| state.composer.clone()),
+            composer_matches: decision.composer_matches,
+            has_draft: screen.and_then(|state| state.has_draft),
+            ready_for_nudge: screen.map(|state| state.ready_for_nudge),
+            can_queue_message: screen.map(|state| state.can_queue_message),
+            hide_cursor: screen.map(|state| state.hide_cursor),
+            native_queue_busy: screen.map(|state| state.native_queue_busy),
+            busy_queue_available: screen.map(|state| state.busy_queue_available),
+            can_submit_injected_message: screen.map(|state| state.can_submit_injected_message),
+        }
+    }
+}
+
+fn append_codex_peer_debug_record(path: &std::ffi::OsStr, mut record: serde_json::Value) {
     use std::io::Write;
 
-    let CodexPeerQueueDecision {
+    let record_sequence =
+        CODEX_PEER_DEBUG_RECORD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let timestamp_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    if let Some(object) = record.as_object_mut() {
+        object.insert(
+            "timestamp_unix_ms".to_string(),
+            serde_json::json!(timestamp_unix_ms),
+        );
+        object.insert(
+            "process_id".to_string(),
+            serde_json::json!(std::process::id()),
+        );
+        object.insert(
+            "record_sequence".to_string(),
+            serde_json::json!(record_sequence),
+        );
+    }
+    let Ok(mut line) = serde_json::to_vec(&record) else {
+        return;
+    };
+    line.push(b'\n');
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::PathBuf::from(path))
+    {
+        let _ = file.write_all(&line);
+    }
+}
+
+fn log_codex_peer_kind_update(
+    pane_id: usize,
+    old_kind: Option<PeerClientKind>,
+    new_kind: PeerClientKind,
+    update_path: &'static str,
+) {
+    let Some(path) = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG") else {
+        return;
+    };
+    let kind_label = |kind| match kind {
+        PeerClientKind::Claude => "claude",
+        PeerClientKind::Codex => "codex",
+    };
+    append_codex_peer_debug_record(
+        &path,
+        serde_json::json!({
+            "action": "client_kind_updated",
+            "pane_id": pane_id,
+            "kind_update_path": update_path,
+            "old_client_kind": old_kind.map(kind_label),
+            "new_client_kind": kind_label(new_kind),
+            "receive_mode": match new_kind.receive_mode() {
+                ipc::PeerReceiveMode::Push => "push",
+                ipc::PeerReceiveMode::Pull => "pull",
+            },
+        }),
+    );
+}
+
+fn log_codex_peer_decision(path: &std::ffi::OsStr, decision: CodexPeerDecision<'_>) {
+    let CodexPeerDecision {
         pane_id,
         delivery_sequence,
         now,
@@ -556,58 +678,55 @@ fn log_codex_peer_queue_decision(path: &std::ffi::OsStr, decision: CodexPeerQueu
         other_queue_entries,
         action,
     } = decision;
-    let record_sequence =
-        CODEX_PEER_DEBUG_RECORD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let timestamp_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis());
-    let timing = if now >= expires_at {
-        "expired"
-    } else if now < ready_at {
-        "waiting_ready_at"
-    } else {
-        "ready_before_expiry"
+    let timing = match (ready_at, expires_at) {
+        (_, Some(expires_at)) if now >= expires_at => Some("expired"),
+        (Some(ready_at), _) if now < ready_at => Some("waiting_ready_at"),
+        (Some(_), Some(_)) => Some("ready_before_expiry"),
+        (Some(_), None) => Some("ready"),
+        (None, _) => None,
     };
     let debug = screen.and_then(|state| state.debug.as_ref());
-    let record = serde_json::json!({
-        "timestamp_unix_ms": timestamp_unix_ms,
-        "process_id": std::process::id(),
-        "record_sequence": record_sequence,
-        "pane_id": pane_id,
-        "delivery_sequence": delivery_sequence,
-        "composer_matches": composer_matches,
-        "retries_remaining": retries_remaining,
-        "expected_composer": expected_composer,
-        "expected_composer_raw": expected_composer_raw,
-        "screen_composer": screen.and_then(|state| state.composer.as_deref()),
-        "screen_composer_raw": debug.and_then(|state| state.composer_raw.as_deref()),
-        "has_draft": screen.and_then(|state| state.has_draft),
-        "ready_for_nudge": screen.map(|state| state.ready_for_nudge),
-        "can_queue_message": screen.map(|state| state.can_queue_message),
-        "hide_cursor": screen.map(|state| state.hide_cursor),
-        "native_queue_busy": screen.map(|state| state.native_queue_busy),
-        "busy_queue_available": screen.map(|state| state.busy_queue_available),
-        "can_submit_injected_message": screen.map(|state| state.can_submit_injected_message),
-        "footer_raw": debug.map(|state| state.footer_raw.as_str()),
-        "status_raw": debug.map(|state| state.status_raw.as_str()),
-        "timing": timing,
-        "now_minus_ready_at_ms": instant_offset_millis(now, ready_at),
-        "now_minus_expires_at_ms": instant_offset_millis(now, expires_at),
-        "queue_entries_total": queue_entries_total,
-        "other_queue_entries": other_queue_entries,
-        "action": action,
-    });
-    let Ok(mut line) = serde_json::to_vec(&record) else {
+    append_codex_peer_debug_record(
+        path,
+        serde_json::json!({
+            "pane_id": pane_id,
+            "delivery_sequence": delivery_sequence,
+            "composer_matches": composer_matches,
+            "retries_remaining": retries_remaining,
+            "expected_composer": expected_composer,
+            "expected_composer_raw": expected_composer_raw,
+            "screen_composer": screen.and_then(|state| state.composer.as_deref()),
+            "screen_composer_raw": debug.and_then(|state| state.composer_raw.as_deref()),
+            "has_draft": screen.and_then(|state| state.has_draft),
+            "ready_for_nudge": screen.map(|state| state.ready_for_nudge),
+            "can_queue_message": screen.map(|state| state.can_queue_message),
+            "hide_cursor": screen.map(|state| state.hide_cursor),
+            "native_queue_busy": screen.map(|state| state.native_queue_busy),
+            "busy_queue_available": screen.map(|state| state.busy_queue_available),
+            "can_submit_injected_message": screen.map(|state| state.can_submit_injected_message),
+            "footer_raw": debug.map(|state| state.footer_raw.as_str()),
+            "status_raw": debug.map(|state| state.status_raw.as_str()),
+            "timing": timing,
+            "now_minus_ready_at_ms": ready_at.map(|target| instant_offset_millis(now, target)),
+            "now_minus_expires_at_ms": expires_at.map(|target| instant_offset_millis(now, target)),
+            "queue_entries_total": queue_entries_total,
+            "other_queue_entries": other_queue_entries,
+            "action": action,
+        }),
+    );
+}
+
+fn log_codex_peer_decision_if_changed(
+    path: &std::ffi::OsStr,
+    observations: &mut HashMap<usize, CodexPeerDebugObservation>,
+    decision: CodexPeerDecision<'_>,
+) {
+    let observation = CodexPeerDebugObservation::from_decision(&decision);
+    if observations.get(&decision.pane_id) == Some(&observation) {
         return;
-    };
-    line.push(b'\n');
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(std::path::PathBuf::from(path))
-    {
-        let _ = file.write_all(&line);
     }
+    observations.insert(decision.pane_id, observation);
+    log_codex_peer_decision(path, decision);
 }
 
 fn codex_composer_has_draft(pane: &Pane) -> Option<bool> {
@@ -822,7 +941,8 @@ impl App {
                     format!("pane {pane_id} not found for peer registration"),
                 )
             })?;
-        self.peer_client_kinds.insert(pane_id, kind);
+        let old_kind = self.peer_client_kinds.insert(pane_id, kind);
+        log_codex_peer_kind_update(pane_id, old_kind, kind, "register");
         Ok(())
     }
 
@@ -845,7 +965,8 @@ impl App {
         }
         // Readiness and kind travel atomically so a failed earlier metadata
         // registration cannot suppress Codex nudge setup.
-        self.peer_client_kinds.insert(pane_id, kind);
+        let old_kind = self.peer_client_kinds.insert(pane_id, kind);
+        log_codex_peer_kind_update(pane_id, old_kind, kind, "set_ready");
         self.peer_delivery_ready.insert(pane_id);
         if let Some(messages) = self.pending_peer_inbox.remove(&pane_id) {
             if self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex) {
@@ -889,14 +1010,80 @@ impl App {
         message: PendingCodexPeerMessage,
         retries_remaining: u8,
     ) {
+        let debug_path = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+        let screen = self.codex_peer_debug_screen_snapshot(pane_id, debug_path.is_some());
+        let expected_composer_raw = debug_path
+            .as_ref()
+            .map(|_| format_codex_peer_message(&message));
+        let expected_composer = expected_composer_raw
+            .as_deref()
+            .map(normalize_codex_composer_expected);
+        let queue_was_empty = self
+            .pending_codex_peer_messages
+            .get(&pane_id)
+            .is_none_or(VecDeque::is_empty);
+        let delivery_sequence = if queue_was_empty && debug_path.is_some() {
+            let sequence = self
+                .codex_peer_delivery_sequences
+                .entry(pane_id)
+                .or_default();
+            *sequence = sequence.saturating_add(1);
+            Some(*sequence)
+        } else {
+            self.pending_codex_peer_messages
+                .get(&pane_id)
+                .and_then(|queue| queue.front())
+                .and_then(PendingCodexPeerDelivery::delivery_sequence)
+        };
         let queue = self.pending_codex_peer_messages.entry(pane_id).or_default();
         if queue.is_empty() {
             queue.push_back(PendingCodexPeerDelivery::Draft {
                 message,
                 retries_remaining,
                 stalled_since: Instant::now(),
+                delivery_sequence,
             });
         }
+        let queue_entries_total = queue.len();
+        if let Some(path) = debug_path.as_deref() {
+            log_codex_peer_decision(
+                path,
+                CodexPeerDecision {
+                    pane_id,
+                    delivery_sequence,
+                    now: Instant::now(),
+                    ready_at: None,
+                    expires_at: None,
+                    expected_composer: expected_composer.as_deref(),
+                    expected_composer_raw: expected_composer_raw.as_deref(),
+                    screen: screen.as_ref(),
+                    composer_matches: None,
+                    retries_remaining: Some(retries_remaining),
+                    queue_entries_total,
+                    other_queue_entries: queue_entries_total.saturating_sub(1),
+                    action: if queue_was_empty {
+                        "nudge_enqueued_draft"
+                    } else {
+                        "nudge_arrival_queue_occupied"
+                    },
+                },
+            );
+        }
+    }
+
+    fn codex_peer_debug_screen_snapshot(
+        &self,
+        pane_id: usize,
+        capture_debug: bool,
+    ) -> Option<CodexPeerScreenSnapshot> {
+        if !capture_debug {
+            return None;
+        }
+        let (ws_index, resolved_pane_id) =
+            self.resolve_pane_across_workspaces(&PaneRef::Id(pane_id))?;
+        let registered_codex = self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex);
+        let pane = self.workspaces[ws_index].panes.get(&resolved_pane_id)?;
+        Self::codex_peer_screen_snapshot(registered_codex, pane, true)
     }
 
     fn show_codex_peer_notification(
@@ -947,6 +1134,8 @@ impl App {
             self.push_pending_codex_peer_nudge(pane_id, message);
             return Ok(false);
         }
+        let debug_path = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+        let screen = self.codex_peer_debug_screen_snapshot(pane_id, debug_path.is_some());
         let payload_text = format_codex_peer_message(&message);
         let payload = crate::mcp_peer::build_send_keys_payload(&payload_text, None, false)
             .expect("codex peer draft payload");
@@ -955,12 +1144,45 @@ impl App {
                 ipc::CodedError::new(ipc::err_code::PANE_VANISHED, "pane vanished")
             })?;
         write_input_to_pane(pane, payload.as_bytes(), false)?;
+        let delivery_sequence = debug_path.as_ref().map(|_| {
+            let sequence = self
+                .codex_peer_delivery_sequences
+                .entry(pane_id)
+                .or_default();
+            *sequence = sequence.saturating_add(1);
+            *sequence
+        });
+        let ready_at = Instant::now() + CODEX_PEER_NUDGE_COMMIT_DELAY;
+        let expected_composer = normalize_codex_composer_expected(&payload_text);
         let queue = self.pending_codex_peer_messages.entry(pane_id).or_default();
         queue.clear();
         queue.push_back(PendingCodexPeerDelivery::SubmitAt {
-            ready_at: Instant::now() + CODEX_PEER_NUDGE_COMMIT_DELAY,
-            expected_composer: normalize_codex_composer_expected(&payload_text),
+            ready_at,
+            expected_composer: expected_composer.clone(),
+            expected_composer_raw: debug_path.as_ref().map(|_| payload_text.clone()),
+            delivery_sequence,
         });
+        let queue_entries_total = queue.len();
+        if let Some(path) = debug_path.as_deref() {
+            log_codex_peer_decision(
+                path,
+                CodexPeerDecision {
+                    pane_id,
+                    delivery_sequence,
+                    now: Instant::now(),
+                    ready_at: Some(ready_at),
+                    expires_at: None,
+                    expected_composer: Some(&expected_composer),
+                    expected_composer_raw: Some(&payload_text),
+                    screen: screen.as_ref(),
+                    composer_matches: None,
+                    retries_remaining: Some(CODEX_PEER_NUDGE_MAX_RETRIES),
+                    queue_entries_total,
+                    other_queue_entries: queue_entries_total.saturating_sub(1),
+                    action: "idle_draft_write_succeeded_submit_at_created",
+                },
+            );
+        }
         self.codex_peer_notification = None;
         self.dirty = true;
         Ok(false)
@@ -1011,10 +1233,11 @@ impl App {
                     .entry(notification.target_pane)
                     .or_default();
                 if queue.is_empty() {
-                    queue.push_back(PendingCodexPeerDelivery::AwaitFocus(
-                        notification.message,
-                        0,
-                    ));
+                    queue.push_back(PendingCodexPeerDelivery::AwaitFocus {
+                        message: notification.message,
+                        retries_remaining: 0,
+                        delivery_sequence: None,
+                    });
                 }
             }
         }
@@ -1060,6 +1283,9 @@ impl App {
             return Ok(true);
         }
         let payload_text = format_codex_peer_message(&notification.message);
+        let debug_path = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+        let screen =
+            self.codex_peer_debug_screen_snapshot(notification.target_pane, debug_path.is_some());
         let payload = crate::mcp_peer::build_send_keys_payload(&payload_text, None, false)
             .expect("codex peer notification payload");
         let pane = self
@@ -1068,15 +1294,48 @@ impl App {
             .get_mut(&notification.target_pane)
             .ok_or_else(|| ipc::CodedError::new(ipc::err_code::PANE_VANISHED, "pane vanished"))?;
         write_input_to_pane(pane, payload.as_bytes(), false)?;
+        let delivery_sequence = debug_path.as_ref().map(|_| {
+            let sequence = self
+                .codex_peer_delivery_sequences
+                .entry(notification.target_pane)
+                .or_default();
+            *sequence = sequence.saturating_add(1);
+            *sequence
+        });
+        let ready_at = Instant::now() + CODEX_PEER_NUDGE_COMMIT_DELAY;
+        let expected_composer = normalize_codex_composer_expected(&payload_text);
         let queue = self
             .pending_codex_peer_messages
             .entry(notification.target_pane)
             .or_default();
         queue.clear();
         queue.push_back(PendingCodexPeerDelivery::SubmitAt {
-            ready_at: Instant::now() + CODEX_PEER_NUDGE_COMMIT_DELAY,
-            expected_composer: normalize_codex_composer_expected(&payload_text),
+            ready_at,
+            expected_composer: expected_composer.clone(),
+            expected_composer_raw: debug_path.as_ref().map(|_| payload_text.clone()),
+            delivery_sequence,
         });
+        let queue_entries_total = queue.len();
+        if let Some(path) = debug_path.as_deref() {
+            log_codex_peer_decision(
+                path,
+                CodexPeerDecision {
+                    pane_id: notification.target_pane,
+                    delivery_sequence,
+                    now: Instant::now(),
+                    ready_at: Some(ready_at),
+                    expires_at: None,
+                    expected_composer: Some(&expected_composer),
+                    expected_composer_raw: Some(&payload_text),
+                    screen: screen.as_ref(),
+                    composer_matches: None,
+                    retries_remaining: notification.retries_remaining,
+                    queue_entries_total,
+                    other_queue_entries: queue_entries_total.saturating_sub(1),
+                    action: "notification_draft_write_succeeded_submit_at_created",
+                },
+            );
+        }
         self.codex_peer_notification = None;
         self.dirty = true;
         Ok(true)
@@ -1129,7 +1388,7 @@ impl App {
         self.materialize_unfocused_codex_peer_notification();
         let now = Instant::now();
         let codex_peer_debug_log_path = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
-        let codex_peer_delivery_sequences = &mut self.codex_peer_delivery_sequences;
+        let codex_peer_debug_observations = &mut self.codex_peer_debug_observations;
         let mut empty_panes = Vec::new();
         let mut focused_notifications = Vec::new();
         let active_tab = self.active_tab;
@@ -1159,9 +1418,41 @@ impl App {
                             message,
                             retries_remaining,
                             stalled_since,
+                            delivery_sequence,
                         } => {
+                            let queue_entries_total = queue.len();
+                            let mut log_decision = |action, only_if_changed| {
+                                let Some(path) = codex_peer_debug_log_path.as_deref() else {
+                                    return;
+                                };
+                                let decision = CodexPeerDecision {
+                                    pane_id,
+                                    delivery_sequence,
+                                    now,
+                                    ready_at: None,
+                                    expires_at: None,
+                                    expected_composer: None,
+                                    expected_composer_raw: None,
+                                    screen: screen.as_ref(),
+                                    composer_matches: None,
+                                    retries_remaining: Some(retries_remaining),
+                                    queue_entries_total,
+                                    other_queue_entries: queue_entries_total.saturating_sub(1),
+                                    action,
+                                };
+                                if only_if_changed {
+                                    log_codex_peer_decision_if_changed(
+                                        path,
+                                        codex_peer_debug_observations,
+                                        decision,
+                                    );
+                                } else {
+                                    log_codex_peer_decision(path, decision);
+                                }
+                            };
                             if screen.as_ref().and_then(|state| state.has_draft) == Some(true) {
                                 if pane_is_focused {
+                                    log_decision("draft_has_draft_focused_notification", false);
                                     queue.pop_front();
                                     focused_notifications.push((
                                         pane_id,
@@ -1169,6 +1460,8 @@ impl App {
                                         Some(retries_remaining),
                                     ));
                                     self.dirty = true;
+                                } else {
+                                    log_decision("draft_waiting_has_draft", true);
                                 }
                                 continue;
                             }
@@ -1187,29 +1480,20 @@ impl App {
                                     let expires_at = now + CODEX_PEER_NUDGE_COMMIT_TIMEOUT;
                                     let expected_composer =
                                         normalize_codex_composer_expected(&payload_text);
-                                    let delivery_sequence =
-                                        codex_peer_debug_log_path.as_ref().map(|_| {
-                                            let sequence = codex_peer_delivery_sequences
-                                                .entry(pane_id)
-                                                .or_default();
-                                            *sequence = sequence.saturating_add(1);
-                                            *sequence
-                                        });
                                     if let Some(path) = codex_peer_debug_log_path.as_deref() {
-                                        let queue_entries_total = queue.len();
-                                        log_codex_peer_queue_decision(
+                                        log_codex_peer_decision(
                                             path,
-                                            CodexPeerQueueDecision {
+                                            CodexPeerDecision {
                                                 pane_id,
                                                 delivery_sequence,
                                                 now,
-                                                ready_at,
-                                                expires_at,
-                                                expected_composer: &expected_composer,
+                                                ready_at: Some(ready_at),
+                                                expires_at: Some(expires_at),
+                                                expected_composer: Some(&expected_composer),
                                                 expected_composer_raw: Some(&payload_text),
                                                 screen: screen.as_ref(),
                                                 composer_matches: None,
-                                                retries_remaining,
+                                                retries_remaining: Some(retries_remaining),
                                                 queue_entries_total,
                                                 other_queue_entries: queue_entries_total
                                                     .saturating_sub(1),
@@ -1233,6 +1517,8 @@ impl App {
                                     });
                                     self.dirty = true;
                                     continue;
+                                } else {
+                                    log_decision("draft_queue_write_failed", true);
                                 }
                             }
                             if screen.as_ref().is_some_and(|state| state.ready_for_nudge) {
@@ -1243,20 +1529,56 @@ impl App {
                                 )
                                 .expect("codex peer draft payload");
                                 if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
+                                    let ready_at = now + CODEX_PEER_NUDGE_COMMIT_DELAY;
+                                    let expected_composer =
+                                        normalize_codex_composer_expected(&payload_text);
+                                    if let Some(path) = codex_peer_debug_log_path.as_deref() {
+                                        log_codex_peer_decision(
+                                            path,
+                                            CodexPeerDecision {
+                                                pane_id,
+                                                delivery_sequence,
+                                                now,
+                                                ready_at: Some(ready_at),
+                                                expires_at: None,
+                                                expected_composer: Some(&expected_composer),
+                                                expected_composer_raw: Some(&payload_text),
+                                                screen: screen.as_ref(),
+                                                composer_matches: None,
+                                                retries_remaining: Some(retries_remaining),
+                                                queue_entries_total,
+                                                other_queue_entries: queue_entries_total
+                                                    .saturating_sub(1),
+                                                action: "draft_write_succeeded_submit_at_created",
+                                            },
+                                        );
+                                    }
                                     queue.pop_front();
                                     queue.push_front(PendingCodexPeerDelivery::SubmitAt {
-                                        ready_at: now + CODEX_PEER_NUDGE_COMMIT_DELAY,
-                                        expected_composer: normalize_codex_composer_expected(
-                                            &payload_text,
-                                        ),
+                                        ready_at,
+                                        expected_composer,
+                                        expected_composer_raw: codex_peer_debug_log_path
+                                            .as_ref()
+                                            .map(|_| payload_text),
+                                        delivery_sequence,
                                     });
                                     self.dirty = true;
                                     continue;
+                                } else {
+                                    log_decision("draft_submit_write_failed", true);
                                 }
                             }
                             if now.saturating_duration_since(stalled_since)
                                 >= CODEX_PEER_DRAFT_STALL_TIMEOUT
                             {
+                                log_decision(
+                                    if pane_is_focused {
+                                        "draft_stalled_to_focused_notification"
+                                    } else {
+                                        "draft_stalled_to_await_focus"
+                                    },
+                                    false,
+                                );
                                 queue.pop_front();
                                 if pane_is_focused {
                                     focused_notifications.push((
@@ -1265,32 +1587,72 @@ impl App {
                                         Some(retries_remaining),
                                     ));
                                 } else {
-                                    queue.push_front(PendingCodexPeerDelivery::AwaitFocus(
+                                    queue.push_front(PendingCodexPeerDelivery::AwaitFocus {
                                         message,
                                         retries_remaining,
-                                    ));
+                                        delivery_sequence,
+                                    });
                                 }
                                 self.dirty = true;
+                            } else {
+                                log_decision("draft_waiting_unready", true);
                             }
                         }
                         PendingCodexPeerDelivery::SubmitAt {
                             ready_at,
                             expected_composer,
+                            expected_composer_raw,
+                            delivery_sequence,
                         } => {
-                            if now < ready_at {
-                                continue;
-                            }
+                            let queue_entries_total = queue.len();
                             let composer_matches =
                                 screen.as_ref().and_then(|state| state.composer.as_ref())
                                     == Some(&expected_composer);
+                            let mut log_decision = |action, only_if_changed| {
+                                let Some(path) = codex_peer_debug_log_path.as_deref() else {
+                                    return;
+                                };
+                                let decision = CodexPeerDecision {
+                                    pane_id,
+                                    delivery_sequence,
+                                    now,
+                                    ready_at: Some(ready_at),
+                                    expires_at: None,
+                                    expected_composer: Some(&expected_composer),
+                                    expected_composer_raw: expected_composer_raw.as_deref(),
+                                    screen: screen.as_ref(),
+                                    composer_matches: Some(composer_matches),
+                                    retries_remaining: None,
+                                    queue_entries_total,
+                                    other_queue_entries: queue_entries_total.saturating_sub(1),
+                                    action,
+                                };
+                                if only_if_changed {
+                                    log_codex_peer_decision_if_changed(
+                                        path,
+                                        codex_peer_debug_observations,
+                                        decision,
+                                    );
+                                } else {
+                                    log_codex_peer_decision(path, decision);
+                                }
+                            };
+                            if now < ready_at {
+                                log_decision("submit_at_waiting_ready_at", true);
+                                continue;
+                            }
                             if !composer_matches {
+                                log_decision("submit_at_composer_mismatch", true);
                                 continue;
                             }
                             let payload = crate::mcp_peer::build_send_keys_payload("", None, true)
                                 .expect("codex peer submit payload");
                             if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
+                                log_decision("submit_at_enter_pressed", false);
                                 queue.pop_front();
                                 self.dirty = true;
+                            } else {
+                                log_decision("submit_at_enter_write_failed", true);
                             }
                         }
                         PendingCodexPeerDelivery::QueueAt {
@@ -1306,35 +1668,40 @@ impl App {
                                 screen.as_ref().and_then(|state| state.composer.as_ref())
                                     == Some(&expected_composer);
                             let queue_entries_total = queue.len();
-                            let log_decision = |action| {
+                            let mut log_decision = |action, only_if_changed| {
                                 if let Some(path) = codex_peer_debug_log_path.as_deref() {
-                                    log_codex_peer_queue_decision(
-                                        path,
-                                        CodexPeerQueueDecision {
-                                            pane_id,
-                                            delivery_sequence,
-                                            now,
-                                            ready_at,
-                                            expires_at,
-                                            expected_composer: &expected_composer,
-                                            expected_composer_raw: expected_composer_raw.as_deref(),
-                                            screen: screen.as_ref(),
-                                            composer_matches: Some(composer_matches),
-                                            retries_remaining,
-                                            queue_entries_total,
-                                            other_queue_entries: queue_entries_total
-                                                .saturating_sub(1),
-                                            action,
-                                        },
-                                    );
+                                    let decision = CodexPeerDecision {
+                                        pane_id,
+                                        delivery_sequence,
+                                        now,
+                                        ready_at: Some(ready_at),
+                                        expires_at: Some(expires_at),
+                                        expected_composer: Some(&expected_composer),
+                                        expected_composer_raw: expected_composer_raw.as_deref(),
+                                        screen: screen.as_ref(),
+                                        composer_matches: Some(composer_matches),
+                                        retries_remaining: Some(retries_remaining),
+                                        queue_entries_total,
+                                        other_queue_entries: queue_entries_total.saturating_sub(1),
+                                        action,
+                                    };
+                                    if only_if_changed {
+                                        log_codex_peer_decision_if_changed(
+                                            path,
+                                            codex_peer_debug_observations,
+                                            decision,
+                                        );
+                                    } else {
+                                        log_codex_peer_decision(path, decision);
+                                    }
                                 }
                             };
                             if pane_is_focused {
                                 if composer_matches {
                                     let _ = write_input_to_pane(pane, b"\x15", false);
-                                    log_decision("focused_cleared_and_notified");
+                                    log_decision("focused_cleared_and_notified", false);
                                 } else {
-                                    log_decision("focused_notified_without_clear");
+                                    log_decision("focused_notified_without_clear", false);
                                 }
                                 queue.pop_front();
                                 focused_notifications.push((
@@ -1348,9 +1715,9 @@ impl App {
                             if now >= expires_at {
                                 if composer_matches {
                                     let _ = write_input_to_pane(pane, b"\x15", false);
-                                    log_decision("expired_cleared_and_requeued");
+                                    log_decision("expired_cleared_and_requeued", false);
                                 } else {
-                                    log_decision("expired_discarded_without_ctrl_u");
+                                    log_decision("expired_discarded_without_ctrl_u", false);
                                 }
                                 queue.pop_front();
                                 if retries_remaining > 0 {
@@ -1358,21 +1725,24 @@ impl App {
                                         message,
                                         retries_remaining: retries_remaining - 1,
                                         stalled_since: now,
+                                        delivery_sequence,
                                     });
                                 } else {
-                                    queue.push_front(PendingCodexPeerDelivery::AwaitFocus(
-                                        message, 0,
-                                    ));
+                                    queue.push_front(PendingCodexPeerDelivery::AwaitFocus {
+                                        message,
+                                        retries_remaining: 0,
+                                        delivery_sequence,
+                                    });
                                 }
                                 self.dirty = true;
                                 continue;
                             }
                             if now < ready_at {
-                                log_decision("continued_waiting_ready_at");
+                                log_decision("continued_waiting_ready_at", true);
                                 continue;
                             }
                             if !composer_matches {
-                                log_decision("continued_composer_mismatch");
+                                log_decision("continued_composer_mismatch", true);
                                 continue;
                             }
                             let (payload, success_action, failure_action) = if screen
@@ -1386,19 +1756,54 @@ impl App {
                             {
                                 (b"\r".as_slice(), "enter_pressed", "enter_write_failed")
                             } else {
-                                log_decision("continued_no_commit_key_available");
+                                log_decision("continued_no_commit_key_available", true);
                                 continue;
                             };
                             if write_input_to_pane(pane, payload, false).is_ok() {
-                                log_decision(success_action);
+                                log_decision(success_action, false);
                                 queue.pop_front();
                                 self.dirty = true;
                             } else {
-                                log_decision(failure_action);
+                                log_decision(failure_action, true);
                             }
                         }
-                        PendingCodexPeerDelivery::AwaitFocus(message, retries_remaining) => {
+                        PendingCodexPeerDelivery::AwaitFocus {
+                            message,
+                            retries_remaining,
+                            delivery_sequence,
+                        } => {
+                            let queue_entries_total = queue.len();
+                            let mut log_decision = |action, only_if_changed| {
+                                let Some(path) = codex_peer_debug_log_path.as_deref() else {
+                                    return;
+                                };
+                                let decision = CodexPeerDecision {
+                                    pane_id,
+                                    delivery_sequence,
+                                    now,
+                                    ready_at: None,
+                                    expires_at: None,
+                                    expected_composer: None,
+                                    expected_composer_raw: None,
+                                    screen: screen.as_ref(),
+                                    composer_matches: None,
+                                    retries_remaining: Some(retries_remaining),
+                                    queue_entries_total,
+                                    other_queue_entries: queue_entries_total.saturating_sub(1),
+                                    action,
+                                };
+                                if only_if_changed {
+                                    log_codex_peer_decision_if_changed(
+                                        path,
+                                        codex_peer_debug_observations,
+                                        decision,
+                                    );
+                                } else {
+                                    log_codex_peer_decision(path, decision);
+                                }
+                            };
                             if pane_is_focused {
+                                log_decision("await_focus_focused_notification", false);
                                 queue.pop_front();
                                 focused_notifications.push((
                                     pane_id,
@@ -1409,13 +1814,17 @@ impl App {
                             } else if screen.as_ref().is_some_and(|state| {
                                 state.ready_for_nudge && state.has_draft == Some(false)
                             }) {
+                                log_decision("await_focus_ready_restarted_draft", false);
                                 queue.pop_front();
                                 queue.push_front(PendingCodexPeerDelivery::Draft {
                                     message,
                                     retries_remaining,
                                     stalled_since: now,
+                                    delivery_sequence,
                                 });
                                 self.dirty = true;
+                            } else {
+                                log_decision("await_focus_waiting", true);
                             }
                         }
                     }
@@ -1427,9 +1836,64 @@ impl App {
         }
         for pane_id in empty_panes {
             self.pending_codex_peer_messages.remove(&pane_id);
+            self.codex_peer_debug_observations.remove(&pane_id);
         }
         for (pane_id, message, retries_remaining) in focused_notifications {
             self.show_codex_peer_notification(pane_id, message, retries_remaining);
         }
+    }
+}
+
+#[cfg(test)]
+mod debug_logging_tests {
+    use super::*;
+
+    #[test]
+    fn debug_capture_preserves_composer_and_writes_single_jsonl_record_per_state() {
+        let mut parser = vt100::Parser::new(20, 80, 0);
+        parser.process(
+            b"\x1b[?25h\x1b[2J\x1b[3;1H\xE2\x97\xA6 Working (12s \xE2\x80\xA2 esc to interrupt)\x1b[6;1H\xE2\x80\xBA peer nudge\x1b[10;1H  tab to queue message  51% context left\x1b[6;14H",
+        );
+        let normal = analyze_codex_peer_screen(parser.screen(), false);
+        let debug = analyze_codex_peer_screen(parser.screen(), true);
+        assert_eq!(normal.composer, debug.composer);
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "renga-codex-peer-debug-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        let mut observations = HashMap::new();
+        for _ in 0..2 {
+            log_codex_peer_decision_if_changed(
+                path.as_os_str(),
+                &mut observations,
+                CodexPeerDecision {
+                    pane_id: 7,
+                    delivery_sequence: Some(1),
+                    now: Instant::now(),
+                    ready_at: None,
+                    expires_at: None,
+                    expected_composer: Some("peer nudge"),
+                    expected_composer_raw: Some("peer nudge"),
+                    screen: Some(&debug),
+                    composer_matches: Some(true),
+                    retries_remaining: Some(1),
+                    queue_entries_total: 1,
+                    other_queue_entries: 0,
+                    action: "continued_composer_match",
+                },
+            );
+        }
+        let contents = std::fs::read_to_string(&path).expect("debug JSONL");
+        let lines: Vec<_> = contents.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let record: serde_json::Value = serde_json::from_str(lines[0]).expect("one JSON object");
+        assert_eq!(record["action"], "continued_composer_match");
+        assert_eq!(record["screen_composer"], "peernudge");
+        std::fs::remove_file(path).expect("remove debug JSONL");
     }
 }

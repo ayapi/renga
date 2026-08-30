@@ -53,6 +53,7 @@ impl App {
                 self.pending_peer_inbox.remove(pid);
                 self.pending_codex_peer_messages.remove(pid);
                 self.codex_peer_delivery_sequences.remove(pid);
+                self.codex_peer_debug_observations.remove(pid);
             }
         }
         if self
@@ -308,6 +309,7 @@ impl App {
         self.pending_peer_inbox.remove(&pane_id);
         self.pending_codex_peer_messages.remove(&pane_id);
         self.codex_peer_delivery_sequences.remove(&pane_id);
+        self.codex_peer_debug_observations.remove(&pane_id);
         if self
             .codex_peer_notification
             .as_ref()

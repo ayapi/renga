@@ -76,6 +76,7 @@ impl App {
             pending_peer_inbox: HashMap::new(),
             pending_codex_peer_messages: HashMap::new(),
             codex_peer_delivery_sequences: HashMap::new(),
+            codex_peer_debug_observations: HashMap::new(),
             codex_peer_notification: None,
             recent_peer_sends: HashMap::new(),
             clipboard: None,
