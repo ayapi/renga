@@ -963,6 +963,9 @@ fn peer_send_result_text(to_id: &str, data: &Value) -> String {
     match data.get("delivery").and_then(Value::as_str) {
         Some("delivered") => format!("Delivered to {to_id}."),
         Some("queued") => format!("Queued for {to_id} (peer client not registered yet)."),
+        Some("pending_user_confirmation") => {
+            format!("Pending user confirmation for {to_id}.")
+        }
         // Older renga servers return a successful response without the
         // delivery field and may have dropped an unregistered peer send.
         // Unknown future values are equally unverified, so only the explicit
@@ -2858,6 +2861,10 @@ mod tests {
         assert_eq!(
             peer_send_result_text("2", &json!({ "delivery": "queued" })),
             "Queued for 2 (peer client not registered yet)."
+        );
+        assert_eq!(
+            peer_send_result_text("2", &json!({ "delivery": "pending_user_confirmation" })),
+            "Pending user confirmation for 2."
         );
 
         for data in [json!({}), json!({ "delivery": "future_value" })] {

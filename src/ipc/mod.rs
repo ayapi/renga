@@ -319,6 +319,7 @@ pub enum PeerReceiveMode {
 pub enum PeerSendOutcome {
     Delivered,
     Queued,
+    PendingUserConfirmation,
 }
 
 /// One entry in the `PeerList` response payload. Describes a single

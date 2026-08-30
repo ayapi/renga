@@ -845,12 +845,13 @@ fn handle_peer_send_defers_codex_nudge_while_target_is_focused() {
     seed_codex_draft(&mut app, sibling_id);
     while rx.try_recv().is_ok() {}
 
-    app.handle_peer_send(
-        sender_id,
-        &ipc::PaneRef::Id(sibling_id),
-        "hello focused codex".to_string(),
-    )
-    .expect("peer send");
+    let outcome = app
+        .handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(sibling_id),
+            "hello focused codex".to_string(),
+        )
+        .expect("peer send");
 
     let peer_inbox = rx
         .try_iter()
@@ -870,6 +871,30 @@ fn handle_peer_send_defers_codex_nudge_while_target_is_focused() {
         .expect("focused Codex target should show a notification overlay");
     assert_eq!(notification.target_pane, sibling_id);
     assert_eq!(notification.pending_count, 1);
+    assert_eq!(
+        outcome,
+        ipc::PeerSendOutcome::PendingUserConfirmation,
+        "the reported outcome must match the notification that actually retains the nudge"
+    );
+    let duplicate = app
+        .handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(sibling_id),
+            "hello focused codex".to_string(),
+        )
+        .expect("duplicate peer send");
+    assert_eq!(
+        duplicate,
+        ipc::PeerSendOutcome::PendingUserConfirmation,
+        "dedupe must replay the original pending outcome"
+    );
+    assert_eq!(
+        app.visible_codex_peer_notification()
+            .expect("dedupe must preserve the retained notification")
+            .pending_count,
+        1,
+        "dedupe must not manufacture a second retained nudge"
+    );
     assert_eq!(
         app.pending_codex_peer_messages
             .get(&sibling_id)
@@ -941,23 +966,27 @@ fn handle_peer_send_coalesces_focused_codex_notifications() {
         .expect("focus sibling");
     seed_codex_draft(&mut app, sibling_id);
 
-    app.handle_peer_send(
-        sender_id,
-        &ipc::PaneRef::Id(sibling_id),
-        "hello focused codex".to_string(),
-    )
-    .expect("first peer send");
-    app.handle_peer_send(
-        sender_id,
-        &ipc::PaneRef::Id(sibling_id),
-        "hello again focused codex".to_string(),
-    )
-    .expect("second peer send");
+    let first = app
+        .handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(sibling_id),
+            "hello focused codex".to_string(),
+        )
+        .expect("first peer send");
+    let second = app
+        .handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(sibling_id),
+            "hello again focused codex".to_string(),
+        )
+        .expect("second peer send");
 
     let notification = app
         .visible_codex_peer_notification()
         .expect("focused Codex target should still show one notification");
     assert_eq!(notification.pending_count, 2);
+    assert_eq!(first, ipc::PeerSendOutcome::PendingUserConfirmation);
+    assert_eq!(second, ipc::PeerSendOutcome::PendingUserConfirmation);
     assert_eq!(
         app.pending_codex_peer_messages
             .get(&sibling_id)

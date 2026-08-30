@@ -67,8 +67,12 @@ Result on immediate success: `"Delivered to <to_id>."`. If the target pane
 exists in the same tab but its peer event subscriber is not ready, the result
 is `"Queued for <to_id> (peer client not registered yet)."`; delivery occurs
 after that subscriber reports readiness, in original send order.
+If a ready Codex target requires user acceptance before its pane-local nudge
+can be delivered, the result is `"Pending user confirmation for <to_id>."`.
 If the server omits `delivery` or returns an unknown value, the result is
 `"Message sent to <to_id>; delivery state unconfirmed (renga server may predate queued delivery)."`.
+The server is authoritative for this state; during a client/server version
+skew, a new client displays the outcome reported by the older server.
 
 The pre-registration queue is per pane and bounded to 128 messages / 1 MiB of
 body text. A send that would exceed either cap fails with
@@ -445,7 +449,7 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | `subscribe` | `pane_id?: usize` | Switches to event-stream mode after ack. Bundled MCP peers identify their pane; generic consumers omit the additively introduced key. |
 | `inspect` | `target: PaneRef`, `lines?`, `include_cursor: bool` (default false) | |
 | `peer_list` | `from_pane: usize` | |
-| `peer_send` | `from_pane: usize`, `target: PaneRef`, `body: string` | Cross-tab silently no-ops (Q5). Ok data is `{ "delivery": "delivered"\|"queued" }`. |
+| `peer_send` | `from_pane: usize`, `target: PaneRef`, `body: string` | Cross-tab silently no-ops (Q5). Ok data is `{ "delivery": "delivered"\|"queued"\|"pending_user_confirmation" }`. |
 | `peer_register_client` | `pane_id: usize`, `kind: claude\|codex` | Posted by `renga mcp-peer` on startup. |
 | `peer_set_ready` | `pane_id: usize`, `kind: claude\|codex`, `ready: bool` | Internal peer lifecycle update. `ready=true` means the event subscriber can receive; for push clients this is sent only after MCP initialization. Kind is repeated atomically with readiness. |
 | `set_pane_identity` | `target: PaneRef`, `name?`, `role?` (three-state: missing / null / value) | Uses serde `double_option`. |
@@ -467,7 +471,8 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 Request-specific `ok.data` shapes include
 `split: { "id": usize, "startup_command"?: string | null }` and
 `new_tab: { "id": usize, "startup_command"?: string | null }` and
-`peer_send: { "delivery": "delivered" | "queued" }`; lifecycle setters such
+`peer_send: { "delivery": "delivered" | "queued" | "pending_user_confirmation" }`;
+lifecycle setters such
 as `peer_register_client` and `peer_set_ready` return `null`. For `split` and
 `new_tab`, a string is the effective command queued by the server, explicit
 `null` confirms that no startup command was requested, and a missing key means
@@ -614,6 +619,10 @@ because downstream is required to read the `[code]` token for branching.
   `null`, or confirmation that no action occurred. If a key qualifies as both
   optional-when-unset and additively introduced, use the conservative latter
   interpretation and treat its absence as unknown.
+- **Unknown `peer_send.delivery` values** are unverified outcomes. The
+  additively introduced `pending_user_confirmation` value therefore degrades
+  to the documented unconfirmed result on older MCP clients; it must not be
+  interpreted as `delivered` or `queued`.
 - **Unknown `[code]` tokens**: treat as the equivalent of `internal`.
 
 These rules let renga add fields and variants additively without bumping the

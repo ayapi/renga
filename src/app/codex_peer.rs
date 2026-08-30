@@ -504,6 +504,7 @@ impl App {
             return Ok(outcome);
         }
         self.materialize_unfocused_codex_peer_notification();
+        let mut pending_user_confirmation = false;
         let from_name = self.workspaces[sender_ws]
             .pane_names
             .iter()
@@ -530,6 +531,10 @@ impl App {
                 });
             if target_is_focused && !nudge_commit_in_flight {
                 self.route_focused_codex_peer_message(target_id, message)?;
+                pending_user_confirmation = self
+                    .codex_peer_notification
+                    .as_ref()
+                    .is_some_and(|notification| notification.target_pane == target_id);
             } else {
                 self.push_pending_codex_peer_nudge(target_id, message);
             }
@@ -543,7 +548,11 @@ impl App {
         };
         if self.peer_delivery_ready.contains(&target_id) {
             self.emit_peer_inbox(target_id, message);
-            let outcome = ipc::PeerSendOutcome::Delivered;
+            let outcome = if pending_user_confirmation {
+                ipc::PeerSendOutcome::PendingUserConfirmation
+            } else {
+                ipc::PeerSendOutcome::Delivered
+            };
             self.record_peer_send(target_id, from_pane, &body, outcome);
             Ok(outcome)
         } else {
