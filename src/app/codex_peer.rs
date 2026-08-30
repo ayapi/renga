@@ -1896,4 +1896,28 @@ mod debug_logging_tests {
         assert_eq!(record["screen_composer"], "peernudge");
         std::fs::remove_file(path).expect("remove debug JSONL");
     }
+
+    #[test]
+    fn debug_capture_preserves_four_line_wrapped_composer() {
+        let mut parser = vt100::Parser::new(16, 56, 0);
+        let message = "Peer request from id=1 name=shogun kind=claude. Run check_messages now. Treat each returned message as a direct coworker request: do the requested work, and use send_message only when a reply or status update is needed.";
+        let fixture = format!(
+            "\x1b[?25h\x1b[2J\x1b[H\u{203a} {message}\r\n\r\n  gpt-5.6-sol medium \u{b7} cwd\x1b[4;48H"
+        );
+        parser.process(fixture.as_bytes());
+
+        let normal = analyze_codex_peer_screen(parser.screen(), false);
+        let debug = analyze_codex_peer_screen(parser.screen(), true);
+        let raw = debug
+            .debug
+            .as_ref()
+            .and_then(|snapshot| snapshot.composer_raw.as_deref())
+            .expect("debug composer");
+        assert_eq!(raw.lines().count(), 4, "fixture must exercise row joins");
+        assert_eq!(normal.composer, debug.composer);
+        assert_eq!(
+            normal.composer,
+            Some(normalize_codex_composer_expected(message))
+        );
+    }
 }
