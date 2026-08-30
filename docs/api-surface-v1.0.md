@@ -172,6 +172,9 @@ Caller loop: read `messages[0].body` when present; otherwise append
 `next_offset_bytes`. Do not act on a partial body. Once `complete=true` and the
 entire body is assembled, call again with `ack {message_id, token}`. A response
 lost or truncated before ack is idempotently retrievable with the same cursor.
+The serialized frame includes the JSON-RPC request id, so changing the id's
+digit count can move a retried page's final character; following each returned
+`next_offset_bytes` still reconstructs the body without loss.
 Peers that never ack keep the head for the MCP subprocess lifetime; renga does
 not expire it or repeatedly nudge the pane automatically.
 
