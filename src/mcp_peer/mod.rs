@@ -402,12 +402,44 @@ fn queue_pull_message(inbox: &InboxSink, message: QueuedPeerMessage) {
     let mut state = inbox.lock().unwrap_or_else(|p| p.into_inner());
     state.next_message_id = state.next_message_id.saturating_add(1);
     let message_id = format!("m{}", state.next_message_id);
-    let ack_token = format!("{message_id}:ack");
+    let ack_token = new_ack_token();
     state.messages.push_back(InboxEntry {
         message_id,
         ack_token,
         message,
     });
+}
+
+fn new_ack_token() -> String {
+    let mut bytes = [0u8; 16];
+    if let Err(error) = getrandom::getrandom(&mut bytes) {
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static FALLBACK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let sequence = FALLBACK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut first = std::collections::hash_map::DefaultHasher::new();
+        timestamp.hash(&mut first);
+        std::process::id().hash(&mut first);
+        sequence.hash(&mut first);
+        (&bytes as *const [u8; 16] as usize).hash(&mut first);
+        let first = first.finish();
+        let mut second = std::collections::hash_map::DefaultHasher::new();
+        first.hash(&mut second);
+        timestamp.rotate_left(47).hash(&mut second);
+        let second = second.finish();
+        bytes[..8].copy_from_slice(&first.to_le_bytes());
+        bytes[8..].copy_from_slice(&second.to_le_bytes());
+        log_stderr(&format!(
+            "OS randomness unavailable for peer receipt token; using process-local fallback: {error}"
+        ));
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 // ── channel notification (the whole point of #97) ─────────────
@@ -5396,6 +5428,7 @@ Commands:
         let ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
         enqueue_test_message(&ctx, "keep me".to_string());
         for args in [
+            json!({"ack": {"message_id": "m1", "token": "m1:ack"}}),
             json!({"ack": {"message_id": "wrong", "token": "wrong"}}),
             json!({"message_id": "wrong", "offset_bytes": 0}),
             json!({"offset_bytes": 1}),

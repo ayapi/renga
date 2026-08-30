@@ -147,8 +147,9 @@ message; only an explicit receipt acknowledgement removes the FIFO head.
 | `ack` | `{message_id, token}` | no | Confirms complete receipt, not completion of the requested work. Cannot be combined with cursor fields. A valid ack removes that FIFO head and the same call returns the next head, if any. |
 
 Every successful result retains `content`, `structuredContent.messages[]`,
-`count`, and `isError`. It adds `pending_after`, `has_more`, `ack_required`, and
-`structuredContent.delivery` whenever a FIFO head exists:
+`count`, and `isError`. It always adds `pending_after`, `has_more`, and
+`ack_required`; `structuredContent.delivery` is added only when a FIFO head
+exists:
 
 - When the complete body fits at offset 0, `messages[0]` retains the v1.0 entry
   shape (`from_id`, `from_name`, `from_kind`, `body`, `sent_at`) and `count=1`.

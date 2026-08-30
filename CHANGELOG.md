@@ -38,6 +38,11 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Changed
 
+- **`check_messages` now pages queued peer bodies and requires an explicit
+  receipt ack before removing the FIFO head.** Existing `{}` calls remain valid;
+  additive cursor, response-budget, delivery, and pending-count keys support
+  lossless retry when a Codex tool response is truncated. (renga-4ol)
+
 - **All global Ctrl keybindings moved to the Alt namespace.** Bare
   Ctrl chords used to be intercepted by renga and never reached the
   program inside the pane, shadowing shell readline, vim, fzf and
