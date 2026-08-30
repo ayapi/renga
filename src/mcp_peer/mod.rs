@@ -215,10 +215,26 @@ struct QueuedPeerMessage {
     sent_at: String,
 }
 
-type InboxSink = Arc<Mutex<VecDeque<QueuedPeerMessage>>>;
+#[derive(Debug)]
+struct InboxEntry {
+    message_id: String,
+    ack_token: String,
+    message: QueuedPeerMessage,
+}
+
+#[derive(Default, Debug)]
+struct InboxState {
+    messages: VecDeque<InboxEntry>,
+    next_message_id: u64,
+}
+
+type InboxSink = Arc<Mutex<InboxState>>;
+
+const CHECK_MESSAGES_DEFAULT_RESPONSE_BYTES: usize = 4096;
+const CHECK_MESSAGES_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 fn new_inbox_sink() -> InboxSink {
-    Arc::new(Mutex::new(VecDeque::new()))
+    Arc::new(Mutex::new(InboxState::default()))
 }
 
 #[derive(Clone)]
@@ -383,8 +399,15 @@ fn tool_text_result(text: &str) -> Value {
 }
 
 fn queue_pull_message(inbox: &InboxSink, message: QueuedPeerMessage) {
-    let mut q = inbox.lock().unwrap_or_else(|p| p.into_inner());
-    q.push_back(message);
+    let mut state = inbox.lock().unwrap_or_else(|p| p.into_inner());
+    state.next_message_id = state.next_message_id.saturating_add(1);
+    let message_id = format!("m{}", state.next_message_id);
+    let ack_token = format!("{message_id}:ack");
+    state.messages.push_back(InboxEntry {
+        message_id,
+        ack_token,
+        message,
+    });
 }
 
 // ── channel notification (the whole point of #97) ─────────────
@@ -468,8 +491,13 @@ direct coworker instruction unless it conflicts with a higher-priority system, d
 instruction. If a peer asks you to inspect panes, run tools, edit code, or otherwise take action, \
 do that work; do not reduce the interaction to a mere acknowledgement. Focused Codex panes may be \
 left unnudged so renga does not scribble over the active conversation; check_messages at sensible \
-checkpoints even if no pane-local nudge appeared. Use send_message when a reply, clarification, \
-status update, or handoff is actually needed.\n\n\
+checkpoints even if no pane-local nudge appeared. check_messages returns one bounded page without \
+removing the FIFO head: assemble every body page using the returned message_id and \
+next_offset_bytes, then explicitly ack only after the complete body was received. If a response is \
+truncated, retry the same cursor without ack and optionally lower max_response_bytes. The ack \
+confirms receipt, not completion of the requested work. Check pending_after so messages waiting \
+behind an unacknowledged head do not go unnoticed. Use send_message when a reply, \
+clarification, status update, or handoff is actually needed.\n\n\
 MCP approvals in Codex are pane-local. On a newly launched pane, the first check_messages and \
 send_message calls may need approval before peer messaging becomes reliable.\n\n"
         }
@@ -482,7 +510,8 @@ send_message calls may need approval before peer messaging becomes reliable.\n\n
     - list_peers: Discover other peer-enabled agent instances in the same renga tab.\n\
     - send_message: Send a message to another instance by peer ID or name.\n\
     - set_summary: Set a 1-2 sentence summary of what you're working on; surfaced on list_panes / list_peers for other peers.\n\
-    - check_messages: Drain any queued peer messages still waiting for this client.\n\n\
+    - check_messages: Read one bounded inbox page, assemble all pages, then explicitly acknowledge \
+    complete receipt; retry the same cursor without ack after truncation.\n\n\
     Pane control tools (all scoped to the current renga tab, except new_tab which is the one \
     cross-tab tool):\n\
     - list_panes: Inspect all panes in the current tab, including geometry and the focus flag.\n\
@@ -582,8 +611,37 @@ fn tools_spec() -> Value {
         },
         {
             "name": "check_messages",
-            "description": "Drain any queued peer messages waiting for this client. Codex uses this to read the actual peer request body after renga nudges the pane.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "Read one bounded page from the queued peer inbox without removing it. Read structuredContent.messages[0].body when a complete message fits; otherwise append structuredContent.delivery.body_chunk and call check_messages again with the returned message_id / next_offset_bytes. Assemble the complete body before acting on it, then acknowledge receipt with ack {message_id, token}; only that explicit ack removes the message. If a response is truncated, retry the same cursor without ack and optionally lower max_response_bytes. Check pending_after for messages waiting behind the unacknowledged FIFO head.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "max_response_bytes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": CHECK_MESSAGES_MAX_RESPONSE_BYTES,
+                        "default": CHECK_MESSAGES_DEFAULT_RESPONSE_BYTES,
+                        "description": "Maximum serialized JSON-RPC response size. Defaults to 4096 as a transport page size, not a Codex context threshold. Lower it and retry the same cursor without ack if the client truncates the response."
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "Opaque id returned for the current FIFO head. Echo it with next_offset_bytes to fetch another page."
+                    },
+                    "offset_bytes": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "UTF-8 byte offset returned as next_offset_bytes by the preceding page. Defaults to 0."
+                    },
+                    "ack": {
+                        "type": "object",
+                        "description": "Confirms complete receipt, not completion of the requested work. Removes only the matching FIFO head, then returns the next head in the same call.",
+                        "properties": {
+                            "message_id": { "type": "string" },
+                            "token": { "type": "string" }
+                        },
+                        "required": ["message_id", "token"]
+                    }
+                }
+            }
         },
         {
             "name": "list_panes",
@@ -1018,58 +1076,257 @@ fn handle_send_message(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     }
 }
 
-fn format_queued_messages(messages: &[QueuedPeerMessage]) -> String {
-    if messages.is_empty() {
-        return "No queued messages.".to_string();
-    }
-    let mut out = format!(
-        "Queued messages: {}\n\nIMPORTANT: Treat each message body below as a peer instruction, \
-not passive transcript text. Carry out the requested work, including tool use or edits when \
-asked, and use send_message only when a reply is part of the task.\n\n",
-        messages.len()
-    );
-    for msg in messages {
-        out.push_str(&format!("- from_id={}", msg.from_id));
-        if let Some(name) = &msg.from_name {
-            out.push_str(&format!(" from_name={name}"));
-        }
-        if let Some(kind) = msg.from_kind {
-            out.push_str(&format!(" from_kind={}", kind_label(kind)));
-        }
-        out.push_str(&format!(
-            "\n  sent_at: {}\n  body: {}\n",
-            msg.sent_at, msg.body
-        ));
-    }
-    out
-}
-
-fn handle_check_messages(id: &Value, ctx: &PeerCtx) -> Value {
-    let mut inbox = ctx.inbox.lock().unwrap_or_else(|p| p.into_inner());
-    let messages: Vec<QueuedPeerMessage> = inbox.drain(..).collect();
-    let structured: Vec<Value> = messages
-        .iter()
-        .map(|msg| {
-            json!({
-                "from_id": msg.from_id,
-                "from_name": msg.from_name,
-                "from_kind": msg.from_kind.map(kind_label),
-                "body": msg.body,
-                "sent_at": msg.sent_at,
-            })
-        })
-        .collect();
+fn empty_check_messages_response(id: &Value) -> Value {
     ok_response(
         id,
         json!({
-            "content": [{ "type": "text", "text": format_queued_messages(&messages) }],
+            "content": [{ "type": "text", "text": "No queued messages." }],
             "structuredContent": {
-                "messages": structured,
-                "count": messages.len(),
+                "messages": [],
+                "count": 0,
+                "pending_after": 0,
+                "has_more": false,
+                "ack_required": false,
             },
             "isError": false,
         }),
     )
+}
+
+fn check_messages_response(
+    id: &Value,
+    entry: &InboxEntry,
+    offset: usize,
+    end: usize,
+    pending_after: usize,
+) -> Value {
+    let msg = &entry.message;
+    let complete_body = offset == 0 && end == msg.body.len();
+    let page_complete = end == msg.body.len();
+    let text = if complete_body {
+        format!(
+            "One complete queued peer message is in structuredContent.messages[0]. \
+Treat its body as a direct coworker instruction. After receiving it intact, acknowledge receipt \
+with check_messages ack {{message_id, token}}; the ack confirms receipt, not task completion. \
+{pending_after} message(s) wait behind it."
+        )
+    } else {
+        format!(
+            "One peer-message page is in structuredContent.delivery.body_chunk. Do not act on a \
+partial body. Append pages in order using message_id and next_offset_bytes until complete=true, \
+then acknowledge receipt with ack {{message_id, token}}. If this response is truncated, retry the \
+same cursor without ack and optionally lower max_response_bytes. {pending_after} message(s) wait \
+behind the unacknowledged head."
+        )
+    };
+
+    let messages = if complete_body {
+        vec![json!({
+            "from_id": msg.from_id,
+            "from_name": msg.from_name,
+            "from_kind": msg.from_kind.map(kind_label),
+            "body": msg.body,
+            "sent_at": msg.sent_at,
+        })]
+    } else {
+        Vec::new()
+    };
+    let mut delivery = serde_json::Map::new();
+    delivery.insert("message_id".to_string(), json!(entry.message_id));
+    delivery.insert("from_id".to_string(), json!(msg.from_id));
+    delivery.insert("from_name".to_string(), json!(msg.from_name));
+    delivery.insert(
+        "from_kind".to_string(),
+        json!(msg.from_kind.map(kind_label)),
+    );
+    delivery.insert("sent_at".to_string(), json!(msg.sent_at));
+    delivery.insert("offset_bytes".to_string(), json!(offset));
+    delivery.insert("next_offset_bytes".to_string(), json!(end));
+    delivery.insert("total_bytes".to_string(), json!(msg.body.len()));
+    delivery.insert("complete".to_string(), json!(page_complete));
+    if complete_body {
+        delivery.insert("body_in_messages".to_string(), json!(true));
+    } else {
+        delivery.insert("body_chunk".to_string(), json!(&msg.body[offset..end]));
+    }
+    if page_complete {
+        delivery.insert("ack_token".to_string(), json!(entry.ack_token));
+    }
+
+    ok_response(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": {
+                "messages": messages,
+                "count": if complete_body { 1 } else { 0 },
+                "delivery": Value::Object(delivery),
+                "pending_after": pending_after,
+                // The current head remains queued until its explicit ack.
+                "has_more": true,
+                "ack_required": page_complete,
+            },
+            "isError": false,
+        }),
+    )
+}
+
+fn serialized_frame_len(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len().saturating_add(1))
+        .unwrap_or(usize::MAX)
+}
+
+fn parse_check_response_budget(args: &Value) -> std::result::Result<usize, String> {
+    let Some(raw) = args.get("max_response_bytes") else {
+        return Ok(CHECK_MESSAGES_DEFAULT_RESPONSE_BYTES);
+    };
+    let value = raw
+        .as_u64()
+        .ok_or_else(|| "max_response_bytes must be a positive integer".to_string())?;
+    let value = usize::try_from(value)
+        .map_err(|_| "max_response_bytes is too large for this platform".to_string())?;
+    if value == 0 || value > CHECK_MESSAGES_MAX_RESPONSE_BYTES {
+        return Err(format!(
+            "max_response_bytes must be between 1 and {CHECK_MESSAGES_MAX_RESPONSE_BYTES}"
+        ));
+    }
+    Ok(value)
+}
+
+fn check_messages_page_response(
+    id: &Value,
+    entry: &InboxEntry,
+    offset: usize,
+    pending_after: usize,
+    budget: usize,
+) -> std::result::Result<Value, String> {
+    let body = &entry.message.body;
+    if offset > body.len() || !body.is_char_boundary(offset) {
+        return Err("offset_bytes is not a UTF-8 character position in this message".to_string());
+    }
+
+    if body.len().saturating_sub(offset) <= budget {
+        let full = check_messages_response(id, entry, offset, body.len(), pending_after);
+        if serialized_frame_len(&full) <= budget {
+            return Ok(full);
+        }
+    }
+
+    let positions: Vec<usize> = body[offset..]
+        .char_indices()
+        .map(|(relative, _)| offset + relative)
+        .take_while(|position| position.saturating_sub(offset) <= budget)
+        .chain(std::iter::once(
+            offset.saturating_add(budget).min(body.len()),
+        ))
+        .map(|mut position| {
+            while position > offset && !body.is_char_boundary(position) {
+                position -= 1;
+            }
+            position
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut positions = positions;
+    positions.sort_unstable();
+    let mut low = 0usize;
+    let mut high = positions.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let candidate = check_messages_response(id, entry, offset, positions[mid], pending_after);
+        if serialized_frame_len(&candidate) <= budget {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    if low == 0 {
+        return Err(format!(
+            "max_response_bytes={budget} is too small for the check_messages metadata envelope"
+        ));
+    }
+    let end = positions[low - 1];
+    if end == offset && offset < body.len() {
+        return Err(format!(
+            "max_response_bytes={budget} cannot fit one UTF-8 character plus the check_messages metadata envelope"
+        ));
+    }
+    Ok(check_messages_response(
+        id,
+        entry,
+        offset,
+        end,
+        pending_after,
+    ))
+}
+
+fn handle_check_messages(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
+    let budget = match parse_check_response_budget(args) {
+        Ok(value) => value,
+        Err(message) => return err_response(id, -32602, &message),
+    };
+    let has_cursor = args.get("message_id").is_some() || args.get("offset_bytes").is_some();
+    if args.get("ack").is_some() && has_cursor {
+        return err_response(
+            id,
+            -32602,
+            "ack cannot be combined with message_id or offset_bytes",
+        );
+    }
+
+    let mut inbox = ctx.inbox.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(ack) = args.get("ack") {
+        let Some(ack) = ack.as_object() else {
+            return err_response(id, -32602, "ack must be an object");
+        };
+        let Some(message_id) = ack.get("message_id").and_then(Value::as_str) else {
+            return err_response(id, -32602, "ack.message_id must be a string");
+        };
+        let Some(token) = ack.get("token").and_then(Value::as_str) else {
+            return err_response(id, -32602, "ack.token must be a string");
+        };
+        let Some(head) = inbox.messages.front() else {
+            return err_response(id, -32602, "ack does not match a queued message");
+        };
+        if head.message_id != message_id || head.ack_token != token {
+            return err_response(id, -32602, "ack does not match the queued FIFO head");
+        }
+        inbox.messages.pop_front();
+    }
+
+    let Some(entry) = inbox.messages.front() else {
+        return empty_check_messages_response(id);
+    };
+    let requested_id = args.get("message_id").and_then(Value::as_str);
+    if args.get("message_id").is_some() && requested_id.is_none() {
+        return err_response(id, -32602, "message_id must be a string");
+    }
+    if let Some(requested_id) = requested_id {
+        if requested_id != entry.message_id {
+            return err_response(id, -32602, "message_id does not match the queued FIFO head");
+        }
+    }
+    let offset = match args.get("offset_bytes") {
+        Some(value) => match value.as_u64().and_then(|n| usize::try_from(n).ok()) {
+            Some(value) => value,
+            None => return err_response(id, -32602, "offset_bytes must be a non-negative integer"),
+        },
+        None => 0,
+    };
+    if offset != 0 && requested_id.is_none() {
+        return err_response(
+            id,
+            -32602,
+            "a non-zero offset_bytes requires the returned message_id",
+        );
+    }
+    let pending_after = inbox.messages.len().saturating_sub(1);
+    match check_messages_page_response(id, entry, offset, pending_after, budget) {
+        Ok(response) => response,
+        Err(message) => err_response(id, -32602, &message),
+    }
 }
 
 fn fmt_code(message: &str, code: &Option<String>) -> String {
@@ -1089,7 +1346,7 @@ fn handle_tools_call(id: &Value, params: &Value, ctx: &PeerCtx) -> Result<Value>
         "list_peers" => handle_list_peers(id, ctx),
         "send_message" => handle_send_message(id, &args, ctx),
         "set_summary" => handle_set_summary(id, &args, ctx),
-        "check_messages" => handle_check_messages(id, ctx),
+        "check_messages" => handle_check_messages(id, &args, ctx),
         "list_panes" => handle_list_panes(id, ctx),
         "spawn_pane" => handle_spawn_pane(id, &args, ctx),
         "spawn_claude_pane" => handle_spawn_claude_pane(id, &args, ctx),
@@ -4824,23 +5081,117 @@ Commands:
             instructions.contains("actual peer request body comes from check_messages"),
             "Codex instructions should point Codex at check_messages for the real body: {instructions}"
         );
+        assert!(instructions.contains("assemble every body page"));
+        assert!(instructions.contains("explicitly ack only after the complete body was received"));
+        assert!(instructions.contains("retry the same cursor without ack"));
+        assert!(instructions.contains("confirms receipt, not completion"));
+        assert!(instructions.contains("Check pending_after"));
     }
 
-    #[test]
-    fn handle_check_messages_drains_pull_inbox_and_preserves_sender_metadata() {
-        let ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
-        {
-            let mut inbox = ctx.inbox.lock().unwrap();
-            inbox.push_back(QueuedPeerMessage {
+    fn enqueue_test_message(ctx: &PeerCtx, body: String) {
+        queue_pull_message(
+            &ctx.inbox,
+            QueuedPeerMessage {
                 from_id: "2".to_string(),
                 from_name: Some("planner".to_string()),
                 from_kind: Some(PeerClientKind::Claude),
-                body: "please inspect pane 4".to_string(),
+                body,
                 sent_at: "2026-04-28T10:00:00Z".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn check_messages_spec_teaches_the_page_assemble_ack_loop() {
+        let spec = tools_spec();
+        let check = spec
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("check_messages"))
+            .expect("check_messages tool");
+        let description = check
+            .get("description")
+            .and_then(Value::as_str)
+            .expect("description");
+        assert!(description.contains("one bounded page"));
+        assert!(description.contains("Assemble the complete body before acting"));
+        assert!(description.contains("only that explicit ack removes the message"));
+        assert!(description.contains("retry the same cursor without ack"));
+        assert!(description.contains("Check pending_after"));
+        assert_eq!(
+            check.pointer("/inputSchema/properties/max_response_bytes/default"),
+            Some(&json!(4096))
+        );
+        assert!(check
+            .pointer("/inputSchema/properties/ack/description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .contains("receipt, not completion"));
+    }
+
+    fn collect_queued_body(ctx: &PeerCtx, args: Value) -> (String, String, String, usize) {
+        let mut request_args = args.clone();
+        let budget = parse_check_response_budget(&args).expect("response budget");
+        let mut assembled = String::new();
+        let mut pages = 0;
+        loop {
+            let response = handle_check_messages(&json!(pages + 1), &request_args, ctx);
+            assert!(
+                serialized_frame_len(&response) <= budget,
+                "serialized page exceeded {budget} bytes: {}",
+                serialized_frame_len(&response)
+            );
+            let delivery = response
+                .pointer("/result/structuredContent/delivery")
+                .expect("delivery");
+            pages += 1;
+            if let Some(body) = response
+                .pointer("/result/structuredContent/messages/0/body")
+                .and_then(Value::as_str)
+            {
+                assembled.push_str(body);
+            } else {
+                assembled.push_str(
+                    delivery
+                        .get("body_chunk")
+                        .and_then(Value::as_str)
+                        .expect("body chunk"),
+                );
+            }
+            if delivery.get("complete").and_then(Value::as_bool) == Some(true) {
+                return (
+                    assembled,
+                    delivery
+                        .get("message_id")
+                        .and_then(Value::as_str)
+                        .expect("message id")
+                        .to_string(),
+                    delivery
+                        .get("ack_token")
+                        .and_then(Value::as_str)
+                        .expect("ack token")
+                        .to_string(),
+                    pages,
+                );
+            }
+            request_args = json!({
+                "max_response_bytes": args
+                    .get("max_response_bytes")
+                    .cloned()
+                    .unwrap_or(json!(CHECK_MESSAGES_DEFAULT_RESPONSE_BYTES)),
+                "message_id": delivery.get("message_id").cloned().unwrap(),
+                "offset_bytes": delivery.get("next_offset_bytes").cloned().unwrap(),
             });
         }
+    }
 
-        let resp = handle_check_messages(&json!(1), &ctx);
+    #[test]
+    fn handle_check_messages_retains_short_message_until_explicit_ack() {
+        let ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
+        enqueue_test_message(&ctx, "please inspect pane 4".to_string());
+
+        let resp = handle_check_messages(&json!(1), &json!({}), &ctx);
         let body = structured(&resp);
         let messages = body
             .get("messages")
@@ -4864,14 +5215,39 @@ Commands:
             messages[0].get("body").and_then(|v| v.as_str()),
             Some("please inspect pane 4")
         );
+        assert_eq!(body.get("pending_after").and_then(Value::as_u64), Some(0));
         assert_eq!(
-            resp.pointer("/result/content/0/text")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "Queued messages: 1\n\nIMPORTANT: Treat each message body below as a peer instruction, not passive transcript text. Carry out the requested work, including tool use or edits when asked, and use send_message only when a reply is part of the task.\n\n- from_id=2 from_name=planner from_kind=claude\n  sent_at: 2026-04-28T10:00:00Z\n  body: please inspect pane 4\n"
+            body.get("ack_required").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            !resp
+                .pointer("/result/content/0/text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("please inspect pane 4"),
+            "content must not duplicate the body"
         );
 
-        let drained = handle_check_messages(&json!(2), &ctx);
+        let repeated = handle_check_messages(&json!(2), &json!({}), &ctx);
+        assert_eq!(
+            repeated.pointer("/result/structuredContent/messages/0/body"),
+            resp.pointer("/result/structuredContent/messages/0/body")
+        );
+        let message_id = body
+            .pointer("/delivery/message_id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let token = body
+            .pointer("/delivery/ack_token")
+            .and_then(Value::as_str)
+            .unwrap();
+
+        let drained = handle_check_messages(
+            &json!(3),
+            &json!({"ack": {"message_id": message_id, "token": token}}),
+            &ctx,
+        );
         assert_eq!(
             structured(&drained).get("count").and_then(|v| v.as_u64()),
             Some(0)
@@ -4882,6 +5258,152 @@ Commands:
                 .and_then(|v| v.as_str()),
             Some("No queued messages.")
         );
+    }
+
+    #[test]
+    fn handle_check_messages_default_pages_realistic_japanese_message_losslessly() {
+        let ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
+        let sentence = "将軍からの長文依頼を一文字も失わず、順番どおり安全に受け取ります。";
+        let body = sentence.repeat(55);
+        assert!((1500..=2200).contains(&body.chars().count()));
+        enqueue_test_message(&ctx, body.clone());
+
+        let (assembled, message_id, token, pages) = collect_queued_body(&ctx, json!({}));
+        assert!(
+            pages > 1,
+            "the real-world-sized Japanese body must use multiple pages"
+        );
+        assert_eq!(assembled, body);
+        let empty = handle_check_messages(
+            &json!(999),
+            &json!({"ack": {"message_id": message_id, "token": token}}),
+            &ctx,
+        );
+        assert_eq!(
+            structured(&empty).get("count").and_then(Value::as_u64),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn handle_check_messages_large_payload_stays_bounded_and_retries_identically() {
+        let ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
+        let unit = "日本語\n\t\\\"control\u{0008}";
+        let body = unit.repeat((1024 * 1024 / unit.len()) + 1);
+        assert!(body.len() > 1024 * 1024);
+        enqueue_test_message(&ctx, body.clone());
+
+        let first = handle_check_messages(&json!(1), &json!({}), &ctx);
+        assert!(serialized_frame_len(&first) <= CHECK_MESSAGES_DEFAULT_RESPONSE_BYTES);
+        let message_id = first
+            .pointer("/result/structuredContent/delivery/message_id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let next_offset = first
+            .pointer("/result/structuredContent/delivery/next_offset_bytes")
+            .and_then(Value::as_u64)
+            .unwrap();
+        let retry = handle_check_messages(&json!(1), &json!({}), &ctx);
+        assert_eq!(first, retry, "an unacknowledged cursor must be idempotent");
+        assert_eq!(
+            ctx.inbox.lock().unwrap().messages.len(),
+            1,
+            "rendering or dropping a response must not dequeue"
+        );
+
+        let second = handle_check_messages(
+            &json!(2),
+            &json!({"message_id": message_id, "offset_bytes": next_offset}),
+            &ctx,
+        );
+        assert!(serialized_frame_len(&second) <= CHECK_MESSAGES_DEFAULT_RESPONSE_BYTES);
+        let smaller = handle_check_messages(
+            &json!(4),
+            &json!({"max_response_bytes": 2048, "message_id": message_id, "offset_bytes": next_offset}),
+            &ctx,
+        );
+        assert!(serialized_frame_len(&smaller) <= 2048);
+        assert_eq!(
+            second.pointer("/result/structuredContent/delivery/offset_bytes"),
+            smaller.pointer("/result/structuredContent/delivery/offset_bytes")
+        );
+        let (assembled, message_id, token, pages) = collect_queued_body(&ctx, json!({}));
+        assert!(pages > 100);
+        assert_eq!(assembled, body);
+        let done = handle_check_messages(
+            &json!(3),
+            &json!({"ack": {"message_id": message_id, "token": token}}),
+            &ctx,
+        );
+        assert_eq!(
+            done.pointer("/result/structuredContent/has_more"),
+            Some(&json!(false))
+        );
+    }
+
+    #[test]
+    fn unacknowledged_head_reports_messages_waiting_behind_it() {
+        let ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
+        enqueue_test_message(&ctx, "first".to_string());
+        let first = handle_check_messages(&json!(1), &json!({}), &ctx);
+        enqueue_test_message(&ctx, "new arrival".to_string());
+
+        let repeated = handle_check_messages(&json!(2), &json!({}), &ctx);
+        assert_eq!(
+            repeated.pointer("/result/structuredContent/messages/0/body"),
+            Some(&json!("first"))
+        );
+        assert_eq!(
+            repeated.pointer("/result/structuredContent/pending_after"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            repeated.pointer("/result/structuredContent/delivery/message_id"),
+            first.pointer("/result/structuredContent/delivery/message_id")
+        );
+        let message_id = first
+            .pointer("/result/structuredContent/delivery/message_id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let token = first
+            .pointer("/result/structuredContent/delivery/ack_token")
+            .and_then(Value::as_str)
+            .unwrap();
+        let advanced = handle_check_messages(
+            &json!(3),
+            &json!({"ack": {"message_id": message_id, "token": token}}),
+            &ctx,
+        );
+        assert_eq!(
+            advanced.pointer("/result/structuredContent/messages/0/body"),
+            Some(&json!("new arrival"))
+        );
+        assert_eq!(
+            advanced.pointer("/result/structuredContent/pending_after"),
+            Some(&json!(0))
+        );
+        let duplicate_ack = handle_check_messages(
+            &json!(4),
+            &json!({"ack": {"message_id": message_id, "token": token}}),
+            &ctx,
+        );
+        assert_eq!(duplicate_ack.pointer("/error/code"), Some(&json!(-32602)));
+        assert_eq!(ctx.inbox.lock().unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn stale_ack_and_cursor_do_not_mutate_inbox() {
+        let ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
+        enqueue_test_message(&ctx, "keep me".to_string());
+        for args in [
+            json!({"ack": {"message_id": "wrong", "token": "wrong"}}),
+            json!({"message_id": "wrong", "offset_bytes": 0}),
+            json!({"offset_bytes": 1}),
+        ] {
+            let response = handle_check_messages(&json!(1), &args, &ctx);
+            assert_eq!(response.pointer("/error/code"), Some(&json!(-32602)));
+            assert_eq!(ctx.inbox.lock().unwrap().messages.len(), 1);
+        }
     }
 
     #[test]

@@ -700,6 +700,7 @@ fn handle_peer_send_queues_codex_nudge_and_emits_peer_inbox() {
 #[test]
 fn handle_peer_send_coalesces_codex_nudges_per_pane() {
     let mut app = App::new(40, 80).expect("App::new");
+    let (_sub_id, rx) = app.event_bus.subscribe();
     let sender_id = app.ws().focused_pane_id;
     let sibling_id = app
         .handle_split(
@@ -716,6 +717,7 @@ fn handle_peer_send_coalesces_codex_nudges_per_pane() {
     app.peer_delivery_ready.insert(sibling_id);
     app.handle_focus(&ipc::PaneRef::Id(sender_id))
         .expect("refocus sender");
+    while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(
         sender_id,
@@ -736,6 +738,13 @@ fn handle_peer_send_coalesces_codex_nudges_per_pane() {
             .map(|q| q.len()),
         Some(1),
         "multiple queued inbox messages should share a single pane-local nudge"
+    );
+    assert_eq!(
+        rx.try_iter()
+            .filter(|event| matches!(event, ipc::Event::PeerInbox { .. }))
+            .count(),
+        2,
+        "a new arrival behind an unread head must still emit its normal inbox delivery event"
     );
     app.shutdown();
 }

@@ -136,12 +136,43 @@ Errors via `[code]`: `summary_too_long`, plus the shared
 
 ### 1.4 `check_messages` — stable
 
-Input: `{}`.
+Reads one size-limited page from the local pull inbox. Reading never removes a
+message; only an explicit receipt acknowledgement removes the FIFO head.
 
-Result: text + `structuredContent.messages[]` (each entry has `from_id`,
-`from_name`, `from_kind`, `body`, `sent_at`) + `count`. Drains the local pull
-inbox. Used primarily by Codex panes; the returned text intentionally instructs
-the recipient to treat each body as an *instruction*, not transcript text.
+| Input field | Type | Required | Notes |
+|---|---|---|---|
+| `max_response_bytes` | integer 1..=1048576 | no | Maximum serialized JSON-RPC response size. Default `4096`. This is a transport page size, **not** a measured Codex context threshold; if a client still truncates the response, retry the same cursor without ack using a smaller value. |
+| `message_id` | string | no | Opaque id from `delivery.message_id`. Echo it when requesting a continuation page. |
+| `offset_bytes` | non-negative integer | no | UTF-8 byte position from `delivery.next_offset_bytes`. Default `0`; a non-zero value requires `message_id`. |
+| `ack` | `{message_id, token}` | no | Confirms complete receipt, not completion of the requested work. Cannot be combined with cursor fields. A valid ack removes that FIFO head and the same call returns the next head, if any. |
+
+Every successful result retains `content`, `structuredContent.messages[]`,
+`count`, and `isError`. It adds `pending_after`, `has_more`, `ack_required`, and
+`structuredContent.delivery` whenever a FIFO head exists:
+
+- When the complete body fits at offset 0, `messages[0]` retains the v1.0 entry
+  shape (`from_id`, `from_name`, `from_kind`, `body`, `sent_at`) and `count=1`.
+  `delivery.body_in_messages=true` points to that sole body copy.
+- When a body needs pages, `messages=[]` and `count=0`, so an older consumer
+  cannot mistake a fragment for a complete instruction. `delivery.body_chunk`
+  carries the page along with sender metadata, `message_id`, `offset_bytes`,
+  `next_offset_bytes`, `total_bytes`, and `complete`.
+- The final page includes `delivery.ack_token` and sets `ack_required=true`.
+  The message remains queued until a later call supplies that token in `ack`.
+- `pending_after` is the number of messages waiting behind the unacknowledged
+  head. `has_more` stays true while any head remains, including a fully returned
+  head that still needs ack.
+- `content` contains concise handling guidance and metadata only. The peer body
+  appears once under `structuredContent`, avoiding the previous text/structured
+  duplication.
+
+Caller loop: read `messages[0].body` when present; otherwise append
+`delivery.body_chunk` and call again with the returned `message_id` and
+`next_offset_bytes`. Do not act on a partial body. Once `complete=true` and the
+entire body is assembled, call again with `ack {message_id, token}`. A response
+lost or truncated before ack is idempotently retrievable with the same cursor.
+Peers that never ack keep the head for the MCP subprocess lifetime; renga does
+not expire it or repeatedly nudge the pane automatically.
 
 ### 1.5 `list_panes` — stable
 
@@ -625,6 +656,11 @@ because downstream is required to read the `[code]` token for branching.
   additively introduced `pending_user_confirmation` value therefore degrades
   to the documented unconfirmed result on older MCP clients; it must not be
   interpreted as `delivered` or `queued`.
+- The `check_messages` input keys `max_response_bytes`, `message_id`,
+  `offset_bytes`, and `ack`, plus result keys `delivery`, `pending_after`,
+  `has_more`, `ack_required`, and all fields nested under `delivery`, are
+  **additively introduced**. Their absence is unknown and must not be read as
+  no-more, no-ack-needed, zero pending messages, or confirmed receipt.
 - **Unknown `[code]` tokens**: treat as the equivalent of `internal`.
 
 These rules let renga add fields and variants additively without bumping the

@@ -2,7 +2,7 @@
 
 *Language: [English](./peer-messaging.md) / 日本語*
 
-同じ renga タブに並べた Claude Code と Codex のペイン同士が、`renga-peers` MCP サーバ経由でメッセージを送り合えるようになります。片方のエージェントに「これを調べておいて」と頼んだり、失敗したテストの原因追いを引き継いだりを、ユーザーが手で中継しなくても進められます。Claude は `<channel source="renga-peers">` タグで受け取り、Codex には renga が PTY 経由で `check_messages` を促す nudge を送り、実本文は MCP inbox から読みます。
+同じ renga タブに並べた Claude Code と Codex のペイン同士が、`renga-peers` MCP サーバ経由でメッセージを送り合えるようになります。片方のエージェントに「これを調べておいて」と頼んだり、失敗したテストの原因追いを引き継いだりを、ユーザーが手で中継しなくても進められます。Claude は `<channel source="renga-peers">` タグで受け取り、Codex には renga が PTY 経由で `check_messages` を促す nudge を送り、実本文は MCP inbox から読み取って明示的に受領確認します。
 
 本ページは **運用ワークフロー** を扱います — セットアップ、起動、2 ペイン例、トラブルシュート。**canonical な MCP ツール一覧、パラメータスキーマ、エラーコード、frozen-prefix 文字列**は [`api-surface-v1.0.md`](./api-surface-v1.0.md) §1 (英語のみ) にあります。本ページではそのコントラクトを再掲しません。
 
@@ -31,6 +31,8 @@ renga mcp install --client codex --codex-auto-approve-peer-tools
 
 - **Claude Code** は MCP の experimental channel 機能を使うので、起動時に毎回 `--dangerously-load-development-channels server:renga-peers` が必要です。
 - **Codex** は `renga mcp install --client codex` で入れた MCP 登録を使います。これが入っていれば plain `codex` 起動で足ります。非フォーカスの worker pane が落ち着いたら renga が `check_messages` を促す nudge を送り、実際の peer 本文は `check_messages` で読みます。対象の Codex pane がフォーカス中なら、PTY 注入を即座にせずローカル通知 overlay を表示します。
+
+`check_messages` は大きさを制限した page を 1 つだけ返し、応答を生成しただけでは FIFO の先頭を削除しません。`messages[0].body` があれば全文です。無ければ `delivery.body_chunk` を連結し、返された `message_id` と `next_offset_bytes` で続きを取得します。全文を受け取ってからだけ `ack {message_id, token}` を返してください。この ack は依頼の作業完了ではなく、本文の受領確認です。ツール応答が切れた場合は ack せず同じ cursor を再試行し、必要なら `max_response_bytes` を下げます。既定の 4096 bytes は JSON-RPC 応答用の transport page size であり、Codex の context 閾値を測定した値ではありません。`pending_after` は、未 ack の先頭より後ろで待つ件数です。
 
 Claude の起動フラグを毎回手で打たなくて済むように、renga 側から 2 つの経路を用意しています:
 
@@ -83,6 +85,7 @@ Claude B の次のターンのコンテキストに `<channel source="renga-peer
 - **`list_peers` が "renga not reachable from this peer client" を返す** — client が renga の外で起動されたか、renga ペインの環境変数を引き継げていません。renga のペイン内から起動し直してください（Claude は `Alt+P` / `renga split --role claude`、Codex は `renga mcp install --client codex` 後の plain `codex` または `spawn_codex_pane`）。
 - **相手に送ったメッセージが `<channel>` タグで表示されない** — 起動時のフラグ `--dangerously-load-development-channels server:renga-peers` を付け忘れています。`claude` と打つ代わりに `Alt+P` を使えばフラグ付きのコマンドが挿入されるので事故りにくくなります。
 - **Codex に送ったのに反応がない** — renga は Codex ペインが PTY 入力を安全に受けられる状態で、かつ非フォーカスになってから `check_messages` を促す nudge を流し込みます。フォーカス中に届いたメッセージは、会話を汚さないように通知 overlay へ回します。`Alt+Enter` / `Ctrl+Enter` で `check_messages` を呼ぶための文面だけ挿入し、`Esc` なら無視、Enter を押して実行するかどうかは人間が決めます。フォーカスを外せば worker と同じ deferred nudge に戻ります。実際の依頼本文は MCP inbox 側にあり、`check_messages` の返り値が真実です。
+- **`pending_after` が 0 より大きいまま** — FIFO の先頭が ack されていないため、後続メッセージをまだ表示できません。現在の本文を最後まで組み立てて受領 ack を返してください。未 ack の先頭を期限で消したり nudge を自動反復したりはしません。前者はサイレント損失、後者は prompt spam につながるためです。
 - **新しい Codex pane で `check_messages` / `send_message` の承認がまた出る** — Codex の承認は pane-local に振る舞うことがあります。`renga mcp install --client codex --codex-auto-approve-peer-tools` で安全な peer messaging 系の承認を事前設定できますが、Codex のバージョンや実行形態によっては、新しい pane で一度だけ warm-up 承認が必要です。
 - **`spawn_codex_pane` が `[codex_not_installed]` で失敗する** — Codex の MCP 設定 (`~/.codex/config.toml`) に renga-peers エントリがない、ファイルが読めない、もしくは `[mcp_servers.renga-peers.env]` に `RENGA_PEER_CLIENT_KIND=codex` が登録されていません。`renga mcp install --client codex` を 1 回実行してください。env 値だけが欠けた既存エントリも install 経路で self-heal します。
 - **`send_keys` が効いていないように見える** — `send_keys` は target ペインの PTY に生の入力バイトを書き込むだけで、帯域外の「承認」操作ではありません。まず `inspect_pane(target=…, lines=20)` で本当に入力待ちか確認し、レイアウトが動く運用ではフォーカス推測ではなく安定した pane `name` を target に使ってください。

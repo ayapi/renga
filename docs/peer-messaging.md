@@ -1,6 +1,6 @@
 # Peer messaging between Claude Code and Codex panes
 
-Mixed Claude Code and Codex instances running in the same renga tab exchange structured messages through the `renga-peers` MCP server, so one agent can ask its sibling to research something, hand off a test failure, or coordinate without the user relaying every message manually. Claude peers receive `<channel source="renga-peers">` tags; Codex peers get a pane-local nudge from renga, then drain the actual queued message body with `check_messages`.
+Mixed Claude Code and Codex instances running in the same renga tab exchange structured messages through the `renga-peers` MCP server, so one agent can ask its sibling to research something, hand off a test failure, or coordinate without the user relaying every message manually. Claude peers receive `<channel source="renga-peers">` tags; Codex peers get a pane-local nudge from renga, then read and explicitly acknowledge the actual queued message body with `check_messages`.
 
 This page covers the **operational workflow** — setup, launch, the two-pane example, and troubleshooting. The **canonical MCP tool list, parameter schemas, error codes, and frozen-prefix strings** live in [`api-surface-v1.0.md`](./api-surface-v1.0.md) §1; this doc deliberately does not restate that contract.
 
@@ -29,6 +29,17 @@ Peer delivery is client-specific:
 
 - **Claude Code** uses the MCP experimental channel protocol, so it needs `--dangerously-load-development-channels server:renga-peers` at startup.
 - **Codex** uses the MCP registration installed by `renga mcp install --client codex`; once that is in place, a plain `codex` launch is enough. renga will nudge non-focused worker panes when they look ready, and Codex reads the actual peer request body with `check_messages`. If the target Codex pane is currently focused, renga shows a local notification overlay instead of injecting PTY input immediately.
+
+`check_messages` returns at most one size-limited page and does not remove its
+FIFO head merely because it rendered a response. If `messages[0].body` is
+present, that is a complete message. Otherwise, assemble
+`delivery.body_chunk` pages by echoing `message_id` and `next_offset_bytes`.
+Only after the complete body is received should the caller send the returned
+`ack {message_id, token}`; that ack confirms receipt, not task completion. If a
+tool response is truncated, retry the same cursor without ack and optionally
+lower `max_response_bytes`. The default 4096-byte serialized-response budget is
+a transport page size, not a Codex context threshold. `pending_after` reports
+how many messages are waiting behind an unacknowledged head.
 
 renga gives you two shortcuts so you don't have to type the Claude launch flag by hand:
 
@@ -81,6 +92,7 @@ The pane-control tools (`list_panes`, `spawn_pane`, `spawn_claude_pane`, `spawn_
 - **`list_peers` reports "renga not reachable from this peer client"** — The client was launched outside a renga pane, or without inheriting the pane env. Re-launch from inside renga (`Alt+P` / `renga split --role claude` for Claude, or a normal `codex` / `spawn_codex_pane` launch after `renga mcp install --client codex`).
 - **Peer messages don't render as `<channel>` tags** — You probably forgot the `--dangerously-load-development-channels server:renga-peers` flag. Prefer `Alt+P` over typing `claude` directly.
 - **A message sent to Codex seems to do nothing** — renga only injects the `check_messages` nudge when the target Codex pane looks ready to accept PTY input and is not currently focused. If the message arrives while that pane is focused, renga shows a notification overlay instead: `Alt+Enter` / `Ctrl+Enter` inserts the `check_messages` prompt into the composer, `Esc` ignores it, and pressing Enter is still your decision. If you leave the pane focused alone, the request stays in the MCP inbox; if you move focus away, the worker-style deferred nudge path takes over. The actual request body still lives in the MCP inbox, so run `check_messages` and treat that result as the source of truth.
+- **`pending_after` stays above zero** — The FIFO head has not been acknowledged, so later messages cannot be shown yet. Finish assembling the current body and send its receipt ack. renga deliberately does not expire an unacknowledged head or repeatedly inject nudges, because either behavior could cause silent loss or prompt spam.
 - **A new Codex pane asks for `check_messages` / `send_message` approval again** — Codex approvals can still behave pane-locally. `renga mcp install --client codex --codex-auto-approve-peer-tools` preconfigures the safe peer-messaging approvals, but a brand-new pane may still need one warm-up approval depending on the Codex version and runtime.
 - **`spawn_codex_pane` fails with `[codex_not_installed]`** — Codex's MCP config (`~/.codex/config.toml`) is missing the renga-peers entry, the file is unreadable, or `RENGA_PEER_CLIENT_KIND=codex` is absent from its `[mcp_servers.renga-peers.env]` subtable. Run `renga mcp install --client codex` once; the install path self-heals an existing entry that is missing the env var.
 - **`send_keys` seems to do nothing** — `send_keys` writes raw bytes to the target pane's PTY; it does not grant approval out-of-band. Snapshot first with `inspect_pane(target=…, lines=20)` to confirm the pane is actually waiting for input, and prefer a stable pane `name` over guessing by focus in changing layouts.
