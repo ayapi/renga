@@ -92,8 +92,10 @@ deferred to a future minor release.
 arriving within a small dedupe window (~5s) are collapsed server-side to a
 single delivery. A repeat call returns the same outcome as the original call:
 `"Delivered to …"` for an immediately delivered message, or `"Queued for …"`
-for a message accepted into the peer's pending queue. This prevents the sender
-from probing the dedupe state; only one `Event::PeerInbox` reaches the receiver.
+for a message accepted into the peer's pending queue, or
+`"Pending user confirmation for …"` when the original nudge awaits acceptance.
+This prevents the sender from probing the dedupe state; only one
+`Event::PeerInbox` reaches the receiver.
 Two distinct senders sending the same body still both deliver. See renga#221
 for context.
 

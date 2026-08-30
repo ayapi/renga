@@ -1880,13 +1880,15 @@ fn focused_codex_without_draft_auto_submits_when_ready() {
         .expect("focus sibling");
     seed_codex_live_ready_placeholder(&mut app, sibling_id);
 
-    app.handle_peer_send(
-        sender_id,
-        &ipc::PaneRef::Id(sibling_id),
-        "hello focused codex".to_string(),
-    )
-    .expect("peer send");
+    let outcome = app
+        .handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(sibling_id),
+            "hello focused codex".to_string(),
+        )
+        .expect("peer send");
 
+    assert_eq!(outcome, ipc::PeerSendOutcome::Delivered);
     assert!(app.visible_codex_peer_notification().is_none());
     let queued = app
         .pending_codex_peer_messages
@@ -1919,13 +1921,15 @@ fn focused_codex_without_draft_queues_when_not_ready() {
     app.handle_focus(&ipc::PaneRef::Id(sibling_id))
         .expect("focus sibling");
 
-    app.handle_peer_send(
-        sender_id,
-        &ipc::PaneRef::Id(sibling_id),
-        "hello focused codex".to_string(),
-    )
-    .expect("peer send");
+    let outcome = app
+        .handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(sibling_id),
+            "hello focused codex".to_string(),
+        )
+        .expect("peer send");
 
+    assert_eq!(outcome, ipc::PeerSendOutcome::Delivered);
     assert!(app.visible_codex_peer_notification().is_none());
     assert!(matches!(
         app.pending_codex_peer_messages
@@ -1933,6 +1937,106 @@ fn focused_codex_without_draft_queues_when_not_ready() {
             .and_then(|q| q.front()),
         Some(PendingCodexPeerDelivery::Draft { .. })
     ));
+    app.shutdown();
+}
+
+#[test]
+fn focused_codex_new_draft_queue_does_not_inherit_existing_confirmation_outcome() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
+    app.handle_focus(&ipc::PaneRef::Id(sibling_id))
+        .expect("focus sibling");
+
+    seed_codex_draft(&mut app, sibling_id);
+    let first = app
+        .handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(sibling_id),
+            "first notification".to_string(),
+        )
+        .expect("first peer send");
+    assert_eq!(first, ipc::PeerSendOutcome::PendingUserConfirmation);
+
+    app.ws_mut()
+        .panes
+        .get_mut(&sibling_id)
+        .expect("pane")
+        .parser = std::sync::Arc::new(std::sync::Mutex::new(vt100::Parser::new(40, 80, 10_000)));
+    seed_codex_busy_placeholder(&mut app, sibling_id);
+    {
+        let pane = app.ws().panes.get(&sibling_id).expect("pane");
+        let parser = pane
+            .parser
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            codex_composer_has_draft_on_screen(parser.screen()),
+            Some(false),
+            "the user-cleared busy composer must take the Draft queue path"
+        );
+    }
+    app.ws_mut()
+        .panes
+        .get_mut(&sibling_id)
+        .expect("pane")
+        .clear_test_input();
+    let second = app
+        .handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(sibling_id),
+            "second automatic nudge".to_string(),
+        )
+        .expect("second peer send");
+
+    assert_eq!(
+        second,
+        ipc::PeerSendOutcome::Delivered,
+        "a newly queued Draft must not inherit an older notification's outcome"
+    );
+    assert_eq!(
+        app.visible_codex_peer_notification()
+            .expect("the first notification remains visible")
+            .pending_count,
+        1
+    );
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&sibling_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::Draft { .. })
+    ));
+
+    seed_codex_live_ready_placeholder(&mut app, sibling_id);
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&sibling_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
+    ));
+    assert!(
+        !app
+            .ws()
+            .panes
+            .get(&sibling_id)
+            .expect("pane")
+            .test_input()
+            .is_empty(),
+        "the second nudge should enter automatic submission without accepting the first notification"
+    );
     app.shutdown();
 }
 

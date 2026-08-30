@@ -530,11 +530,8 @@ impl App {
                     matches!(delivery, PendingCodexPeerDelivery::QueueAt { .. })
                 });
             if target_is_focused && !nudge_commit_in_flight {
-                self.route_focused_codex_peer_message(target_id, message)?;
-                pending_user_confirmation = self
-                    .codex_peer_notification
-                    .as_ref()
-                    .is_some_and(|notification| notification.target_pane == target_id);
+                pending_user_confirmation =
+                    self.route_focused_codex_peer_message(target_id, message)?;
             } else {
                 self.push_pending_codex_peer_nudge(target_id, message);
             }
@@ -737,7 +734,7 @@ impl App {
         &mut self,
         pane_id: usize,
         message: PendingCodexPeerMessage,
-    ) -> std::result::Result<(), ipc::CodedError> {
+    ) -> std::result::Result<bool, ipc::CodedError> {
         let registered_codex = self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex);
         let has_draft = self
             .ws()
@@ -747,7 +744,7 @@ impl App {
             .unwrap_or(false);
         if has_draft {
             self.show_codex_peer_notification(pane_id, message, Some(CODEX_PEER_NUDGE_MAX_RETRIES));
-            return Ok(());
+            return Ok(true);
         }
         let ready = self
             .ws()
@@ -756,7 +753,7 @@ impl App {
             .is_some_and(|pane| Self::codex_peer_delivery_ready(registered_codex, pane));
         if !ready {
             self.push_pending_codex_peer_nudge(pane_id, message);
-            return Ok(());
+            return Ok(false);
         }
         let payload_text = format_codex_peer_message(&message);
         let payload = crate::mcp_peer::build_send_keys_payload(&payload_text, None, false)
@@ -774,7 +771,7 @@ impl App {
         });
         self.codex_peer_notification = None;
         self.dirty = true;
-        Ok(())
+        Ok(false)
     }
 
     pub(crate) fn codex_peer_notification_is_visible(&self) -> bool {

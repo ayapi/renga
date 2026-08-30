@@ -70,6 +70,12 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
   Alt+P inserted string is longer by one flag, which is user-facing
   but not a wire-format change. (renga-234)
 
+### Fixed
+
+- **`send_message` now reports focused Codex confirmation waits accurately.**
+  The additive `pending_user_confirmation` outcome renders as
+  `Pending user confirmation for <target>.` instead of claiming delivery.
+
 ## [1.3.2] — 2026-06-07
 
 Patch release. Fixes caret freeze/drift in Claude Code panes on Windows
