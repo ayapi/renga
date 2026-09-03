@@ -80,7 +80,6 @@ pub(crate) enum PendingCodexPeerDelivery {
     QueueAt {
         ready_at: Instant,
         expires_at: Instant,
-        injected_while_focused: bool,
         message: PendingCodexPeerMessage,
         expected_composer: String,
         expected_composer_raw: Option<String>,
@@ -1508,7 +1507,6 @@ impl App {
                                         // does not interpret text plus Tab/Enter as a paste.
                                         ready_at,
                                         expires_at,
-                                        injected_while_focused: pane_is_focused,
                                         message,
                                         expected_composer,
                                         expected_composer_raw: codex_peer_debug_log_path
@@ -1660,7 +1658,6 @@ impl App {
                         PendingCodexPeerDelivery::QueueAt {
                             ready_at,
                             expires_at,
-                            injected_while_focused,
                             message,
                             expected_composer,
                             expected_composer_raw,
@@ -1700,7 +1697,7 @@ impl App {
                                 }
                             };
                             if now >= expires_at {
-                                if injected_while_focused || pane_is_focused {
+                                if pane_is_focused {
                                     if composer_matches {
                                         let _ = write_input_to_pane(pane, b"\x15", false);
                                         log_decision(
@@ -1762,14 +1759,13 @@ impl App {
                             } else if screen
                                 .as_ref()
                                 .is_some_and(|state| state.can_submit_injected_message)
-                                && !injected_while_focused
                                 && !pane_is_focused
                             {
                                 Some((b"\r".as_slice(), "enter_pressed", "enter_write_failed"))
                             } else if screen
                                 .as_ref()
                                 .is_some_and(|state| state.can_submit_injected_message)
-                                && (injected_while_focused || pane_is_focused)
+                                && pane_is_focused
                             {
                                 let _ = write_input_to_pane(pane, b"\x15", false);
                                 log_decision(

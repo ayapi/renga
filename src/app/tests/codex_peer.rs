@@ -2218,13 +2218,7 @@ fn busy_codex_native_queue_path_is_independent_of_pane_focus() {
             .get(&codex_id)
             .and_then(|queue| queue.front());
         assert!(
-            matches!(
-                pending,
-                Some(PendingCodexPeerDelivery::QueueAt {
-                    injected_while_focused,
-                    ..
-                }) if *injected_while_focused == pane_is_focused
-            ),
+            matches!(pending, Some(PendingCodexPeerDelivery::QueueAt { .. })),
             "the same busy screen must use native queue regardless of pane focus: {pending:?}"
         );
         assert!(app.visible_codex_peer_notification().is_none());
@@ -2313,6 +2307,129 @@ fn focused_native_queue_never_falls_back_to_enter_when_turn_finishes() {
         assert!(!app.pending_codex_peer_messages.contains_key(&codex_id));
         app.shutdown();
     }
+}
+
+#[test]
+fn unfocused_queue_fallback_does_not_replace_another_panes_notification() {
+    let mut app = App::new(40, 160).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let pane_a = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split pane A");
+    let pane_b = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Horizontal,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split pane B");
+    for pane_id in [pane_a, pane_b] {
+        app.peer_client_kinds.insert(pane_id, PeerClientKind::Codex);
+        app.peer_delivery_ready.insert(pane_id);
+    }
+
+    app.handle_focus(&ipc::PaneRef::Id(pane_b))
+        .expect("focus pane B");
+    seed_codex_busy_placeholder(&mut app, pane_b);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(pane_b),
+        "queue for pane B".to_string(),
+    )
+    .expect("send to pane B");
+    app.flush_pending_codex_peer_messages();
+    let expected_b = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: None,
+        from_kind: None,
+    });
+    seed_codex_idle_composer(&mut app, pane_b, &expected_b);
+
+    app.handle_focus(&ipc::PaneRef::Id(pane_a))
+        .expect("focus pane A");
+    seed_codex_draft(&mut app, pane_a);
+    let outcome = app
+        .handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(pane_a),
+            "retain pane A notification".to_string(),
+        )
+        .expect("send to pane A");
+    assert_eq!(outcome, ipc::PeerSendOutcome::PendingUserConfirmation);
+    assert_eq!(
+        app.visible_codex_peer_notification()
+            .expect("pane A notification")
+            .target_pane,
+        pane_a
+    );
+
+    app.ws_mut()
+        .panes
+        .get_mut(&pane_b)
+        .expect("pane B")
+        .clear_test_input();
+    make_codex_native_queue_ready(&mut app, pane_b);
+    app.flush_pending_codex_peer_messages();
+
+    assert_eq!(
+        app.visible_codex_peer_notification()
+            .expect("pane A notification must remain")
+            .target_pane,
+        pane_a,
+        "an unfocused pane must not replace another pane's visible notification"
+    );
+    assert_eq!(
+        app.ws().panes.get(&pane_b).expect("pane B").test_input(),
+        b"\r",
+        "the now-unfocused pane may use the ordinary idle Enter fallback"
+    );
+    app.shutdown();
+}
+
+#[test]
+fn focused_expired_queue_with_changed_composer_does_not_clear_user_input() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_codex_busy_placeholder(&mut app, codex_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "do not clear changed composer".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    app.handle_focus(&ipc::PaneRef::Id(codex_id))
+        .expect("focus Codex pane");
+    seed_codex_busy_composer(&mut app, codex_id, "user changed this composer");
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    expire_codex_native_queue(&mut app, codex_id);
+    app.flush_pending_codex_peer_messages();
+
+    assert!(
+        app.ws()
+            .panes
+            .get(&codex_id)
+            .expect("pane")
+            .test_input()
+            .is_empty(),
+        "a mismatched composer may belong to the user and must not receive Ctrl+U"
+    );
+    assert!(app.visible_codex_peer_notification().is_some());
+    app.shutdown();
 }
 
 #[test]
