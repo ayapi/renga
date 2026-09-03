@@ -697,6 +697,14 @@ fn dispatch_request_with_registry(
             kind,
             ready,
         } => forward_peer_set_ready(command_tx, peer_subscriptions, pane_id, kind, ready),
+        Request::PeerInboxAck {
+            pane_id,
+            delivery_id,
+        } => forward_unit(command_tx, |reply| AppCommand::PeerInboxAck {
+            pane_id,
+            delivery_id,
+            reply,
+        }),
         Request::SetSummary { from_pane, summary } => {
             let (reply_tx, reply_rx) = oneshot::channel();
             if command_tx
@@ -1310,6 +1318,32 @@ mod tests {
 
         assert!(matches!(response, Response::Ok { .. }));
         assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn peer_inbox_ack_is_forwarded_with_both_identifiers() {
+        let (command_tx, command_rx) = mpsc::channel();
+        let responder = thread::spawn(move || match command_rx.recv().unwrap() {
+            AppCommand::PeerInboxAck {
+                pane_id,
+                delivery_id,
+                reply,
+            } => {
+                assert_eq!(pane_id, 19);
+                assert_eq!(delivery_id, 23);
+                reply.send(Ok(())).unwrap();
+            }
+            other => panic!("expected peer receipt, got {other:?}"),
+        });
+        let response = dispatch_request(
+            Request::PeerInboxAck {
+                pane_id: 19,
+                delivery_id: 23,
+            },
+            &command_tx,
+        );
+        assert!(matches!(response, Response::Ok { .. }));
+        responder.join().unwrap();
     }
 
     #[test]

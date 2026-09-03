@@ -96,8 +96,7 @@ impl App {
                 body,
                 reply,
             } => {
-                let result = self.handle_peer_send(from_pane, &target, body);
-                let _ = reply.send(result);
+                self.begin_peer_send(from_pane, &target, body, reply);
             }
             AppCommand::PeerRegisterClient {
                 pane_id,
@@ -114,6 +113,14 @@ impl App {
                 reply,
             } => {
                 let result = self.handle_peer_set_ready(pane_id, kind, ready);
+                let _ = reply.send(result);
+            }
+            AppCommand::PeerInboxAck {
+                pane_id,
+                delivery_id,
+                reply,
+            } => {
+                let result = self.handle_peer_inbox_ack(pane_id, delivery_id);
                 let _ = reply.send(result);
             }
             AppCommand::PeerSubscriberGone { pane_id } => {

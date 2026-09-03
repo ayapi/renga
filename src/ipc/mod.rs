@@ -190,6 +190,11 @@ pub enum Request {
         kind: PeerClientKind,
         ready: bool,
     },
+    /// Confirm that the bundled MCP peer has retained a peer-inbox
+    /// message in its own process. This is separate from the
+    /// `check_messages` receipt token, which confirms the later
+    /// MCP-client-to-Codex handoff.
+    PeerInboxAck { pane_id: usize, delivery_id: u64 },
     /// Rename or (re)assign the stable `name` / `role` of an existing
     /// pane. Both fields use three-state semantics over the wire:
     ///
@@ -496,6 +501,9 @@ pub mod err_code {
     /// The target is not ready and its bounded pre-registration peer
     /// inbox cannot accept another message.
     pub const PEER_QUEUE_FULL: &str = "peer_queue_full";
+    /// The target MCP process did not confirm local retention before
+    /// the sender-facing IPC reply deadline.
+    pub const PEER_DELIVERY_UNCONFIRMED: &str = "peer_delivery_unconfirmed";
 }
 
 /// App-side error carrying a free-form message plus an optional
@@ -611,6 +619,10 @@ pub enum Event {
     /// event. Workspace isolation is enforced at send time, so an
     /// emitted `PeerInbox` is always intra-tab by construction.
     PeerInbox {
+        /// App-assigned receipt id. Older servers omit it; newer MCP
+        /// peers acknowledge it only after retaining the message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_id: Option<u64>,
         /// Pane the message is addressed to.
         target_pane: usize,
         /// Pane that originated the message.
@@ -1181,8 +1193,18 @@ mod tests {
     }
 
     #[test]
+    fn peer_inbox_ack_request_roundtrips() {
+        let r = Request::PeerInboxAck {
+            pane_id: 2,
+            delivery_id: 17,
+        };
+        assert_eq!(roundtrip(&r), r);
+    }
+
+    #[test]
     fn peer_inbox_event_roundtrips() {
         let ev = Event::PeerInbox {
+            delivery_id: Some(9),
             target_pane: 2,
             from_pane: 1,
             from_name: Some("leader".into()),
@@ -1269,6 +1291,7 @@ mod tests {
     #[test]
     fn peer_inbox_event_omits_name_when_none() {
         let ev = Event::PeerInbox {
+            delivery_id: None,
             target_pane: 5,
             from_pane: 6,
             from_name: None,

@@ -130,6 +130,66 @@ fn set_client_ready(ctx: &PeerCtx, ready: bool) {
     }
 }
 
+fn acknowledge_peer_inbox(ctx: &PeerCtx, delivery_id: u64) {
+    let Mode::Connected { pane_id, endpoint } = &ctx.mode else {
+        return;
+    };
+    match client::send_request(
+        endpoint,
+        &Request::PeerInboxAck {
+            pane_id: *pane_id,
+            delivery_id,
+        },
+    ) {
+        Ok(Response::Ok { .. }) => {}
+        Ok(other) => log_stderr(&format!("peer inbox receipt returned: {other:?}")),
+        Err(e) => log_stderr(&format!("peer inbox receipt failed: {e}")),
+    }
+}
+
+const PEER_RECEIPT_CACHE_CAP: usize = 4096;
+
+#[derive(Default)]
+struct PeerReceiptCache {
+    ids: VecDeque<u64>,
+    set: std::collections::HashSet<u64>,
+}
+
+impl PeerReceiptCache {
+    fn contains(&self, delivery_id: u64) -> bool {
+        self.set.contains(&delivery_id)
+    }
+
+    fn insert(&mut self, delivery_id: u64) {
+        if !self.set.insert(delivery_id) {
+            return;
+        }
+        self.ids.push_back(delivery_id);
+        while self.ids.len() > PEER_RECEIPT_CACHE_CAP {
+            if let Some(expired) = self.ids.pop_front() {
+                self.set.remove(&expired);
+            }
+        }
+    }
+}
+
+fn retain_peer_delivery_once(
+    cache: &mut PeerReceiptCache,
+    delivery_id: Option<u64>,
+    retain: impl FnOnce() -> bool,
+) -> bool {
+    if delivery_id.is_some_and(|id| cache.contains(id)) {
+        return true;
+    }
+    if !retain() {
+        return false;
+    }
+    if let Some(delivery_id) = delivery_id {
+        cache.insert(delivery_id);
+    }
+    true
+}
+
 #[derive(Default)]
 struct PushState {
     initialized: bool,
@@ -394,11 +454,11 @@ fn write_frame(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn deliver_push_frame(ctx: &PeerCtx, value: Value) {
-    deliver_push_frame_with(ctx, value, write_frame);
+fn deliver_push_frame(ctx: &PeerCtx, value: Value) -> bool {
+    deliver_push_frame_with(ctx, value, write_frame)
 }
 
-fn deliver_push_frame_with<F>(ctx: &PeerCtx, value: Value, mut emit: F)
+fn deliver_push_frame_with<F>(ctx: &PeerCtx, value: Value, mut emit: F) -> bool
 where
     F: FnMut(&Value) -> Result<()>,
 {
@@ -409,16 +469,18 @@ where
             // initialization, so this cap normally only affects repeated
             // diagnostic notices such as EventsDropped before initialization.
             log_stderr("push notification buffer full before initialized; dropping newest notice");
-            return;
+            return false;
         }
         state.pending.push_back(value);
-        return;
+        return true;
     }
     // Keep the push lock through the write so a concurrent initialized
     // flush cannot be overtaken by a newly arrived notification.
     if let Err(e) = emit(&value) {
         log_stderr(&format!("failed to push channel notification: {e}"));
+        return false;
     }
+    true
 }
 
 fn mark_push_initialized(ctx: &PeerCtx) -> bool {
@@ -3029,6 +3091,7 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
         .spawn(move || {
             let mut consecutive_failures = 0u32;
             let mut retry_delay = Duration::from_millis(250);
+            let mut receipt_cache = PeerReceiptCache::default();
             loop {
                 let attempt_started = Instant::now();
                 let subscribed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3074,6 +3137,7 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                 }
                 match event {
                     ipc::Event::PeerInbox {
+                        delivery_id,
                         target_pane,
                         from_pane,
                         from_name,
@@ -3081,21 +3145,29 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                         body,
                         ts_ms,
                     } if target_pane == pane_id => {
-                        if client_kind.receive_mode() == ipc::PeerReceiveMode::Pull {
-                            queue_pull_message(&inbox, QueuedPeerMessage {
-                                from_id: from_pane.to_string(),
-                                from_name: from_name.clone(),
-                                from_kind,
-                                body: body.clone(),
-                                sent_at: ts_ms_to_string(ts_ms),
-                            });
-                        } else {
-                            let note = channel_notification(
-                                &body,
-                                &from_pane.to_string(),
-                                from_name.as_deref(),
-                            );
-                            deliver_push_frame(&registration_ctx, note);
+                        let retained = retain_peer_delivery_once(&mut receipt_cache, delivery_id, || {
+                            if client_kind.receive_mode() == ipc::PeerReceiveMode::Pull {
+                                queue_pull_message(&inbox, QueuedPeerMessage {
+                                    from_id: from_pane.to_string(),
+                                    from_name: from_name.clone(),
+                                    from_kind,
+                                    body: body.clone(),
+                                    sent_at: ts_ms_to_string(ts_ms),
+                                });
+                                true
+                            } else {
+                                let note = channel_notification(
+                                    &body,
+                                    &from_pane.to_string(),
+                                    from_name.as_deref(),
+                                );
+                                deliver_push_frame(&registration_ctx, note)
+                            }
+                        });
+                        if retained {
+                            if let Some(delivery_id) = delivery_id {
+                                acknowledge_peer_inbox(&registration_ctx, delivery_id);
+                            }
                         }
                     }
                     // The EventBus bounds each subscriber at 256 events
@@ -5584,6 +5656,7 @@ Commands:
     fn should_buffer_for_poll_excludes_heartbeat_and_peer_inbox() {
         assert!(!should_buffer_for_poll(&ipc::Event::Heartbeat { ts_ms: 1 }));
         assert!(!should_buffer_for_poll(&ipc::Event::PeerInbox {
+            delivery_id: None,
             target_pane: 1,
             from_pane: 2,
             from_name: None,
@@ -5607,6 +5680,22 @@ Commands:
             count: 3,
             ts_ms: 1,
         }));
+    }
+
+    #[test]
+    fn peer_receipt_cache_makes_reemitted_delivery_id_idempotent() {
+        let mut cache = PeerReceiptCache::default();
+        let mut retained = Vec::new();
+        assert!(retain_peer_delivery_once(&mut cache, Some(41), || {
+            retained.push("body");
+            true
+        }));
+        assert!(retain_peer_delivery_once(&mut cache, Some(41), || {
+            retained.push("body");
+            true
+        }));
+        assert_eq!(retained, vec!["body"]);
+        assert_eq!(cache.ids.iter().copied().collect::<Vec<_>>(), vec![41]);
     }
 
     #[test]

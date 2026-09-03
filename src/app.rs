@@ -31,7 +31,7 @@ use self::codex_peer::{
 };
 use self::codex_peer::{
     write_input_to_pane, CodexPeerDebugObservation, CodexPeerNotificationState,
-    PendingCodexPeerDelivery, PendingPeerInboxMessage,
+    PendingCodexPeerDelivery, PendingPeerInboxDelivery, PendingPeerInboxMessage,
 };
 pub(crate) use self::keyboard_input::key_event_to_bytes_pub;
 use self::keyboard_input::{extract_preview_selected_text, extract_selected_text};

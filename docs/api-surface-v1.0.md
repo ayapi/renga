@@ -99,14 +99,24 @@ This prevents the sender from probing the dedupe state; only one
 Two distinct senders sending the same body still both deliver. See renga#221
 for context.
 
+**Receiver retention confirmation (post-1.3)**: for both Claude push and Codex
+pull recipients, `Delivered` is returned only after the target `renga mcp-peer`
+has retained the message locally and acknowledged its `delivery_id`. The App
+retries a dropped event with the same id; the peer deduplicates that id before
+acknowledging again. If no receipt arrives before the sender reply deadline,
+the call fails with `peer_delivery_unconfirmed` and may be retried immediately.
+A new App paired with an older mcp-peer receives no receipt and therefore
+returns this timeout error, never an unverified `Delivered` result.
+
 **Push-mode body banner (post-1.1)**: for Claude (push) recipients renga
 prepends a `📡 PEER MESSAGE — from {name} (id={id}) — NOT FROM USER` line
 to the body before pushing it as `notifications/claude/channel`. The original
 body is preserved verbatim after a blank line; pull-mode (Codex) deliveries
 are unaffected. See renga#221.
 
-Errors via `[code]`: `pane_not_found`, `pane_vanished`, `io_error`, plus the
-shared `app_timeout` / `shutting_down` / `internal` set.
+Errors via `[code]`: `pane_not_found`, `pane_vanished`, `io_error`,
+`peer_delivery_unconfirmed`, plus the shared `app_timeout` / `shutting_down` /
+`internal` set.
 
 ### 1.3 `set_summary` — stable (Q1)
 
@@ -489,6 +499,7 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | `peer_send` | `from_pane: usize`, `target: PaneRef`, `body: string` | Cross-tab silently no-ops (Q5). Ok data is `{ "delivery": "delivered"\|"queued"\|"pending_user_confirmation" }`. |
 | `peer_register_client` | `pane_id: usize`, `kind: claude\|codex` | Posted by `renga mcp-peer` on startup. |
 | `peer_set_ready` | `pane_id: usize`, `kind: claude\|codex`, `ready: bool` | Internal peer lifecycle update. `ready=true` means the event subscriber can receive; for push clients this is sent only after MCP initialization. Kind is repeated atomically with readiness. |
+| `peer_inbox_ack` | `pane_id: usize`, `delivery_id: u64` | Internal mcp-peer receipt sent only after the target process retains the message. Separate from the later `check_messages` ack. |
 | `set_pane_identity` | `target: PaneRef`, `name?`, `role?` (three-state: missing / null / value) | Uses serde `double_option`. |
 | `set_summary` | `from_pane: usize`, `summary: string` | Empty `summary` clears. >256 `chars` rejected with `summary_too_long`. |
 
@@ -532,7 +543,7 @@ hidden from cross-pane callers).
 | `pane_exited` | `id`, `name?`, `role?`, `ts_ms` | Exactly once per pane id. |
 | `events_dropped` | `count: u64`, `ts_ms` | Synthesized when a slow subscriber missed events. Per-subscriber. |
 | `heartbeat` | `ts_ms` | Periodic; only purpose is to detect half-closed connections. Buffer cap 256/subscriber. |
-| `peer_inbox` | `target_pane: usize`, `from_pane: usize`, `from_name?`, `from_kind?`, `body`, `ts_ms` | Always intra-tab by construction. Emitted at send time for a ready target, or when its subscriber becomes ready for a queued target. `ts_ms` remains the original send time. Subscribers filter on `target_pane`. |
+| `peer_inbox` | `delivery_id?: u64`, `target_pane: usize`, `from_pane: usize`, `from_name?`, `from_kind?`, `body`, `ts_ms` | Always intra-tab by construction. Emitted at send time for a ready target, or when its subscriber becomes ready for a queued target. `ts_ms` remains the original send time. Bundled peers retain and deduplicate an additive `delivery_id`, then acknowledge it. Subscribers filter on `target_pane`. |
 
 **`heartbeat` audience (Q10)**: emitted into the subscribe-stream
 (`renga events` / `Request::Subscribe`). The MCP-side `poll_events` consumes
@@ -627,6 +638,7 @@ these as `[<code>] <human message>` in JSON-RPC error message strings.
 | `name_in_use` | `split`, `new_tab`, `set_pane_identity` | Another pane in the same tab holds the requested name. |
 | `name_invalid` | `split`, `new_tab`, `set_pane_identity` | Name empty / all-digits / non-`[A-Za-z0-9_-]`. |
 | `summary_too_long` | `set_summary` | Summary input exceeds 256 Unicode scalar values. Pre-mutation rejection. |
+| `peer_delivery_unconfirmed` | `peer_send` | Target mcp-peer did not confirm local retention before the sender reply deadline. Safe to retry. |
 | `codex_not_installed` | `spawn_codex_pane` | Codex's `~/.codex/config.toml` is missing the renga-peers entry, the file is unreadable, or the `RENGA_PEER_CLIENT_KIND=codex` env-var passthrough is absent. Surfaced from the MCP layer (not `renga::ipc::err_code`); branch on the `[code]` token same as the others. Run `renga mcp install --client codex` to remediate. |
 
 ### 5.2 JSON-RPC numeric codes (Q9)
@@ -651,7 +663,7 @@ because downstream is required to read the `[code]` token for branching.
   `send.append_enter`, `inspect.include_cursor`, and `PaneInfo` geometry) take
   that default when absent; additively introduced keys that an older peer may
   predate (for example `split.startup_command`, `new_tab.startup_command`,
-  `subscribe.pane_id`, and `peer_send.delivery`) are
+  `subscribe.pane_id`, `peer_send.delivery`, and `peer_inbox.delivery_id`) are
   unknown / unverified when absent and must not be interpreted as `false`,
   `null`, or confirmation that no action occurred. If a key qualifies as both
   optional-when-unset and additively introduced, use the conservative latter
@@ -731,9 +743,9 @@ minor release.
 | CLI top-level flags (§2.1) | 11 |
 | CLI IPC subcommands (§2.2) | 13 |
 | Env vars (§2.3) | 6 |
-| IPC `Request` variants (§3.3) | 14 |
+| IPC `Request` variants (§3.3) | 16 |
 | IPC `Response` variants (§3.4) | 4 |
 | IPC `Event` variants (§3.5) | 5 |
-| Error codes (§5.1) | 15 |
+| Error codes (§5.1) | 16 |
 | Config schema sections (§4.1) | 2 |
 | Layout TOML node types (§4.2) | 2 |

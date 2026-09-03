@@ -321,19 +321,15 @@ fn handle_peer_send_waits_for_target_peer_registration() {
     app.handle_peer_set_ready(sibling_id, PeerClientKind::Codex, true)
         .expect("peer readiness");
 
-    assert!(matches!(
-        app.pending_codex_peer_messages
-            .get(&sibling_id)
-            .and_then(|queue| queue.front()),
-        Some(PendingCodexPeerDelivery::Draft { .. })
-    ));
+    assert!(!app.pending_codex_peer_messages.contains_key(&sibling_id));
 
     let event = rx
         .try_iter()
         .find(|event| matches!(event, ipc::Event::PeerInbox { .. }))
         .expect("registration should release the queued message");
-    match event {
+    let delivery_id = match event {
         ipc::Event::PeerInbox {
+            delivery_id: Some(delivery_id),
             target_pane,
             from_pane,
             body,
@@ -342,9 +338,18 @@ fn handle_peer_send_waits_for_target_peer_registration() {
             assert_eq!(target_pane, sibling_id);
             assert_eq!(from_pane, sender_id);
             assert_eq!(body, "queued before registration");
+            delivery_id
         }
         other => panic!("unexpected event: {other:?}"),
-    }
+    };
+    app.handle_peer_inbox_ack(sibling_id, delivery_id)
+        .expect("MCP retained queued message");
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&sibling_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::Draft { .. })
+    ));
     app.shutdown();
 }
 
@@ -464,6 +469,10 @@ fn codex_readiness_sets_kind_and_rearms_nudge_atomically() {
         app.peer_client_kinds.get(&sibling_id),
         Some(&PeerClientKind::Codex)
     );
+    assert!(!app.pending_codex_peer_messages.contains_key(&sibling_id));
+    let delivery_id = *app.pending_peer_deliveries.keys().next().unwrap();
+    app.handle_peer_inbox_ack(sibling_id, delivery_id)
+        .expect("MCP retained queued message");
     assert!(matches!(
         app.pending_codex_peer_messages
             .get(&sibling_id)
@@ -4035,5 +4044,226 @@ fn handle_peer_send_dedupe_does_not_collapse_distinct_senders() {
         count, 2,
         "same body from distinct senders must not collapse into one delivery"
     );
+    app.shutdown();
+}
+
+fn app_with_ready_peer(
+    kind: PeerClientKind,
+) -> (App, usize, usize, std::sync::mpsc::Receiver<ipc::Event>) {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (_sub_id, rx) = app.event_bus.subscribe();
+    let sender = app.ws().focused_pane_id;
+    let target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.handle_peer_set_ready(target, kind, true)
+        .expect("ready target");
+    while rx.try_recv().is_ok() {}
+    (app, sender, target, rx)
+}
+
+fn peer_delivery_id(rx: &std::sync::mpsc::Receiver<ipc::Event>) -> u64 {
+    loop {
+        match rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("PeerInbox event")
+        {
+            ipc::Event::PeerInbox {
+                delivery_id: Some(id),
+                ..
+            } => return id,
+            _ => continue,
+        }
+    }
+}
+
+#[test]
+fn production_send_waits_for_mcp_receipt_before_codex_nudge_and_reply() {
+    let (mut app, sender, target, rx) = app_with_ready_peer(PeerClientKind::Codex);
+    app.handle_focus(&ipc::PaneRef::Id(sender))
+        .expect("focus sender");
+    let (reply_tx, reply_rx) = oneshot::channel();
+
+    app.begin_peer_send(sender, &ipc::PaneRef::Id(target), "race".into(), reply_tx);
+    let delivery_id = peer_delivery_id(&rx);
+    app.flush_pending_codex_peer_messages();
+    assert!(!app.pending_codex_peer_messages.contains_key(&target));
+    assert!(reply_rx.recv_timeout(Duration::from_millis(10)).is_err());
+
+    app.handle_peer_inbox_ack(target, delivery_id)
+        .expect("receipt");
+    assert!(app.pending_codex_peer_messages.contains_key(&target));
+    assert_eq!(
+        reply_rx.recv().expect("send reply").expect("delivered"),
+        ipc::PeerSendOutcome::Delivered
+    );
+    let nudge_count = app.pending_codex_peer_messages[&target].len();
+    app.handle_peer_inbox_ack(target, delivery_id)
+        .expect("duplicate receipt is stale");
+    assert_eq!(app.pending_codex_peer_messages[&target].len(), nudge_count);
+    app.shutdown();
+}
+
+#[test]
+fn identical_inflight_sends_join_one_delivery_and_share_outcome() {
+    let (mut app, sender, target, rx) = app_with_ready_peer(PeerClientKind::Claude);
+    let (reply_a_tx, reply_a_rx) = oneshot::channel();
+    let (reply_b_tx, reply_b_rx) = oneshot::channel();
+    app.begin_peer_send(sender, &ipc::PaneRef::Id(target), "same".into(), reply_a_tx);
+    app.begin_peer_send(sender, &ipc::PaneRef::Id(target), "same".into(), reply_b_tx);
+    let delivery_id = peer_delivery_id(&rx);
+    assert_eq!(app.pending_peer_deliveries.len(), 1);
+    assert_eq!(app.pending_peer_deliveries[&delivery_id].replies.len(), 2);
+    assert!(rx
+        .try_iter()
+        .all(|event| !matches!(event, ipc::Event::PeerInbox { .. })));
+
+    app.handle_peer_inbox_ack(target, delivery_id)
+        .expect("receipt");
+    for reply in [reply_a_rx, reply_b_rx] {
+        assert_eq!(
+            reply.recv().unwrap().unwrap(),
+            ipc::PeerSendOutcome::Delivered
+        );
+    }
+    app.shutdown();
+}
+
+#[test]
+fn wrong_pane_cannot_confirm_delivery_and_stale_receipt_is_ignored() {
+    let (mut app, sender, target, rx) = app_with_ready_peer(PeerClientKind::Claude);
+    let (reply_tx, reply_rx) = oneshot::channel();
+    app.begin_peer_send(sender, &ipc::PaneRef::Id(target), "guard".into(), reply_tx);
+    let delivery_id = peer_delivery_id(&rx);
+
+    let error = app
+        .handle_peer_inbox_ack(sender, delivery_id)
+        .expect_err("wrong pane must fail");
+    assert_eq!(error.code, Some(ipc::err_code::PROTOCOL));
+    assert!(app.pending_peer_deliveries.contains_key(&delivery_id));
+    app.handle_peer_inbox_ack(target, delivery_id)
+        .expect("right pane");
+    assert_eq!(
+        reply_rx.recv().unwrap().unwrap(),
+        ipc::PeerSendOutcome::Delivered
+    );
+    app.handle_peer_inbox_ack(target, delivery_id + 999)
+        .expect("unknown receipt ignored");
+    app.shutdown();
+}
+
+#[test]
+fn retry_reuses_delivery_id_and_timeout_allows_immediate_resend() {
+    let (mut app, sender, target, rx) = app_with_ready_peer(PeerClientKind::Claude);
+    let (reply_tx, reply_rx) = oneshot::channel();
+    app.begin_peer_send(sender, &ipc::PaneRef::Id(target), "retry".into(), reply_tx);
+    let first_id = peer_delivery_id(&rx);
+    app.pending_peer_deliveries
+        .get_mut(&first_id)
+        .unwrap()
+        .next_retry_at = Instant::now();
+    app.flush_pending_peer_deliveries();
+    assert_eq!(peer_delivery_id(&rx), first_id);
+
+    app.pending_peer_deliveries
+        .get_mut(&first_id)
+        .unwrap()
+        .expires_at = Instant::now();
+    app.flush_pending_peer_deliveries();
+    let error = reply_rx
+        .recv()
+        .unwrap()
+        .expect_err("timeout must not deliver");
+    assert_eq!(error.code, Some(ipc::err_code::PEER_DELIVERY_UNCONFIRMED));
+
+    let (retry_tx, _retry_rx) = oneshot::channel();
+    app.begin_peer_send(sender, &ipc::PaneRef::Id(target), "retry".into(), retry_tx);
+    let second_id = peer_delivery_id(&rx);
+    assert_ne!(second_id, first_id, "failed send must not poison dedupe");
+    app.shutdown();
+}
+
+#[test]
+fn queued_flush_timeout_returns_message_to_pre_ready_queue() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender = app.ws().focused_pane_id;
+    let target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split");
+    assert_eq!(
+        app.handle_peer_send(sender, &ipc::PaneRef::Id(target), "keep".into())
+            .unwrap(),
+        ipc::PeerSendOutcome::Queued
+    );
+    app.handle_peer_set_ready(target, PeerClientKind::Claude, true)
+        .unwrap();
+    let delivery_id = *app.pending_peer_deliveries.keys().next().unwrap();
+    app.pending_peer_deliveries
+        .get_mut(&delivery_id)
+        .unwrap()
+        .expires_at = Instant::now();
+    app.flush_pending_peer_deliveries();
+    assert_eq!(app.pending_peer_inbox[&target][0].body, "keep");
+    assert!(!app.peer_delivery_ready.contains(&target));
+    app.shutdown();
+}
+
+#[test]
+fn subscriber_disconnect_never_reports_delivered() {
+    let (mut app, sender, target, rx) = app_with_ready_peer(PeerClientKind::Claude);
+    let (reply_tx, reply_rx) = oneshot::channel();
+    app.begin_peer_send(
+        sender,
+        &ipc::PaneRef::Id(target),
+        "disconnect".into(),
+        reply_tx,
+    );
+    let _ = peer_delivery_id(&rx);
+    app.handle_peer_subscriber_gone(target);
+    let error = reply_rx.recv().unwrap().expect_err("disconnect must fail");
+    assert_eq!(error.code, Some(ipc::err_code::PEER_DELIVERY_UNCONFIRMED));
+    assert!(app.pending_peer_deliveries.is_empty());
+    assert!(!app.pending_codex_peer_messages.contains_key(&target));
+    app.shutdown();
+}
+
+#[test]
+fn full_event_channel_never_reports_delivered_without_receipt() {
+    let (mut app, sender, target, _rx) = app_with_ready_peer(PeerClientKind::Claude);
+    for id in 0..256 {
+        app.event_bus.emit(ipc::Event::PaneStarted {
+            id,
+            name: None,
+            role: None,
+            ts_ms: 0,
+        });
+    }
+    let (reply_tx, reply_rx) = oneshot::channel();
+    app.begin_peer_send(sender, &ipc::PaneRef::Id(target), "full".into(), reply_tx);
+    let delivery_id = *app.pending_peer_deliveries.keys().next().unwrap();
+    app.pending_peer_deliveries
+        .get_mut(&delivery_id)
+        .unwrap()
+        .expires_at = Instant::now();
+    app.flush_pending_peer_deliveries();
+    let error = reply_rx
+        .recv()
+        .unwrap()
+        .expect_err("dropped event must not deliver");
+    assert_eq!(error.code, Some(ipc::err_code::PEER_DELIVERY_UNCONFIRMED));
     app.shutdown();
 }

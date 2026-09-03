@@ -139,6 +139,7 @@ impl App {
         self.peer_client_kinds.clear();
         self.peer_delivery_ready.clear();
         self.pending_peer_inbox.clear();
+        self.pending_peer_deliveries.clear();
         self.pending_codex_peer_messages.clear();
         self.codex_peer_delivery_sequences.clear();
         self.codex_peer_debug_observations.clear();
@@ -158,5 +159,6 @@ impl App {
         for cmd in cmds {
             self.handle_app_command(cmd);
         }
+        self.flush_pending_peer_deliveries();
     }
 }

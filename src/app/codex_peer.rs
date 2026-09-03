@@ -26,6 +26,13 @@ pub(crate) const PEER_SEND_DEDUPE_TTL: Duration = Duration::from_secs(5);
 // successful response for data that cannot be retained reliably.
 pub(crate) const PENDING_PEER_INBOX_MAX_MESSAGES: usize = 128;
 pub(crate) const PENDING_PEER_INBOX_MAX_BYTES: usize = 1024 * 1024;
+/// Receipt retries are cheap in the normal millisecond-scale path and
+/// make best-effort event-bus drops recoverable without duplicating the
+/// receiver's inbox entry.
+pub(crate) const PEER_INBOX_ACK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// Must expire before IPC's five-second App reply limit so the sender
+/// receives a specific delivery error instead of the generic App timeout.
+pub(crate) const PEER_INBOX_ACK_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingPeerInboxMessage {
@@ -34,6 +41,26 @@ pub(crate) struct PendingPeerInboxMessage {
     pub(crate) from_kind: Option<PeerClientKind>,
     pub(crate) body: String,
     pub(crate) ts_ms: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingPeerInboxDelivery {
+    pub(crate) target_pane: usize,
+    pub(crate) message: PendingPeerInboxMessage,
+    pub(crate) nudge: Option<PendingCodexPeerMessage>,
+    pub(crate) replies:
+        Vec<oneshot::Sender<std::result::Result<ipc::PeerSendOutcome, ipc::CodedError>>>,
+    pub(crate) next_retry_at: Instant,
+    pub(crate) expires_at: Instant,
+}
+
+enum PreparedPeerSend {
+    Immediate(ipc::PeerSendOutcome),
+    Confirm {
+        target_pane: usize,
+        message: PendingPeerInboxMessage,
+        nudge: Option<PendingCodexPeerMessage>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -784,12 +811,36 @@ impl App {
     /// claude-org-ja's peer_notify resolves "secretary" from a shell
     /// running inside the secretary pane, and a silent drop there
     /// breaks the notification round-trip (see renga#215).
+    #[cfg(test)]
     pub(crate) fn handle_peer_send(
         &mut self,
         from_pane: usize,
         target: &PaneRef,
         body: String,
     ) -> std::result::Result<ipc::PeerSendOutcome, ipc::CodedError> {
+        match self.prepare_peer_send(from_pane, target, body)? {
+            PreparedPeerSend::Immediate(outcome) => Ok(outcome),
+            PreparedPeerSend::Confirm {
+                target_pane,
+                message,
+                nudge,
+            } => {
+                // Direct App tests and in-process callers have no MCP
+                // process to acknowledge the event. Preserve that helper's
+                // synchronous contract while production IPC uses
+                // `begin_peer_send` below.
+                self.emit_peer_inbox(target_pane, None, message.clone());
+                self.finish_confirmed_peer_delivery(target_pane, message, nudge)
+            }
+        }
+    }
+
+    fn prepare_peer_send(
+        &mut self,
+        from_pane: usize,
+        target: &PaneRef,
+        body: String,
+    ) -> std::result::Result<PreparedPeerSend, ipc::CodedError> {
         let (sender_ws, _) = self
             .resolve_pane_across_workspaces(&PaneRef::Id(from_pane))
             .ok_or_else(|| {
@@ -800,10 +851,10 @@ impl App {
             })?;
         let (target_ws, target_id) = match self.resolve_pane_across_workspaces(target) {
             Some(pair) => pair,
-            None => return Ok(ipc::PeerSendOutcome::Delivered),
+            None => return Ok(PreparedPeerSend::Immediate(ipc::PeerSendOutcome::Delivered)),
         };
         if sender_ws != target_ws {
-            return Ok(ipc::PeerSendOutcome::Delivered);
+            return Ok(PreparedPeerSend::Immediate(ipc::PeerSendOutcome::Delivered));
         }
         if let Some(outcome) = self.duplicate_peer_send_outcome(target_id, from_pane, &body) {
             // Same (target, from, body) within the dedupe window —
@@ -812,41 +863,26 @@ impl App {
             // transcript with phantom Human: turns. The sender
             // gets a successful Ok() reply so it can't probe the
             // dedupe state. (renga#221)
-            return Ok(outcome);
+            return Ok(PreparedPeerSend::Immediate(outcome));
         }
         self.materialize_unfocused_codex_peer_notification();
-        let mut pending_user_confirmation = false;
         let from_name = self.workspaces[sender_ws]
             .pane_names
             .iter()
             .find(|(_, id)| **id == from_pane)
             .map(|(n, _)| n.clone());
         let from_kind = self.peer_client_kinds.get(&from_pane).copied();
-        if self.peer_delivery_ready.contains(&target_id)
+        let nudge = if self.peer_delivery_ready.contains(&target_id)
             && self.pane_expects_codex_peer_delivery(target_ws, target_id)
         {
-            let message = PendingCodexPeerMessage {
+            Some(PendingCodexPeerMessage {
                 from_pane,
                 from_name: from_name.clone(),
                 from_kind,
-            };
-            let target_is_focused = self.active_tab == target_ws
-                && self.workspaces[target_ws].focus_target == FocusTarget::Pane
-                && self.workspaces[target_ws].focused_pane_id == target_id;
-            let nudge_commit_in_flight = self
-                .pending_codex_peer_messages
-                .get(&target_id)
-                .and_then(|queue| queue.front())
-                .is_some_and(|delivery| {
-                    matches!(delivery, PendingCodexPeerDelivery::QueueAt { .. })
-                });
-            if target_is_focused && !nudge_commit_in_flight {
-                pending_user_confirmation =
-                    self.route_focused_codex_peer_message(target_id, message)?;
-            } else {
-                self.push_pending_codex_peer_nudge(target_id, message);
-            }
-        }
+            })
+        } else {
+            None
+        };
         let message = PendingPeerInboxMessage {
             from_pane,
             from_name,
@@ -855,14 +891,11 @@ impl App {
             ts_ms: ipc::events::now_ms(),
         };
         if self.peer_delivery_ready.contains(&target_id) {
-            self.emit_peer_inbox(target_id, message);
-            let outcome = if pending_user_confirmation {
-                ipc::PeerSendOutcome::PendingUserConfirmation
-            } else {
-                ipc::PeerSendOutcome::Delivered
-            };
-            self.record_peer_send(target_id, from_pane, &body, outcome);
-            Ok(outcome)
+            Ok(PreparedPeerSend::Confirm {
+                target_pane: target_id,
+                message,
+                nudge,
+            })
         } else {
             let queue = self.pending_peer_inbox.entry(target_id).or_default();
             let retained_bytes: usize = queue.iter().map(|item| item.body.len()).sum();
@@ -877,12 +910,75 @@ impl App {
             queue.push_back(message);
             let outcome = ipc::PeerSendOutcome::Queued;
             self.record_peer_send(target_id, from_pane, &body, outcome);
-            Ok(outcome)
+            Ok(PreparedPeerSend::Immediate(outcome))
         }
     }
 
-    fn emit_peer_inbox(&self, target_pane: usize, message: PendingPeerInboxMessage) {
+    pub(crate) fn begin_peer_send(
+        &mut self,
+        from_pane: usize,
+        target: &PaneRef,
+        body: String,
+        reply: oneshot::Sender<std::result::Result<ipc::PeerSendOutcome, ipc::CodedError>>,
+    ) {
+        let target_id = self
+            .resolve_pane_across_workspaces(target)
+            .map(|(_, id)| id);
+        if let Some(pending) = self.pending_peer_deliveries.values_mut().find(|pending| {
+            Some(pending.target_pane) == target_id
+                && pending.message.from_pane == from_pane
+                && pending.message.body == body
+        }) {
+            pending.replies.push(reply);
+            return;
+        }
+        match self.prepare_peer_send(from_pane, target, body) {
+            Ok(PreparedPeerSend::Immediate(outcome)) => {
+                let _ = reply.send(Ok(outcome));
+            }
+            Ok(PreparedPeerSend::Confirm {
+                target_pane,
+                message,
+                nudge,
+            }) => self.start_peer_delivery(target_pane, message, nudge, Some(reply)),
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+
+    fn start_peer_delivery(
+        &mut self,
+        target_pane: usize,
+        message: PendingPeerInboxMessage,
+        nudge: Option<PendingCodexPeerMessage>,
+        reply: Option<oneshot::Sender<std::result::Result<ipc::PeerSendOutcome, ipc::CodedError>>>,
+    ) {
+        let delivery_id = self.next_peer_delivery_id;
+        self.next_peer_delivery_id = self.next_peer_delivery_id.saturating_add(1).max(1);
+        let now = Instant::now();
+        self.pending_peer_deliveries.insert(
+            delivery_id,
+            PendingPeerInboxDelivery {
+                target_pane,
+                message: message.clone(),
+                nudge,
+                replies: reply.into_iter().collect(),
+                next_retry_at: now + PEER_INBOX_ACK_RETRY_INTERVAL,
+                expires_at: now + PEER_INBOX_ACK_TIMEOUT,
+            },
+        );
+        self.emit_peer_inbox(target_pane, Some(delivery_id), message);
+    }
+
+    fn emit_peer_inbox(
+        &self,
+        target_pane: usize,
+        delivery_id: Option<u64>,
+        message: PendingPeerInboxMessage,
+    ) {
         self.event_bus.emit(ipc::Event::PeerInbox {
+            delivery_id,
             target_pane,
             from_pane: message.from_pane,
             from_name: message.from_name,
@@ -890,6 +986,125 @@ impl App {
             body: message.body,
             ts_ms: message.ts_ms,
         });
+    }
+
+    fn finish_confirmed_peer_delivery(
+        &mut self,
+        target_pane: usize,
+        message: PendingPeerInboxMessage,
+        nudge: Option<PendingCodexPeerMessage>,
+    ) -> std::result::Result<ipc::PeerSendOutcome, ipc::CodedError> {
+        let pending_user_confirmation = if let Some(nudge) = nudge {
+            let Some((target_ws, _)) =
+                self.resolve_pane_across_workspaces(&PaneRef::Id(target_pane))
+            else {
+                return Err(ipc::CodedError::new(
+                    ipc::err_code::PANE_VANISHED,
+                    format!("target pane {target_pane} disappeared before peer receipt"),
+                ));
+            };
+            let target_is_focused = self.active_tab == target_ws
+                && self.workspaces[target_ws].focus_target == FocusTarget::Pane
+                && self.workspaces[target_ws].focused_pane_id == target_pane;
+            let nudge_commit_in_flight = self
+                .pending_codex_peer_messages
+                .get(&target_pane)
+                .and_then(|queue| queue.front())
+                .is_some_and(|delivery| {
+                    matches!(delivery, PendingCodexPeerDelivery::QueueAt { .. })
+                });
+            if target_is_focused && !nudge_commit_in_flight {
+                self.route_focused_codex_peer_message(target_pane, nudge)?
+            } else {
+                self.push_pending_codex_peer_nudge(target_pane, nudge);
+                false
+            }
+        } else {
+            false
+        };
+        let outcome = if pending_user_confirmation {
+            ipc::PeerSendOutcome::PendingUserConfirmation
+        } else {
+            ipc::PeerSendOutcome::Delivered
+        };
+        self.record_peer_send(target_pane, message.from_pane, &message.body, outcome);
+        Ok(outcome)
+    }
+
+    pub(crate) fn handle_peer_inbox_ack(
+        &mut self,
+        pane_id: usize,
+        delivery_id: u64,
+    ) -> std::result::Result<(), ipc::CodedError> {
+        let Some(pending) = self.pending_peer_deliveries.get(&delivery_id) else {
+            return Ok(());
+        };
+        if pending.target_pane != pane_id {
+            return Err(ipc::CodedError::new(
+                ipc::err_code::PROTOCOL,
+                format!(
+                    "peer receipt {delivery_id} belongs to pane {}, not pane {pane_id}",
+                    pending.target_pane
+                ),
+            ));
+        }
+        let pending = self.pending_peer_deliveries.remove(&delivery_id).unwrap();
+        let result = self.finish_confirmed_peer_delivery(
+            pending.target_pane,
+            pending.message,
+            pending.nudge,
+        );
+        for reply in pending.replies {
+            let _ = reply.send(result.clone());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush_pending_peer_deliveries(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<u64> = self
+            .pending_peer_deliveries
+            .iter()
+            .filter_map(|(id, pending)| (now >= pending.expires_at).then_some(*id))
+            .collect();
+        for delivery_id in expired {
+            let Some(pending) = self.pending_peer_deliveries.remove(&delivery_id) else {
+                continue;
+            };
+            if pending.replies.is_empty() {
+                self.peer_delivery_ready.remove(&pending.target_pane);
+                self.pending_peer_inbox
+                    .entry(pending.target_pane)
+                    .or_default()
+                    .push_back(pending.message);
+            } else {
+                let error = ipc::CodedError::new(
+                    ipc::err_code::PEER_DELIVERY_UNCONFIRMED,
+                    format!(
+                        "pane {} did not confirm peer message receipt",
+                        pending.target_pane
+                    ),
+                );
+                for reply in pending.replies {
+                    let _ = reply.send(Err(error.clone()));
+                }
+            }
+        }
+
+        let retries: Vec<(u64, usize, PendingPeerInboxMessage)> = self
+            .pending_peer_deliveries
+            .iter_mut()
+            .filter_map(|(id, pending)| {
+                if now < pending.next_retry_at {
+                    return None;
+                }
+                pending.next_retry_at = now + PEER_INBOX_ACK_RETRY_INTERVAL;
+                Some((*id, pending.target_pane, pending.message.clone()))
+            })
+            .collect();
+        for (delivery_id, target_pane, message) in retries {
+            self.emit_peer_inbox(target_pane, Some(delivery_id), message);
+        }
     }
 
     /// Return the original outcome when an identical (target, from, body)
@@ -969,20 +1184,15 @@ impl App {
         log_codex_peer_kind_update(pane_id, old_kind, kind, "set_ready");
         self.peer_delivery_ready.insert(pane_id);
         if let Some(messages) = self.pending_peer_inbox.remove(&pane_id) {
-            if self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex) {
-                if let Some(last) = messages.back() {
-                    self.push_pending_codex_peer_nudge(
-                        pane_id,
-                        PendingCodexPeerMessage {
-                            from_pane: last.from_pane,
-                            from_name: last.from_name.clone(),
-                            from_kind: last.from_kind,
-                        },
-                    );
-                }
-            }
-            for message in messages {
-                self.emit_peer_inbox(pane_id, message);
+            let count = messages.len();
+            let is_codex = self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex);
+            for (index, message) in messages.into_iter().enumerate() {
+                let nudge = (is_codex && index + 1 == count).then(|| PendingCodexPeerMessage {
+                    from_pane: message.from_pane,
+                    from_name: message.from_name.clone(),
+                    from_kind: message.from_kind,
+                });
+                self.start_peer_delivery(pane_id, message, nudge, None);
             }
         }
         Ok(())
@@ -994,6 +1204,31 @@ impl App {
     /// same transport-liveness requirement.
     pub(crate) fn handle_peer_subscriber_gone(&mut self, pane_id: usize) {
         self.peer_delivery_ready.remove(&pane_id);
+        let mut failed: Vec<u64> = self
+            .pending_peer_deliveries
+            .iter()
+            .filter_map(|(id, pending)| (pending.target_pane == pane_id).then_some(*id))
+            .collect();
+        failed.sort_unstable();
+        for delivery_id in failed {
+            let Some(pending) = self.pending_peer_deliveries.remove(&delivery_id) else {
+                continue;
+            };
+            if pending.replies.is_empty() {
+                self.pending_peer_inbox
+                    .entry(pane_id)
+                    .or_default()
+                    .push_back(pending.message);
+            } else {
+                let error = ipc::CodedError::new(
+                    ipc::err_code::PEER_DELIVERY_UNCONFIRMED,
+                    format!("peer event stream for pane {pane_id} disconnected"),
+                );
+                for reply in pending.replies {
+                    let _ = reply.send(Err(error.clone()));
+                }
+            }
+        }
     }
 
     fn push_pending_codex_peer_nudge(&mut self, pane_id: usize, message: PendingCodexPeerMessage) {

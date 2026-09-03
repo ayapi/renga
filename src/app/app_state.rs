@@ -100,6 +100,13 @@ pub enum AppCommand {
         ready: bool,
         reply: oneshot::Sender<std::result::Result<(), ipc::CodedError>>,
     },
+    /// The target MCP process has retained `delivery_id` in its local
+    /// inbox. The App completes the original `PeerSend` only after this.
+    PeerInboxAck {
+        pane_id: usize,
+        delivery_id: u64,
+        reply: oneshot::Sender<std::result::Result<(), ipc::CodedError>>,
+    },
     /// The IPC server observed the last pane-associated event stream
     /// terminate. Unlike `PeerSetReady`, this is authoritative server
     /// state and does not need client-kind metadata or a reply.
@@ -271,6 +278,11 @@ pub struct App {
     /// subscription is active, at which point these are emitted in
     /// original send order.
     pub(crate) pending_peer_inbox: HashMap<usize, VecDeque<PendingPeerInboxMessage>>,
+    /// Peer events awaiting an explicit receipt from the target MCP
+    /// process. These are retried with the same id until confirmed or
+    /// failed before the IPC caller's reply timeout.
+    pub(crate) pending_peer_deliveries: HashMap<u64, PendingPeerInboxDelivery>,
+    pub(crate) next_peer_delivery_id: u64,
     /// One-shot nudges waiting to be injected into Codex panes so the
     /// pane runs `check_messages` once it looks ready for PTY input.
     pub(crate) pending_codex_peer_messages: HashMap<usize, VecDeque<PendingCodexPeerDelivery>>,
