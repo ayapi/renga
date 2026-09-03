@@ -4101,7 +4101,10 @@ fn production_send_waits_for_mcp_receipt_before_codex_nudge_and_reply() {
         .expect("receipt");
     assert!(app.pending_codex_peer_messages.contains_key(&target));
     assert_eq!(
-        reply_rx.recv().expect("send reply").expect("delivered"),
+        reply_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("send reply")
+            .expect("delivered"),
         ipc::PeerSendOutcome::Delivered
     );
     let nudge_count = app.pending_codex_peer_messages[&target].len();
@@ -4151,7 +4154,10 @@ fn wrong_pane_cannot_confirm_delivery_and_stale_receipt_is_ignored() {
     app.handle_peer_inbox_ack(target, delivery_id)
         .expect("right pane");
     assert_eq!(
-        reply_rx.recv().unwrap().unwrap(),
+        reply_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap(),
         ipc::PeerSendOutcome::Delivered
     );
     app.handle_peer_inbox_ack(target, delivery_id + 999)
@@ -4234,7 +4240,10 @@ fn subscriber_disconnect_never_reports_delivered() {
     );
     let _ = peer_delivery_id(&rx);
     app.handle_peer_subscriber_gone(target);
-    let error = reply_rx.recv().unwrap().expect_err("disconnect must fail");
+    let error = reply_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .expect_err("disconnect must fail");
     assert_eq!(error.code, Some(ipc::err_code::PEER_DELIVERY_UNCONFIRMED));
     assert!(app.pending_peer_deliveries.is_empty());
     assert!(!app.pending_codex_peer_messages.contains_key(&target));

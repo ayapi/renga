@@ -43,6 +43,12 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
   additive cursor, response-budget, delivery, and pending-count keys support
   lossless retry when a Codex tool response is truncated. (renga-4ol)
 
+- **Peer `Delivered` responses now mean the target mcp-peer confirmed local
+  retention.** App-to-peer delivery uses an additive receipt id and retries
+  safely without duplicating the target inbox. Missing confirmation returns the
+  new `peer_delivery_unconfirmed` error instead of reporting false success.
+  (renga-bcb)
+
 - **All global Ctrl keybindings moved to the Alt namespace.** Bare
   Ctrl chords used to be intercepted by renga and never reached the
   program inside the pane, shadowing shell readline, vim, fzf and

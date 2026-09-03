@@ -1062,11 +1062,12 @@ impl App {
 
     pub(crate) fn flush_pending_peer_deliveries(&mut self) {
         let now = Instant::now();
-        let expired: Vec<u64> = self
+        let mut expired: Vec<u64> = self
             .pending_peer_deliveries
             .iter()
             .filter_map(|(id, pending)| (now >= pending.expires_at).then_some(*id))
             .collect();
+        expired.sort_unstable();
         for delivery_id in expired {
             let Some(pending) = self.pending_peer_deliveries.remove(&delivery_id) else {
                 continue;
@@ -1091,7 +1092,7 @@ impl App {
             }
         }
 
-        let retries: Vec<(u64, usize, PendingPeerInboxMessage)> = self
+        let mut retries: Vec<(u64, usize, PendingPeerInboxMessage)> = self
             .pending_peer_deliveries
             .iter_mut()
             .filter_map(|(id, pending)| {
@@ -1102,6 +1103,7 @@ impl App {
                 Some((*id, pending.target_pane, pending.message.clone()))
             })
             .collect();
+        retries.sort_unstable_by_key(|(delivery_id, _, _)| *delivery_id);
         for (delivery_id, target_pane, message) in retries {
             self.emit_peer_inbox(target_pane, Some(delivery_id), message);
         }

@@ -106,7 +106,10 @@ retries a dropped event with the same id; the peer deduplicates that id before
 acknowledging again. If no receipt arrives before the sender reply deadline,
 the call fails with `peer_delivery_unconfirmed` and may be retried immediately.
 A new App paired with an older mcp-peer receives no receipt and therefore
-returns this timeout error, never an unverified `Delivered` result.
+returns this timeout error on direct delivery, never an unverified `Delivered`
+result. A queued pre-registration message is retained after its flush times out;
+the pane becomes unready, so later sends remain `Queued` until the event stream
+reconnects and publishes readiness again.
 
 **Push-mode body banner (post-1.1)**: for Claude (push) recipients renga
 prepends a `📡 PEER MESSAGE — from {name} (id={id}) — NOT FROM USER` line
