@@ -80,6 +80,7 @@ pub(crate) enum PendingCodexPeerDelivery {
     QueueAt {
         ready_at: Instant,
         expires_at: Instant,
+        injected_while_focused: bool,
         message: PendingCodexPeerMessage,
         expected_composer: String,
         expected_composer_raw: Option<String>,
@@ -1466,8 +1467,8 @@ impl App {
                                 continue;
                             }
                             let payload_text = format_codex_peer_message(&message);
-                            if !pane_is_focused
-                                && screen.as_ref().is_some_and(|state| state.can_queue_message)
+                            if screen.as_ref().is_some_and(|state| state.can_queue_message)
+                                && screen.as_ref().and_then(|state| state.has_draft) != Some(true)
                             {
                                 let payload = crate::mcp_peer::build_send_keys_payload(
                                     &payload_text,
@@ -1507,6 +1508,7 @@ impl App {
                                         // does not interpret text plus Tab/Enter as a paste.
                                         ready_at,
                                         expires_at,
+                                        injected_while_focused: pane_is_focused,
                                         message,
                                         expected_composer,
                                         expected_composer_raw: codex_peer_debug_log_path
@@ -1595,7 +1597,7 @@ impl App {
                                 }
                                 self.dirty = true;
                             } else {
-                                log_decision("draft_waiting_unready", true);
+                                log_decision("draft_waiting_no_safe_input_path", true);
                             }
                         }
                         PendingCodexPeerDelivery::SubmitAt {
@@ -1658,6 +1660,7 @@ impl App {
                         PendingCodexPeerDelivery::QueueAt {
                             ready_at,
                             expires_at,
+                            injected_while_focused,
                             message,
                             expected_composer,
                             expected_composer_raw,
@@ -1696,23 +1699,29 @@ impl App {
                                     }
                                 }
                             };
-                            if pane_is_focused {
-                                if composer_matches {
-                                    let _ = write_input_to_pane(pane, b"\x15", false);
-                                    log_decision("focused_cleared_and_notified", false);
-                                } else {
-                                    log_decision("focused_notified_without_clear", false);
-                                }
-                                queue.pop_front();
-                                focused_notifications.push((
-                                    pane_id,
-                                    message,
-                                    Some(retries_remaining),
-                                ));
-                                self.dirty = true;
-                                continue;
-                            }
                             if now >= expires_at {
+                                if injected_while_focused || pane_is_focused {
+                                    if composer_matches {
+                                        let _ = write_input_to_pane(pane, b"\x15", false);
+                                        log_decision(
+                                            "focused_queue_expired_cleared_and_notified",
+                                            false,
+                                        );
+                                    } else {
+                                        log_decision(
+                                            "focused_queue_expired_notified_without_clear",
+                                            false,
+                                        );
+                                    }
+                                    queue.pop_front();
+                                    focused_notifications.push((
+                                        pane_id,
+                                        message,
+                                        Some(retries_remaining),
+                                    ));
+                                    self.dirty = true;
+                                    continue;
+                                }
                                 if composer_matches {
                                     let _ = write_input_to_pane(pane, b"\x15", false);
                                     log_decision("expired_cleared_and_requeued", false);
@@ -1745,18 +1754,41 @@ impl App {
                                 log_decision("continued_composer_mismatch", true);
                                 continue;
                             }
-                            let (payload, success_action, failure_action) = if screen
+                            let commit = if screen
                                 .as_ref()
                                 .is_some_and(|state| state.busy_queue_available)
                             {
-                                (b"\t".as_slice(), "tab_pressed", "tab_write_failed")
+                                Some((b"\t".as_slice(), "tab_pressed", "tab_write_failed"))
                             } else if screen
                                 .as_ref()
                                 .is_some_and(|state| state.can_submit_injected_message)
+                                && !injected_while_focused
+                                && !pane_is_focused
                             {
-                                (b"\r".as_slice(), "enter_pressed", "enter_write_failed")
+                                Some((b"\r".as_slice(), "enter_pressed", "enter_write_failed"))
+                            } else if screen
+                                .as_ref()
+                                .is_some_and(|state| state.can_submit_injected_message)
+                                && (injected_while_focused || pane_is_focused)
+                            {
+                                let _ = write_input_to_pane(pane, b"\x15", false);
+                                log_decision(
+                                    "focused_queue_enter_blocked_cleared_and_notified",
+                                    false,
+                                );
+                                queue.pop_front();
+                                focused_notifications.push((
+                                    pane_id,
+                                    message,
+                                    Some(retries_remaining),
+                                ));
+                                self.dirty = true;
+                                continue;
                             } else {
                                 log_decision("continued_no_commit_key_available", true);
+                                None
+                            };
+                            let Some((payload, success_action, failure_action)) = commit else {
                                 continue;
                             };
                             if write_input_to_pane(pane, payload, false).is_ok() {

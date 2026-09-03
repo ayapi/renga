@@ -2183,6 +2183,139 @@ fn unfocused_busy_codex_without_draft_queues_nudge_natively() {
 }
 
 #[test]
+fn busy_codex_native_queue_path_is_independent_of_pane_focus() {
+    for pane_is_focused in [false, true] {
+        let mut app = App::new(40, 160).expect("App::new");
+        let sender_id = app.ws().focused_pane_id;
+        let codex_id = app
+            .handle_split(
+                &ipc::PaneRef::Focused,
+                ipc::Direction::Vertical,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("split succeeds");
+        app.peer_client_kinds
+            .insert(codex_id, PeerClientKind::Codex);
+        app.peer_delivery_ready.insert(codex_id);
+        let focused_id = if pane_is_focused { codex_id } else { sender_id };
+        app.handle_focus(&ipc::PaneRef::Id(focused_id))
+            .expect("set explicit pane focus");
+        seed_codex_busy_placeholder(&mut app, codex_id);
+
+        app.handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(codex_id),
+            format!("focus={pane_is_focused}"),
+        )
+        .expect("peer send");
+        app.flush_pending_codex_peer_messages();
+
+        let pending = app
+            .pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|queue| queue.front());
+        assert!(
+            matches!(
+                pending,
+                Some(PendingCodexPeerDelivery::QueueAt {
+                    injected_while_focused,
+                    ..
+                }) if *injected_while_focused == pane_is_focused
+            ),
+            "the same busy screen must use native queue regardless of pane focus: {pending:?}"
+        );
+        assert!(app.visible_codex_peer_notification().is_none());
+
+        let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+            from_pane: sender_id,
+            from_name: None,
+            from_kind: None,
+        });
+        seed_codex_busy_composer(&mut app, codex_id, &expected);
+        app.ws_mut()
+            .panes
+            .get_mut(&codex_id)
+            .expect("pane")
+            .clear_test_input();
+        make_codex_native_queue_ready(&mut app, codex_id);
+        app.flush_pending_codex_peer_messages();
+
+        assert_eq!(
+            app.ws().panes.get(&codex_id).expect("pane").test_input(),
+            b"\t",
+            "native queue commit must use Tab when pane_is_focused={pane_is_focused}"
+        );
+        assert!(!app.pending_codex_peer_messages.contains_key(&codex_id));
+        app.shutdown();
+    }
+}
+
+#[test]
+fn focused_native_queue_never_falls_back_to_enter_when_turn_finishes() {
+    for injected_while_focused in [false, true] {
+        let mut app = App::new(40, 160).expect("App::new");
+        let sender_id = app.ws().focused_pane_id;
+        let codex_id = app
+            .handle_split(
+                &ipc::PaneRef::Focused,
+                ipc::Direction::Vertical,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("split succeeds");
+        app.peer_client_kinds
+            .insert(codex_id, PeerClientKind::Codex);
+        app.peer_delivery_ready.insert(codex_id);
+        let initial_focus = if injected_while_focused {
+            codex_id
+        } else {
+            sender_id
+        };
+        app.handle_focus(&ipc::PaneRef::Id(initial_focus))
+            .expect("set initial pane focus");
+        seed_codex_busy_placeholder(&mut app, codex_id);
+
+        app.handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(codex_id),
+            format!("turn finishes before Tab; injected_focused={injected_while_focused}"),
+        )
+        .expect("peer send");
+        app.flush_pending_codex_peer_messages();
+
+        let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+            from_pane: sender_id,
+            from_name: None,
+            from_kind: None,
+        });
+        app.handle_focus(&ipc::PaneRef::Id(codex_id))
+            .expect("focus Codex before commit");
+        seed_codex_idle_composer(&mut app, codex_id, &expected);
+        app.ws_mut()
+            .panes
+            .get_mut(&codex_id)
+            .expect("pane")
+            .clear_test_input();
+        make_codex_native_queue_ready(&mut app, codex_id);
+        app.flush_pending_codex_peer_messages();
+
+        assert_eq!(
+            app.ws().panes.get(&codex_id).expect("pane").test_input(),
+            b"\x15",
+            "renga must clear its matching composer instead of pressing Enter; injected_focused={injected_while_focused}"
+        );
+        assert!(app.visible_codex_peer_notification().is_some());
+        assert!(!app.pending_codex_peer_messages.contains_key(&codex_id));
+        app.shutdown();
+    }
+}
+
+#[test]
 fn busy_codex_uses_structured_status_row() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     seed_pane_screen(
@@ -3094,7 +3227,7 @@ fn coalesced_notification_keeps_largest_retry_budget() {
 }
 
 #[test]
-fn focusing_injected_nudge_does_not_commit_it_blindly() {
+fn focusing_injected_nudge_keeps_native_queue_commit_pending() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     seed_codex_busy_placeholder(&mut app, codex_id);
     app.handle_peer_send(
@@ -3119,12 +3252,33 @@ fn focusing_injected_nudge_does_not_commit_it_blindly() {
     app.handle_focus(&ipc::PaneRef::Id(codex_id))
         .expect("focus codex");
 
+    assert!(
+        app.ws()
+            .panes
+            .get(&codex_id)
+            .expect("pane")
+            .test_input()
+            .is_empty(),
+        "focus alone must not commit or clear the injected nudge"
+    );
+    assert!(app.visible_codex_peer_notification().is_none());
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::QueueAt { .. })
+    ));
+
+    make_codex_native_queue_ready(&mut app, codex_id);
+    app.flush_pending_codex_peer_messages();
+
     assert_eq!(
         app.ws().panes.get(&codex_id).expect("pane").test_input(),
-        b"\x15",
-        "only Ctrl+U may clear the verified injected nudge"
+        b"\t",
+        "a focused busy pane may commit only through Codex's native Tab queue"
     );
-    assert!(app.visible_codex_peer_notification().is_some());
+    assert!(app.visible_codex_peer_notification().is_none());
+    assert!(!app.pending_codex_peer_messages.contains_key(&codex_id));
     app.shutdown();
 }
 
