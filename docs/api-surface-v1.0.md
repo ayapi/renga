@@ -180,9 +180,9 @@ to an ack response:
   `next_offset_bytes`, `total_bytes`, and `complete`.
 - The final page includes `delivery.ack_token` and sets `ack_required=true`.
   The message remains queued until a later call supplies that token in `ack`.
-- `pending_after` is the number of messages waiting behind the unacknowledged
-  head. `has_more` stays true while any head remains, including a fully returned
-  head that still needs ack.
+- For a call that reads a head, `pending_after` is the number of messages
+  waiting behind the unacknowledged head. `has_more` stays true while any head
+  remains, including a fully returned head that still needs ack.
 - A successful ack returns `messages=[]`, `count=0`, `ack_required=false`, and
   no `delivery`. Its `acknowledged_message_id` identifies the removed head;
   `pending_after` is the number still queued and `has_more` is whether that
