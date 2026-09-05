@@ -328,6 +328,23 @@ mod debug_logging_tests {
         assert_eq!(record["action"], ACTION_FRAME_OVER_BUDGET);
         assert_eq!(record["frame_ms"], (FRAME_OVER_BUDGET_MS + 1) as u64);
         assert_eq!(record["visible_panes"], json!([3, 7]));
+        assert_eq!(
+            record[FIELD_PHASE_MS]
+                .as_object()
+                .expect("phase milliseconds")
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                PHASE_EVENT_DRAIN,
+                PHASE_IPC_COMMANDS,
+                PHASE_CODEX_FLUSH,
+                PHASE_RENDER,
+                PHASE_OTHER,
+            ]
+            .into_iter()
+            .collect()
+        );
         let render_ms = record[FIELD_PHASE_MS][PHASE_RENDER]
             .as_u64()
             .expect("render milliseconds");

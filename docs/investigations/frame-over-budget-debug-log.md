@@ -49,6 +49,8 @@ instead points to event-channel work.
 
 A large `render_breakdown_ms.present` with a small `draw` points to the host
 console or terminal-output path rather than ratatui buffer construction.
+A large `draw` with a small `present` instead points to renga's own rendering
+cost — the per-pane cell loops in `ui::render` — not the host console.
 
 Parser-lock acquisition in `keyboard_input.rs` (lines 515 and 664),
 `pointer_input.rs` (line 181), and the user-input-only scroll methods in
