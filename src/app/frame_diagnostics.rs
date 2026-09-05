@@ -288,6 +288,12 @@ mod debug_logging_tests {
             started_at + Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 + 1),
             vec![3, 7],
         );
+        let within_budget_started_at = Instant::now();
+        begin_frame(within_budget_started_at);
+        finish_frame_at(
+            within_budget_started_at + Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 - 1),
+            vec![3, 7],
+        );
 
         let contents = std::fs::read_to_string(&path).expect("debug JSONL");
         let lines: Vec<_> = contents.lines().collect();
