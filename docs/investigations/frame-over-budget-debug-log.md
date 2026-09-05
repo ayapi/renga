@@ -28,6 +28,9 @@ the frame threshold.
 - `phase_ms`: elapsed milliseconds in `event_drain`, `ipc_commands`,
   `codex_flush`, `render`, and `other`. `other` is the total less the four
   explicitly measured phases.
+- `render_breakdown_ms`: `draw` is the time spent building the ratatui buffer
+  inside `ui::render`; `present` is the remainder of `render`, including
+  terminal diff output, flush, and cursor operations.
 - `events_drained`: all `AppEvent` values drained in the iteration.
 - `pty_output_events`: the subset of drained events carrying PTY output.
 - `ipc_commands`: processed commands with `command`, resolved `pane_id`,
@@ -43,6 +46,9 @@ A large `render` value together with a large `lock_wait_ms_by_pane` entry
 identifies a visible pane whose parser lock delayed the App thread. A large
 `event_drain` value with high `pty_output_events` and `output_bytes_by_pane`
 instead points to event-channel work.
+
+A large `render_breakdown_ms.present` with a small `draw` points to the host
+console or terminal-output path rather than ratatui buffer construction.
 
 Parser-lock acquisition in `keyboard_input.rs` (lines 515 and 664),
 `pointer_input.rs` (line 181), and the user-input-only scroll methods in

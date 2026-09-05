@@ -487,7 +487,12 @@ fn run_event_loop(
                 let _ = execute!(terminal.backend_mut(), crossterm::cursor::Hide);
             }
             terminal.draw(|frame| {
+                let render_draw_started_at = app::frame_diagnostics::phase_started();
                 ui::render(app, frame);
+                app::frame_diagnostics::finish_phase(
+                    app::frame_diagnostics::PHASE_RENDER_DRAW,
+                    render_draw_started_at,
+                );
             })?;
             // Apply the caret AFTER the draw, while the cursor is still hidden
             // from the pre-draw `Hide`. On conpty, `ui::render` deferred the

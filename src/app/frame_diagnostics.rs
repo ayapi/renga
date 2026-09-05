@@ -15,10 +15,14 @@ pub(crate) const PHASE_EVENT_DRAIN: &str = "event_drain";
 pub(crate) const PHASE_IPC_COMMANDS: &str = "ipc_commands";
 pub(crate) const PHASE_CODEX_FLUSH: &str = "codex_flush";
 pub(crate) const PHASE_RENDER: &str = "render";
+pub(crate) const PHASE_RENDER_DRAW: &str = "render_draw";
 pub(crate) const PHASE_OTHER: &str = "other";
 const FIELD_ACTION: &str = "action";
 const FIELD_FRAME_MS: &str = "frame_ms";
 const FIELD_PHASE_MS: &str = "phase_ms";
+const FIELD_RENDER_BREAKDOWN_MS: &str = "render_breakdown_ms";
+const FIELD_DRAW: &str = "draw";
+const FIELD_PRESENT: &str = "present";
 const FIELD_EVENTS_DRAINED: &str = "events_drained";
 const FIELD_PTY_OUTPUT_EVENTS: &str = "pty_output_events";
 const FIELD_IPC_COMMANDS: &str = "ipc_commands";
@@ -203,8 +207,19 @@ fn finish_frame_at(finished_at: Instant, visible_panes: Vec<usize>) {
             return;
         }
 
-        let measured_ms: u128 = frame.phase_ms.values().sum();
         let mut phase_ms = frame.phase_ms;
+        let measured_ms: u128 = [
+            PHASE_EVENT_DRAIN,
+            PHASE_IPC_COMMANDS,
+            PHASE_CODEX_FLUSH,
+            PHASE_RENDER,
+        ]
+        .into_iter()
+        .map(|phase| phase_ms.get(phase).copied().unwrap_or_default())
+        .sum();
+        let render_ms = phase_ms.get(PHASE_RENDER).copied().unwrap_or_default();
+        let render_draw_ms = phase_ms.remove(PHASE_RENDER_DRAW).unwrap_or_default();
+        let render_present_ms = render_ms.saturating_sub(render_draw_ms);
         phase_ms.insert(PHASE_OTHER, frame_ms.saturating_sub(measured_ms));
         for phase in [
             PHASE_EVENT_DRAIN,
@@ -249,6 +264,10 @@ fn finish_frame_at(finished_at: Instant, visible_panes: Vec<usize>) {
                 (FIELD_ACTION): ACTION_FRAME_OVER_BUDGET,
                 (FIELD_FRAME_MS): frame_ms,
                 (FIELD_PHASE_MS): phase_ms,
+                (FIELD_RENDER_BREAKDOWN_MS): {
+                    (FIELD_DRAW): render_draw_ms,
+                    (FIELD_PRESENT): render_present_ms,
+                },
                 (FIELD_EVENTS_DRAINED): frame.events_drained,
                 (FIELD_PTY_OUTPUT_EVENTS): frame.pty_output_events,
                 (FIELD_IPC_COMMANDS): ipc_commands,
@@ -284,6 +303,13 @@ mod debug_logging_tests {
         configure(Some(path.as_os_str().to_owned()));
         let started_at = Instant::now();
         begin_frame(started_at);
+        let render_started_at = phase_started();
+        std::thread::sleep(Duration::from_millis(2));
+        let render_draw_started_at = phase_started();
+        std::thread::sleep(Duration::from_millis(4));
+        finish_phase(PHASE_RENDER_DRAW, render_draw_started_at);
+        std::thread::sleep(Duration::from_millis(2));
+        finish_phase(PHASE_RENDER, render_started_at);
         finish_frame_at(
             started_at + Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 + 1),
             vec![3, 7],
@@ -302,6 +328,26 @@ mod debug_logging_tests {
         assert_eq!(record["action"], ACTION_FRAME_OVER_BUDGET);
         assert_eq!(record["frame_ms"], (FRAME_OVER_BUDGET_MS + 1) as u64);
         assert_eq!(record["visible_panes"], json!([3, 7]));
+        let render_ms = record[FIELD_PHASE_MS][PHASE_RENDER]
+            .as_u64()
+            .expect("render milliseconds");
+        let render_draw_ms = record[FIELD_RENDER_BREAKDOWN_MS][FIELD_DRAW]
+            .as_u64()
+            .expect("render draw milliseconds");
+        let render_present_ms = record[FIELD_RENDER_BREAKDOWN_MS][FIELD_PRESENT]
+            .as_u64()
+            .expect("render present milliseconds");
+        assert!(render_draw_ms > 0);
+        assert!(render_present_ms > 0);
+        assert!(
+            render_ms.abs_diff(render_draw_ms + render_present_ms) <= 1,
+            "render subphases should add to render: render={render_ms}, draw={render_draw_ms}, present={render_present_ms}"
+        );
+        assert_eq!(
+            record[FIELD_PHASE_MS][PHASE_OTHER].as_u64(),
+            Some((FRAME_OVER_BUDGET_MS + 1) as u64 - render_ms),
+            "render breakdown must not change other phase accounting"
+        );
         assert!(record["process_id"].is_number());
         assert!(record["record_sequence"].is_number());
         assert!(record["timestamp_unix_ms"].is_number());
