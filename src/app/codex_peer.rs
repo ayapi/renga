@@ -885,10 +885,13 @@ impl App {
                     format!("sender pane {from_pane} not found"),
                 )
             })?;
-        let (target_ws, target_id) = match self.resolve_pane_across_workspaces(target) {
-            Some(pair) => pair,
-            None => return Ok(PreparedPeerSend::Immediate(ipc::PeerSendOutcome::Delivered)),
-        };
+        let (target_ws, target_id) =
+            self.resolve_pane_across_workspaces(target).ok_or_else(|| {
+                ipc::CodedError::new(
+                    ipc::err_code::PANE_NOT_FOUND,
+                    format!("pane not found: {target:?}"),
+                )
+            })?;
         if sender_ws != target_ws {
             return Ok(PreparedPeerSend::Immediate(ipc::PeerSendOutcome::Delivered));
         }

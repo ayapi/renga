@@ -605,6 +605,56 @@ fn handle_peer_send_loops_back_to_sender_pane() {
     app.shutdown();
 }
 
+fn assert_peer_send_rejected_without_queued_state(
+    app: &mut App,
+    sender_id: usize,
+    target: &ipc::PaneRef,
+    expected_code: &'static str,
+) -> ipc::CodedError {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    app.begin_peer_send(sender_id, target, "must not be queued".into(), reply_tx);
+    let error = reply_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("immediate peer-send reply")
+        .expect_err("peer send must not report Delivered");
+    assert_eq!(error.code, Some(expected_code));
+    assert!(app.pending_peer_inbox.is_empty());
+    assert!(app.pending_peer_deliveries.is_empty());
+    error
+}
+
+#[test]
+fn peer_send_rejects_unknown_id_without_queued_state() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let target = ipc::PaneRef::Id(usize::MAX);
+
+    let error = assert_peer_send_rejected_without_queued_state(
+        &mut app,
+        sender_id,
+        &target,
+        ipc::err_code::PANE_NOT_FOUND,
+    );
+    assert_eq!(error.message, format!("pane not found: {target:?}"));
+    app.shutdown();
+}
+
+#[test]
+fn peer_send_rejects_unknown_name_without_queued_state() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let target = ipc::PaneRef::Name("missing-peer".into());
+
+    let error = assert_peer_send_rejected_without_queued_state(
+        &mut app,
+        sender_id,
+        &target,
+        ipc::err_code::PANE_NOT_FOUND,
+    );
+    assert_eq!(error.message, format!("pane not found: {target:?}"));
+    app.shutdown();
+}
+
 #[test]
 fn handle_peer_send_silently_drops_cross_tab_target() {
     // Cross-tab delivery is a silent no-op by design — callers
@@ -640,6 +690,7 @@ fn handle_peer_send_silently_drops_cross_tab_target() {
     );
     app.shutdown();
 }
+
 #[test]
 fn handle_peer_send_queues_codex_nudge_and_emits_peer_inbox() {
     let mut app = App::new(40, 80).expect("App::new");
