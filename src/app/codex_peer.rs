@@ -6,6 +6,29 @@ pub(crate) const CODEX_PEER_NUDGE_COMMIT_TIMEOUT: Duration = Duration::from_secs
 pub(crate) const CODEX_PEER_NUDGE_MAX_RETRIES: u8 = 1;
 static CODEX_PEER_DEBUG_RECORD_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(test)]
+thread_local! {
+    static CODEX_PEER_DEBUG_LOG_PATH_TEST_OVERRIDE:
+        std::cell::RefCell<Option<Option<std::ffi::OsString>>> =
+        const { std::cell::RefCell::new(Some(None)) };
+}
+
+pub(crate) fn codex_peer_debug_log_path() -> Option<std::ffi::OsString> {
+    resolve_codex_peer_debug_log_path(|| std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG"))
+}
+
+fn resolve_codex_peer_debug_log_path(
+    read_env: impl FnOnce() -> Option<std::ffi::OsString>,
+) -> Option<std::ffi::OsString> {
+    #[cfg(test)]
+    if let Some(path) = CODEX_PEER_DEBUG_LOG_PATH_TEST_OVERRIDE.with(|value| value.borrow().clone())
+    {
+        return path;
+    }
+
+    read_env()
+}
 // A 1.5-second grace period spans many 30-fps redraws, so transient partial
 // frames can settle while a genuinely stalled delivery still becomes visible.
 pub(crate) const CODEX_PEER_DRAFT_STALL_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -669,7 +692,7 @@ fn log_codex_peer_kind_update(
     new_kind: PeerClientKind,
     update_path: &'static str,
 ) {
-    let Some(path) = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG") else {
+    let Some(path) = codex_peer_debug_log_path() else {
         return;
     };
     let kind_label = |kind| match kind {
@@ -1253,7 +1276,7 @@ impl App {
         message: PendingCodexPeerMessage,
         retries_remaining: u8,
     ) {
-        let debug_path = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+        let debug_path = codex_peer_debug_log_path();
         let screen = self.codex_peer_debug_screen_snapshot(pane_id, debug_path.is_some());
         let expected_composer_raw = debug_path
             .as_ref()
@@ -1377,7 +1400,7 @@ impl App {
             self.push_pending_codex_peer_nudge(pane_id, message);
             return Ok(false);
         }
-        let debug_path = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+        let debug_path = codex_peer_debug_log_path();
         let screen = self.codex_peer_debug_screen_snapshot(pane_id, debug_path.is_some());
         let payload_text = format_codex_peer_message(&message);
         let payload = crate::mcp_peer::build_send_keys_payload(&payload_text, None, false)
@@ -1526,7 +1549,7 @@ impl App {
             return Ok(true);
         }
         let payload_text = format_codex_peer_message(&notification.message);
-        let debug_path = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+        let debug_path = codex_peer_debug_log_path();
         let screen =
             self.codex_peer_debug_screen_snapshot(notification.target_pane, debug_path.is_some());
         let payload = crate::mcp_peer::build_send_keys_payload(&payload_text, None, false)
@@ -1634,7 +1657,7 @@ impl App {
     pub(crate) fn flush_pending_codex_peer_messages(&mut self) {
         self.materialize_unfocused_codex_peer_notification();
         let now = Instant::now();
-        let codex_peer_debug_log_path = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+        let codex_peer_debug_log_path = codex_peer_debug_log_path();
         let codex_peer_debug_observations = &mut self.codex_peer_debug_observations;
         let mut empty_panes = Vec::new();
         let mut focused_notifications = Vec::new();
@@ -2122,6 +2145,18 @@ impl App {
 #[cfg(test)]
 mod debug_logging_tests {
     use super::*;
+
+    #[test]
+    fn inherited_debug_log_path_is_disabled_by_default() {
+        let env_read = std::cell::Cell::new(false);
+        let path = resolve_codex_peer_debug_log_path(|| {
+            env_read.set(true);
+            Some(std::ffi::OsString::from("inherited-debug-log.jsonl"))
+        });
+
+        assert_eq!(path, None);
+        assert!(!env_read.get());
+    }
 
     #[test]
     fn debug_capture_preserves_composer_and_writes_single_jsonl_record_per_state() {

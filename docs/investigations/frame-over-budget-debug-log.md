@@ -6,9 +6,11 @@ appended to that file. Every record includes `process_id`, `record_sequence`,
 and `timestamp_unix_ms`. When the variable is unset, frame details and lock
 timestamps are not collected.
 
-Test processes read the same environment variable, so do not run `cargo test`
-while capturing a live trace. Test contamination can be identified by its
-short-lived `process_id`, roughly 167 records, and pane ids 1 through 3.
+Test binaries do not read the inherited environment variable under `cfg(test)`;
+only tests that inject a path directly write debug records. Traces captured on
+or before 2026-09-05 can still contain earlier test contamination, identifiable
+by a short-lived `process_id`, roughly 167 records per process, and pane ids 1
+through 3.
 
 ## Threshold and record names
 

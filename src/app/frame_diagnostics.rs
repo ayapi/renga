@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::codex_peer::append_codex_peer_debug_record;
+use super::codex_peer::{append_codex_peer_debug_record, codex_peer_debug_log_path};
 use super::AppCommandTiming;
 
 pub(crate) const FRAME_OVER_BUDGET_MS: u128 = 500;
@@ -62,7 +62,7 @@ thread_local! {
 }
 
 pub(crate) fn configure_from_env() {
-    configure(std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG"));
+    configure(codex_peer_debug_log_path());
 }
 
 fn configure(path: Option<OsString>) {
