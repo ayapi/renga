@@ -14,6 +14,13 @@ thread_local! {
         const { std::cell::RefCell::new(Some(None)) };
 }
 
+#[cfg(test)]
+pub(crate) fn set_codex_peer_debug_log_path_test_override(
+    value: Option<Option<std::ffi::OsString>>,
+) {
+    CODEX_PEER_DEBUG_LOG_PATH_TEST_OVERRIDE.with(|current| *current.borrow_mut() = value);
+}
+
 pub(crate) fn codex_peer_debug_log_path() -> Option<std::ffi::OsString> {
     resolve_codex_peer_debug_log_path(|| std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG"))
 }
@@ -2156,6 +2163,51 @@ mod debug_logging_tests {
 
         assert_eq!(path, None);
         assert!(!env_read.get());
+    }
+
+    #[test]
+    fn production_debug_log_path_reads_the_environment() {
+        let expected = std::ffi::OsString::from("production-debug-log.jsonl");
+        let env_read = std::cell::Cell::new(false);
+        set_codex_peer_debug_log_path_test_override(None);
+
+        let path = resolve_codex_peer_debug_log_path(|| {
+            env_read.set(true);
+            Some(expected.clone())
+        });
+        set_codex_peer_debug_log_path_test_override(Some(None));
+
+        assert_eq!(path, Some(expected));
+        assert!(env_read.get());
+    }
+
+    #[test]
+    fn injected_debug_log_path_writes_from_kind_update_call_site() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "renga-codex-peer-kind-update-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        set_codex_peer_debug_log_path_test_override(Some(Some(path.as_os_str().to_owned())));
+
+        log_codex_peer_kind_update(
+            17,
+            Some(PeerClientKind::Claude),
+            PeerClientKind::Codex,
+            "test",
+        );
+        set_codex_peer_debug_log_path_test_override(Some(None));
+
+        let contents = std::fs::read_to_string(&path).expect("debug JSONL");
+        let lines: Vec<_> = contents.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let record: serde_json::Value = serde_json::from_str(lines[0]).expect("one JSON object");
+        assert_eq!(record["action"], "client_kind_updated");
+        assert_eq!(record["pane_id"], 17);
+        std::fs::remove_file(path).expect("remove debug JSONL");
     }
 
     #[test]

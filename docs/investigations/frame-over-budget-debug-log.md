@@ -10,7 +10,9 @@ Test binaries do not read the inherited environment variable under `cfg(test)`;
 only tests that inject a path directly write debug records. Traces captured on
 or before 2026-09-05 can still contain earlier test contamination, identifiable
 by a short-lived `process_id`, roughly 167 records per process, and pane ids 1
-through 3.
+through 3. The `mcp_peer` subprocess path remains outside this isolation and
+still reads the variable directly, but that path is not executed by the test
+binary.
 
 ## Threshold and record names
 
