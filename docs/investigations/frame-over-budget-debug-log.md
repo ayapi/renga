@@ -39,6 +39,17 @@ identifies a visible pane whose parser lock delayed the App thread. A large
 `event_drain` value with high `pty_output_events` and `output_bytes_by_pane`
 instead points to event-channel work.
 
+Parser-lock acquisition in `keyboard_input.rs` (lines 515 and 664),
+`pointer_input.rs` (line 181), and the user-input-only scroll methods in
+`pane.rs` is not measured. A large `other` value with an empty
+`lock_wait_ms_by_pane` therefore does not rule out parser-lock contention.
+
+`timestamp_unix_ms` is captured when the frame record is written at frame end;
+subtract `frame_ms` to estimate the frame start time.
+
+`pty_writes` covers `write_input_to_pane` calls used for peer and IPC nudges.
+It does not include the keyboard path through `flush_paste_buffer`.
+
 ## Reading `ipc_command_processed`
 
 - `enqueued_at_ms`: Unix milliseconds captured by the IPC worker immediately

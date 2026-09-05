@@ -369,7 +369,6 @@ mod debug_logging_tests {
             std::thread::sleep(Duration::from_millis(300));
         });
         locked_rx.recv().expect("wait for held parser lock");
-        std::thread::sleep(Duration::from_millis(50));
 
         let _ = pane.scrollbar_info();
         holder.join().expect("lock holder exits");
