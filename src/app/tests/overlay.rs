@@ -217,7 +217,7 @@ fn freeze_panes_suppresses_pty_output_repaint_when_overlay_open() {
     // Push a PtyOutput directly through the event channel —
     // drain_pty_events treats it as the pure-output no-op case.
     app.event_tx
-        .send(AppEvent::PtyOutput(pane_a))
+        .send(AppEvent::PtyOutput(pane_a, 1))
         .expect("send PtyOutput");
     app.drain_pty_events();
 
@@ -289,7 +289,7 @@ fn freeze_panes_mixed_batch_repaints_when_any_state_change_present() {
     app.dirty = false;
 
     app.event_tx
-        .send(AppEvent::PtyOutput(pane_a))
+        .send(AppEvent::PtyOutput(pane_a, 1))
         .expect("send PtyOutput");
     app.event_tx
         .send(AppEvent::PtyEof(pane_a))
@@ -487,7 +487,7 @@ fn freeze_panes_off_still_repaints_on_pty_output() {
     app.dirty = false;
 
     app.event_tx
-        .send(AppEvent::PtyOutput(pane_a))
+        .send(AppEvent::PtyOutput(pane_a, 1))
         .expect("send PtyOutput");
     app.drain_pty_events();
 
@@ -603,7 +603,7 @@ fn freeze_panes_does_not_suppress_without_overlay() {
     app.dirty = false;
 
     app.event_tx
-        .send(AppEvent::PtyOutput(pane_a))
+        .send(AppEvent::PtyOutput(pane_a, 1))
         .expect("send PtyOutput");
     app.drain_pty_events();
 

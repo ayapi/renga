@@ -1,5 +1,35 @@
 use super::*;
 
+#[derive(Debug)]
+pub(crate) struct AppCommandTiming {
+    pub(crate) enqueued_at: Option<Instant>,
+    pub(crate) enqueued_at_unix_ms: Option<u128>,
+}
+
+pub(crate) fn with_ipc_enqueue_timing(command: AppCommand) -> AppCommand {
+    #[cfg(test)]
+    return command;
+
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG").is_some()) {
+            return command;
+        }
+        AppCommand::Timed {
+            command: Box::new(command),
+            timing: AppCommandTiming {
+                enqueued_at: Some(Instant::now()),
+                enqueued_at_unix_ms: Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |duration| duration.as_millis()),
+                ),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SplitOutcome {
     pub(crate) id: usize,
@@ -12,6 +42,12 @@ pub(crate) struct SplitOutcome {
 #[allow(dead_code)] // constructed by the IPC server (wired in Step 3.3)
 #[derive(Debug)]
 pub enum AppCommand {
+    /// Debug-only enqueue timing attached by the IPC server. The wrapper is
+    /// absent when `RENGA_DEBUG_CODEX_PEER_LOG` was unset at server startup.
+    Timed {
+        command: Box<AppCommand>,
+        timing: AppCommandTiming,
+    },
     /// Snapshot the pane list of the active workspace.
     List {
         reply: oneshot::Sender<Vec<PaneInfo>>,
@@ -138,7 +174,7 @@ pub enum AppEvent {
     /// PTY output received for a pane. The pane id gates repainting:
     /// only output for a pane on the active tab dirties the frame
     /// (see `drain_pty_events`).
-    PtyOutput(usize),
+    PtyOutput(usize, usize),
     /// A pane emitted OSC 52 with clipboard text.
     ClipboardCopy(String),
     /// PTY process exited for a pane.

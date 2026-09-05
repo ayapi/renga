@@ -20,6 +20,11 @@ impl App {
         let mut had_visible_output = false;
         while let Ok(event) = self.event_rx.try_recv() {
             had_events = true;
+            let pty_output = match &event {
+                AppEvent::PtyOutput(pane_id, bytes) => Some((*pane_id, *bytes)),
+                _ => None,
+            };
+            super::frame_diagnostics::record_app_event(pty_output);
             match event {
                 AppEvent::PtyEof(pane_id) => {
                     had_state_change = true;
@@ -79,7 +84,7 @@ impl App {
                         }
                     }
                 }
-                AppEvent::PtyOutput(pane_id) => {
+                AppEvent::PtyOutput(pane_id, _) => {
                     if self
                         .workspaces
                         .get(self.active_tab)
@@ -157,8 +162,50 @@ impl App {
             cmds.push(cmd);
         }
         for cmd in cmds {
+            let (cmd, timing) = match cmd {
+                AppCommand::Timed { command, timing } => (*command, Some(timing)),
+                command => (command, None),
+            };
+            let diagnostic_identity = timing
+                .as_ref()
+                .map(|_| self.app_command_diagnostic_identity(&cmd));
+            let handle_started_at = timing.as_ref().map(|_| Instant::now());
             self.handle_app_command(cmd);
+            if let (Some(timing), Some(handle_started_at), Some((kind, pane_id))) =
+                (timing, handle_started_at, diagnostic_identity)
+            {
+                super::frame_diagnostics::record_ipc_command(
+                    kind,
+                    pane_id,
+                    timing,
+                    handle_started_at,
+                );
+            }
         }
         self.flush_pending_peer_deliveries();
+    }
+
+    fn app_command_diagnostic_identity(&self, cmd: &AppCommand) -> (&'static str, Option<usize>) {
+        let resolve = |target: &PaneRef| self.ws().resolve_pane_ref(target);
+        match cmd {
+            AppCommand::Timed { command, .. } => self.app_command_diagnostic_identity(command),
+            AppCommand::List { .. } => ("list", None),
+            AppCommand::Send { target, .. } => ("send", resolve(target)),
+            AppCommand::Focus { target, .. } => ("focus", resolve(target)),
+            AppCommand::Split { target, .. } => ("split", resolve(target)),
+            AppCommand::NewTab { .. } => ("new_tab", None),
+            AppCommand::Inspect { target, .. } => ("inspect_pane", resolve(target)),
+            AppCommand::Close { target, .. } => ("close", resolve(target)),
+            AppCommand::PeerList { from_pane, .. } => ("peer_list", Some(*from_pane)),
+            AppCommand::PeerSend { target, .. } => ("peer_send", resolve(target)),
+            AppCommand::PeerRegisterClient { pane_id, .. } => {
+                ("peer_register_client", Some(*pane_id))
+            }
+            AppCommand::PeerSetReady { pane_id, .. } => ("peer_set_ready", Some(*pane_id)),
+            AppCommand::PeerInboxAck { pane_id, .. } => ("peer_inbox_ack", Some(*pane_id)),
+            AppCommand::PeerSubscriberGone { pane_id } => ("peer_subscriber_gone", Some(*pane_id)),
+            AppCommand::SetPaneIdentity { target, .. } => ("set_pane_identity", resolve(target)),
+            AppCommand::SetSummary { pane_id, .. } => ("set_summary", Some(*pane_id)),
+        }
     }
 }

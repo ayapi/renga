@@ -19,7 +19,7 @@ mod win_job;
 
 use std::io;
 use std::panic;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
@@ -387,15 +387,29 @@ fn run_event_loop(
     event_poll_timeout: Duration,
 ) -> Result<()> {
     let mut paste_buffer: Vec<u8> = Vec::new();
+    app::frame_diagnostics::configure_from_env();
 
     loop {
+        let frame_started_at = Instant::now();
+        app::frame_diagnostics::begin_frame(frame_started_at);
+
         // Drain any PTY output events
+        let phase_started_at = app::frame_diagnostics::phase_started();
         app.drain_pty_events();
+        app::frame_diagnostics::finish_phase(
+            app::frame_diagnostics::PHASE_EVENT_DRAIN,
+            phase_started_at,
+        );
 
         // Phase 3: dispatch any commands delivered from the IPC server
         // thread. No-op when the channel is empty, so it's cheap to call
         // every frame.
+        let phase_started_at = app::frame_diagnostics::phase_started();
         app.drain_app_commands();
+        app::frame_diagnostics::finish_phase(
+            app::frame_diagnostics::PHASE_IPC_COMMANDS,
+            phase_started_at,
+        );
 
         // Phase 1 (--exec): flush queued startup commands once the shell
         // prompt is observed. This is a no-op for panes without a queued
@@ -406,7 +420,12 @@ fn run_event_loop(
             }
         }
 
+        let phase_started_at = app::frame_diagnostics::phase_started();
         app.flush_pending_codex_peer_messages();
+        app::frame_diagnostics::finish_phase(
+            app::frame_diagnostics::PHASE_CODEX_FLUSH,
+            phase_started_at,
+        );
 
         // After paste, wait a few frames for PTY echo to settle
         if app.paste_cooldown > 0 {
@@ -439,6 +458,7 @@ fn run_event_loop(
 
         // Only render when something changed (and no cooldown is active)
         if app.dirty && app.paste_cooldown == 0 && app.resize_cooldown == 0 {
+            let phase_started_at = app::frame_diagnostics::phase_started();
             app.dirty = false;
             // Defense-in-depth for the Windows conpty caret-leak
             // originally reported in #25 / fixed in #36: while any pane
@@ -487,9 +507,16 @@ fn run_event_loop(
                     );
                 }
             }
+            app::frame_diagnostics::finish_phase(
+                app::frame_diagnostics::PHASE_RENDER,
+                phase_started_at,
+            );
         }
 
         if app.should_quit {
+            app::frame_diagnostics::finish_frame(|| {
+                app.workspaces[app.active_tab].layout.collect_pane_ids()
+            });
             break;
         }
 
@@ -547,6 +574,10 @@ fn run_event_loop(
                 _ => {}
             }
         }
+
+        app::frame_diagnostics::finish_frame(|| {
+            app.workspaces[app.active_tab].layout.collect_pane_ids()
+        });
     }
 
     Ok(())

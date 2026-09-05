@@ -31,7 +31,16 @@ use interprocess::local_socket::{prelude::*, ListenerOptions, Stream};
 use super::endpoint::{EndpointKind, EndpointName};
 use super::events::EventBus;
 use super::{err_code, Event, Request, Response, APP_REPLY_TIMEOUT};
-use crate::app::AppCommand;
+use crate::app::{with_ipc_enqueue_timing, AppCommand};
+
+fn enqueue_app_command(
+    command_tx: &Sender<AppCommand>,
+    command: AppCommand,
+) -> std::result::Result<(), ()> {
+    command_tx
+        .send(with_ipc_enqueue_timing(command))
+        .map_err(|_| ())
+}
 #[cfg(test)]
 use crate::app::SplitOutcome;
 
@@ -92,7 +101,7 @@ impl PeerSubscriptionRegistry {
 
     fn unregister(&self, pane_id: usize, command_tx: &Sender<AppCommand>) {
         self.unregister_with(pane_id, || {
-            let _ = command_tx.send(AppCommand::PeerSubscriberGone { pane_id });
+            let _ = enqueue_app_command(command_tx, AppCommand::PeerSubscriberGone { pane_id });
         });
     }
 }
@@ -484,10 +493,7 @@ fn dispatch_request_with_registry(
         }
         Request::List => {
             let (reply_tx, reply_rx) = oneshot::channel();
-            if command_tx
-                .send(AppCommand::List { reply: reply_tx })
-                .is_err()
-            {
+            if enqueue_app_command(command_tx, AppCommand::List { reply: reply_tx }).is_err() {
                 return Response::err_coded(err_code::SHUTTING_DOWN, "app shutting down");
             }
             match reply_rx.recv_timeout(APP_REPLY_TIMEOUT) {
@@ -517,12 +523,14 @@ fn dispatch_request_with_registry(
         }
         Request::Close { target } => {
             let (reply_tx, reply_rx) = oneshot::channel();
-            if command_tx
-                .send(AppCommand::Close {
+            if enqueue_app_command(
+                command_tx,
+                AppCommand::Close {
                     target,
                     reply: reply_tx,
-                })
-                .is_err()
+                },
+            )
+            .is_err()
             {
                 return Response::err_coded(err_code::SHUTTING_DOWN, "app shutting down");
             }
@@ -545,8 +553,9 @@ fn dispatch_request_with_registry(
             cwd,
         } => {
             let (reply_tx, reply_rx) = oneshot::channel();
-            if command_tx
-                .send(AppCommand::Split {
+            if enqueue_app_command(
+                command_tx,
+                AppCommand::Split {
                     target,
                     direction,
                     command,
@@ -554,8 +563,9 @@ fn dispatch_request_with_registry(
                     role,
                     cwd,
                     reply: reply_tx,
-                })
-                .is_err()
+                },
+            )
+            .is_err()
             {
                 return Response::err_coded(err_code::SHUTTING_DOWN, "app shutting down");
             }
@@ -578,16 +588,18 @@ fn dispatch_request_with_registry(
             cwd,
         } => {
             let (reply_tx, reply_rx) = oneshot::channel();
-            if command_tx
-                .send(AppCommand::NewTab {
+            if enqueue_app_command(
+                command_tx,
+                AppCommand::NewTab {
                     command,
                     name: id,
                     label,
                     role,
                     cwd,
                     reply: reply_tx,
-                })
-                .is_err()
+                },
+            )
+            .is_err()
             {
                 return Response::err_coded(err_code::SHUTTING_DOWN, "app shutting down");
             }
@@ -615,14 +627,16 @@ fn dispatch_request_with_registry(
             include_cursor,
         } => {
             let (reply_tx, reply_rx) = oneshot::channel();
-            if command_tx
-                .send(AppCommand::Inspect {
+            if enqueue_app_command(
+                command_tx,
+                AppCommand::Inspect {
                     target,
                     lines,
                     include_cursor,
                     reply: reply_tx,
-                })
-                .is_err()
+                },
+            )
+            .is_err()
             {
                 return Response::err_coded(err_code::SHUTTING_DOWN, "app shutting down");
             }
@@ -636,12 +650,14 @@ fn dispatch_request_with_registry(
         }
         Request::PeerList { from_pane } => {
             let (reply_tx, reply_rx) = oneshot::channel();
-            if command_tx
-                .send(AppCommand::PeerList {
+            if enqueue_app_command(
+                command_tx,
+                AppCommand::PeerList {
                     from_pane,
                     reply: reply_tx,
-                })
-                .is_err()
+                },
+            )
+            .is_err()
             {
                 return Response::err_coded(err_code::SHUTTING_DOWN, "app shutting down");
             }
@@ -664,14 +680,16 @@ fn dispatch_request_with_registry(
             body,
         } => {
             let (reply_tx, reply_rx) = oneshot::channel();
-            if command_tx
-                .send(AppCommand::PeerSend {
+            if enqueue_app_command(
+                command_tx,
+                AppCommand::PeerSend {
                     from_pane,
                     target,
                     body,
                     reply: reply_tx,
-                })
-                .is_err()
+                },
+            )
+            .is_err()
             {
                 return Response::err_coded(err_code::SHUTTING_DOWN, "app shutting down");
             }
@@ -707,13 +725,15 @@ fn dispatch_request_with_registry(
         }),
         Request::SetSummary { from_pane, summary } => {
             let (reply_tx, reply_rx) = oneshot::channel();
-            if command_tx
-                .send(AppCommand::SetSummary {
+            if enqueue_app_command(
+                command_tx,
+                AppCommand::SetSummary {
                     pane_id: from_pane,
                     summary,
                     reply: reply_tx,
-                })
-                .is_err()
+                },
+            )
+            .is_err()
             {
                 return Response::err_coded(err_code::SHUTTING_DOWN, "app shutting down");
             }
@@ -732,14 +752,16 @@ fn dispatch_request_with_registry(
         }
         Request::SetPaneIdentity { target, name, role } => {
             let (reply_tx, reply_rx) = oneshot::channel();
-            if command_tx
-                .send(AppCommand::SetPaneIdentity {
+            if enqueue_app_command(
+                command_tx,
+                AppCommand::SetPaneIdentity {
                     target,
                     name,
                     role,
                     reply: reply_tx,
-                })
-                .is_err()
+                },
+            )
+            .is_err()
             {
                 return Response::err_coded(err_code::SHUTTING_DOWN, "app shutting down");
             }
@@ -790,9 +812,9 @@ fn forward_peer_set_ready(
         // Enqueue while the registry lock is held. This serializes the
         // separate readiness connection with stream registration and
         // teardown workers.
-        command_tx.send(command)
+        enqueue_app_command(command_tx, command)
     } else {
-        command_tx.send(command)
+        enqueue_app_command(command_tx, command)
     };
 
     if send_result.is_err() {
@@ -813,7 +835,7 @@ fn forward_unit(
     build: impl FnOnce(oneshot::Sender<std::result::Result<(), super::CodedError>>) -> AppCommand,
 ) -> Response {
     let (reply_tx, reply_rx) = oneshot::channel();
-    if command_tx.send(build(reply_tx)).is_err() {
+    if enqueue_app_command(command_tx, build(reply_tx)).is_err() {
         return Response::err_coded(err_code::SHUTTING_DOWN, "app shutting down");
     }
     match reply_rx.recv_timeout(APP_REPLY_TIMEOUT) {

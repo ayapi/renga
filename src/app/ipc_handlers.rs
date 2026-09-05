@@ -3,6 +3,7 @@ use super::*;
 impl App {
     pub(crate) fn handle_app_command(&mut self, cmd: AppCommand) {
         match cmd {
+            AppCommand::Timed { command, .. } => self.handle_app_command(*command),
             AppCommand::List { reply } => {
                 let ws = self.ws();
                 let focused = ws.focused_pane_id;
@@ -397,10 +398,12 @@ impl App {
             .find(|(_, id)| **id == pane_id)
             .map(|(n, _)| n.clone());
 
+        let lock_started = super::frame_diagnostics::lock_wait_started();
         let (rows, cols, line_start, line_count, collected, cursor) = {
             let parser = pane.parser.lock().map_err(|_| {
                 ipc::CodedError::new(ipc::err_code::INTERNAL, "vt100 parser lock poisoned")
             })?;
+            super::frame_diagnostics::record_lock_wait(pane_id, lock_started);
             let screen = parser.screen();
             let size = screen.size();
             let total_rows = size.0 as usize;

@@ -36,7 +36,7 @@ fn pty_output_from_active_tab_pane_dirties() {
     app.dirty = false;
 
     app.event_tx
-        .send(AppEvent::PtyOutput(pane_a))
+        .send(AppEvent::PtyOutput(pane_a, 1))
         .expect("send PtyOutput");
     app.drain_pty_events();
 
@@ -54,7 +54,7 @@ fn pty_output_from_background_tab_pane_does_not_dirty() {
 
     // Output for the now-hidden tab-0 pane.
     app.event_tx
-        .send(AppEvent::PtyOutput(pane_tab0))
+        .send(AppEvent::PtyOutput(pane_tab0, 1))
         .expect("send PtyOutput");
     app.drain_pty_events();
 
@@ -74,7 +74,7 @@ fn pty_output_for_unknown_pane_does_not_dirty() {
     app.dirty = false;
 
     app.event_tx
-        .send(AppEvent::PtyOutput(usize::MAX))
+        .send(AppEvent::PtyOutput(usize::MAX, 1))
         .expect("send PtyOutput");
     app.drain_pty_events();
 
@@ -108,7 +108,7 @@ fn mixed_batch_with_background_output_and_state_change_dirties() {
     app.dirty = false;
 
     app.event_tx
-        .send(AppEvent::PtyOutput(pane_tab0))
+        .send(AppEvent::PtyOutput(pane_tab0, 1))
         .expect("send PtyOutput");
     app.event_tx
         .send(AppEvent::PtyEof(pane_tab0))

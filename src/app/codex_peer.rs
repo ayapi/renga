@@ -625,7 +625,10 @@ impl CodexPeerDebugObservation {
     }
 }
 
-fn append_codex_peer_debug_record(path: &std::ffi::OsStr, mut record: serde_json::Value) {
+pub(super) fn append_codex_peer_debug_record(
+    path: &std::ffi::OsStr,
+    mut record: serde_json::Value,
+) {
     use std::io::Write;
 
     let record_sequence =
@@ -757,9 +760,11 @@ fn log_codex_peer_decision_if_changed(
 }
 
 fn codex_composer_has_draft(pane: &Pane) -> Option<bool> {
+    let lock_started = super::frame_diagnostics::lock_wait_started();
     let Ok(parser) = pane.parser.lock() else {
         return None;
     };
+    super::frame_diagnostics::record_lock_wait(pane.id, lock_started);
     codex_composer_has_draft_on_screen(parser.screen())
 }
 
@@ -791,6 +796,7 @@ pub(crate) fn write_input_to_pane(
     data: &[u8],
     append_enter: bool,
 ) -> std::result::Result<(), ipc::CodedError> {
+    super::frame_diagnostics::record_pty_write(pane.id);
     pane.write_input(data)
         .map_err(|e| ipc::CodedError::new(ipc::err_code::IO_ERROR, e.to_string()))?;
     if append_enter {
@@ -1601,9 +1607,11 @@ impl App {
         if !registered_codex && !pane.is_codex_running() {
             return false;
         }
+        let lock_started = super::frame_diagnostics::lock_wait_started();
         let Ok(parser) = pane.parser.lock() else {
             return false;
         };
+        super::frame_diagnostics::record_lock_wait(pane.id, lock_started);
         analyze_codex_peer_screen(parser.screen(), false).ready_for_nudge
     }
 
@@ -1615,9 +1623,11 @@ impl App {
         if !registered_codex && !pane.is_codex_running() {
             return None;
         }
+        let lock_started = super::frame_diagnostics::lock_wait_started();
         let Ok(parser) = pane.parser.lock() else {
             return None;
         };
+        super::frame_diagnostics::record_lock_wait(pane.id, lock_started);
         Some(analyze_codex_peer_screen(parser.screen(), capture_debug))
     }
 

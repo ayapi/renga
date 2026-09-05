@@ -987,7 +987,9 @@ fn render_terminal_content(
     frame: &mut Frame,
     area: Rect,
 ) -> Option<(u16, u16)> {
+    let lock_started = crate::app::frame_diagnostics::lock_wait_started();
     let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+    crate::app::frame_diagnostics::record_lock_wait(pane.id, lock_started);
     let screen = parser.screen();
 
     let rows = area.height as usize;

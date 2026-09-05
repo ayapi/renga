@@ -1245,7 +1245,7 @@ fn pty_reader_thread(
                     });
                 }
                 drop(parser);
-                let _ = event_tx.send(AppEvent::PtyOutput(pane_id));
+                let _ = event_tx.send(AppEvent::PtyOutput(pane_id, n));
             }
             Err(_) => {
                 break;
@@ -1697,7 +1697,7 @@ mod tests {
             wait_for(
                 || {
                     rx.try_iter()
-                        .any(|event| matches!(event, AppEvent::PtyOutput(9910)))
+                        .any(|event| matches!(event, AppEvent::PtyOutput(9910, _)))
                 },
                 Duration::from_secs(30)
             ),
