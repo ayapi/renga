@@ -264,6 +264,7 @@ fn finish_frame_at(finished_at: Instant, visible_panes: Vec<usize>) {
 #[cfg(test)]
 mod debug_logging_tests {
     use super::*;
+    use crate::app::AppCommand;
     use crate::pane::Pane;
 
     fn temp_log_path(label: &str) -> std::path::PathBuf {
@@ -316,31 +317,30 @@ mod debug_logging_tests {
     }
 
     #[test]
-    fn processed_ipc_command_records_enqueue_and_processing_times() {
+    fn timed_app_command_records_enqueue_queue_and_processing_times() {
         let path = temp_log_path("ipc");
         configure(Some(path.as_os_str().to_owned()));
-        let handle_started_at = Instant::now();
-        let enqueued_at = handle_started_at - Duration::from_millis(7);
-        begin_frame(enqueued_at);
-        record_ipc_command(
-            "inspect_pane",
-            Some(5),
-            AppCommandTiming {
-                enqueued_at: Some(enqueued_at),
-                enqueued_at_unix_ms: Some(1234),
-            },
-            handle_started_at,
-        );
+        begin_frame(Instant::now());
+
+        let mut app = crate::app::App::new(40, 80).expect("headless app");
+        let (reply_tx, reply_rx) = oneshot::channel();
+        crate::app::set_ipc_enqueue_timing_test_override(Some(true));
+        let command = crate::app::with_ipc_enqueue_timing(AppCommand::List { reply: reply_tx });
+        crate::app::set_ipc_enqueue_timing_test_override(Some(false));
+        assert!(matches!(command, AppCommand::Timed { .. }));
+        app.command_tx.send(command).expect("enqueue timed command");
+        app.drain_app_commands();
+        let _ = reply_rx.recv().expect("list response");
 
         let contents = std::fs::read_to_string(&path).expect("debug JSONL");
         let lines: Vec<_> = contents.lines().collect();
         assert_eq!(lines.len(), 1);
         let record: Value = serde_json::from_str(lines[0]).expect("one JSON object");
         assert_eq!(record["action"], ACTION_IPC_COMMAND_PROCESSED);
-        assert_eq!(record["command"], "inspect_pane");
-        assert_eq!(record["pane_id"], 5);
-        assert_eq!(record["enqueued_at_ms"], 1234);
-        assert_eq!(record["queue_wait_ms"], 7);
+        assert_eq!(record["command"], "list");
+        assert!(record["pane_id"].is_null());
+        assert!(record["enqueued_at_ms"].is_number());
+        assert!(record["queue_wait_ms"].is_number());
         assert!(record["command_ms"].is_number());
         std::fs::remove_file(path).expect("remove debug JSONL");
         configure(None);

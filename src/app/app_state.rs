@@ -6,27 +6,46 @@ pub(crate) struct AppCommandTiming {
     pub(crate) enqueued_at_unix_ms: Option<u128>,
 }
 
-pub(crate) fn with_ipc_enqueue_timing(command: AppCommand) -> AppCommand {
+fn ipc_enqueue_timing_enabled() -> bool {
     #[cfg(test)]
-    return command;
+    if let Some(enabled) = IPC_ENQUEUE_TIMING_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
 
-    #[cfg(not(test))]
-    {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ENABLED.get_or_init(|| std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG").is_some()) {
-            return command;
-        }
-        AppCommand::Timed {
-            command: Box::new(command),
-            timing: AppCommandTiming {
-                enqueued_at: Some(Instant::now()),
-                enqueued_at_unix_ms: Some(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |duration| duration.as_millis()),
-                ),
-            },
-        }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG").is_some())
+}
+
+#[cfg(test)]
+thread_local! {
+    static IPC_ENQUEUE_TIMING_TEST_OVERRIDE: std::cell::Cell<Option<bool>> = const {
+        // Tests opt into the production wrapper explicitly. Keeping the
+        // default disabled prevents an inherited debug-log environment from
+        // latching the process-wide OnceLock and making dispatch tests depend
+        // on execution order.
+        std::cell::Cell::new(Some(false))
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn set_ipc_enqueue_timing_test_override(enabled: Option<bool>) {
+    IPC_ENQUEUE_TIMING_TEST_OVERRIDE.with(|value| value.set(enabled));
+}
+
+pub(crate) fn with_ipc_enqueue_timing(command: AppCommand) -> AppCommand {
+    if !ipc_enqueue_timing_enabled() {
+        return command;
+    }
+    AppCommand::Timed {
+        command: Box::new(command),
+        timing: AppCommandTiming {
+            enqueued_at: Some(Instant::now()),
+            enqueued_at_unix_ms: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_millis()),
+            ),
+        },
     }
 }
 

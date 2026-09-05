@@ -854,6 +854,34 @@ mod tests {
     use crate::ipc::{Direction, PaneRef, Request};
     use std::sync::mpsc;
 
+    fn unwrap_timed(command: AppCommand) -> (AppCommand, Option<crate::app::AppCommandTiming>) {
+        match command {
+            AppCommand::Timed { command, timing } => (*command, Some(timing)),
+            command => (command, None),
+        }
+    }
+
+    #[test]
+    fn dispatch_wraps_command_with_enqueue_timing_when_debug_is_enabled() {
+        let (tx, rx) = mpsc::channel::<AppCommand>();
+        let handle = thread::spawn(move || {
+            let (command, timing) = unwrap_timed(rx.recv().expect("dispatched command"));
+            let timing = timing.expect("debug-enabled dispatch must carry timing");
+            assert!(timing.enqueued_at.is_some());
+            assert!(timing.enqueued_at_unix_ms.is_some());
+            match command {
+                AppCommand::List { reply } => reply.send(Vec::new()).unwrap(),
+                other => panic!("expected list, got {other:?}"),
+            }
+        });
+
+        crate::app::set_ipc_enqueue_timing_test_override(Some(true));
+        let response = dispatch_request(Request::List, &tx);
+        crate::app::set_ipc_enqueue_timing_test_override(Some(false));
+        handle.join().unwrap();
+        assert!(matches!(response, Response::Ok { .. }));
+    }
+
     #[test]
     fn dispatch_list_ok_when_app_replies() {
         // Pretend to be the App: spawn a thread that pulls a List

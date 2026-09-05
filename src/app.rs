@@ -23,6 +23,8 @@ mod selection;
 mod sidebar_input;
 mod workspace_state;
 
+#[cfg(test)]
+pub(crate) use self::app_state::set_ipc_enqueue_timing_test_override;
 pub(crate) use self::app_state::{
     with_ipc_enqueue_timing, AppCommandTiming, SplitOutcome, CLAUDE_PEER_LAUNCH_CMD,
 };
