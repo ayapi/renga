@@ -17,6 +17,9 @@ mod version_check;
 #[cfg(windows)]
 mod win_job;
 
+#[cfg(test)]
+pub(crate) static DEBUG_CODEX_PEER_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use std::io;
 use std::panic;
 use std::time::{Duration, Instant};

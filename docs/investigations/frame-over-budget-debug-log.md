@@ -6,14 +6,15 @@ appended to that file. Every record includes `process_id`, `record_sequence`,
 and `timestamp_unix_ms`. When the variable is unset, frame details and lock
 timestamps are not collected.
 
-Test binaries do not read the inherited environment variable under `cfg(test)`;
-only tests that inject a path directly write debug records. The sole exception
-temporarily sets the variable to a disposable path to verify the production
-environment-variable wiring. Traces captured on or before 2026-09-05 can still
+Test binaries do not normally read the inherited environment variable under
+`cfg(test)`; tests instead inject a path directly. Two wiring tests temporarily
+set the variable to disposable paths for the TUI and mcp-peer paths, serialized
+by a shared static mutex so their process-wide mutations cannot race. Traces
+captured on or before 2026-09-05 can still
 contain earlier test contamination, identifiable by a short-lived `process_id`,
 roughly 167 records per process, and pane ids 1 through 3. The `mcp_peer`
-subprocess path remains outside this isolation and still reads the variable
-directly, but that path is not executed by the test binary.
+subprocess resolves the variable once at startup and its unit tests inject the
+resolved path into `PeerCtx`; they do not start the subprocess.
 
 ## Threshold and record names
 

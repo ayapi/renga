@@ -1582,6 +1582,7 @@ fn handle_check_messages(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     };
     let structured = response.pointer("/result/structuredContent");
     let delivery = structured.and_then(|value| value.get("delivery"));
+    let error_reason = response.pointer("/error/message").and_then(Value::as_str);
     let body_len = delivery
         .and_then(|value| value.get("body_chunk"))
         .and_then(Value::as_str)
@@ -1606,6 +1607,7 @@ fn handle_check_messages(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
                 })),
             },
             "ack_result": ack_result,
+            "error_reason": error_reason,
             "response": {
                 "head_message_id": delivery.and_then(|value| value.get("message_id")).and_then(Value::as_str),
                 "count": structured.and_then(|value| value.get("count")).and_then(Value::as_u64),
@@ -3288,9 +3290,12 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                         body,
                         ts_ms,
                     } if target_pane == pane_id => {
-                        let receipt_cache_hit =
-                            delivery_id.is_some_and(|id| receipt_cache.contains(id));
-                        let body_len = body.len();
+                        let debug_metadata = registration_ctx.debug_log_path.as_ref().map(|_| {
+                            (
+                                delivery_id.is_some_and(|id| receipt_cache.contains(id)),
+                                body.len(),
+                            )
+                        });
                         let retained = retain_peer_delivery_once(&mut receipt_cache, delivery_id, || {
                             if client_kind.receive_mode() == ipc::PeerReceiveMode::Pull {
                                 queue_pull_message(&inbox, QueuedPeerMessage {
@@ -3310,20 +3315,22 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                                 deliver_push_frame(&registration_ctx, note)
                             }
                         });
-                        let inbox_len_after = inbox
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .messages
-                            .len();
-                        log_peer_inbox_received(
-                            &registration_ctx,
-                            delivery_id,
-                            from_pane,
-                            body_len,
-                            inbox_len_after,
-                        );
-                        if receipt_cache_hit {
-                            log_peer_receipt_cache_hit(&registration_ctx, delivery_id);
+                        if let Some((receipt_cache_hit, body_len)) = debug_metadata {
+                            let inbox_len_after = inbox
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .messages
+                                .len();
+                            log_peer_inbox_received(
+                                &registration_ctx,
+                                delivery_id,
+                                from_pane,
+                                body_len,
+                                inbox_len_after,
+                            );
+                            if receipt_cache_hit {
+                                log_peer_receipt_cache_hit(&registration_ctx, delivery_id);
+                            }
                         }
                         if retained {
                             if let Some(delivery_id) = delivery_id {
@@ -5543,6 +5550,26 @@ Commands:
     }
 
     #[test]
+    fn check_messages_debug_log_omits_complete_body_and_records_its_length() {
+        let path = debug_test_path("complete-body");
+        let ctx = connected_ctx_with_debug_log(path.clone());
+        let body = "complete private body";
+        enqueue_test_message(&ctx, body.to_string());
+
+        handle_check_messages(&json!(1), &json!({}), &ctx);
+
+        let text = std::fs::read_to_string(&path).expect("debug log");
+        assert!(!text.contains(body));
+        let records = read_debug_records(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].pointer("/response/body_len"),
+            Some(&json!(body.len()))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn check_messages_debug_log_records_cursor_call_once_without_body_or_token() {
         let path = debug_test_path("cursor");
         let ctx = connected_ctx_with_debug_log(path.clone());
@@ -5649,6 +5676,10 @@ Commands:
             Some(&json!("rejected:ack does not match the queued FIFO head"))
         );
         assert_eq!(
+            records[0].get("error_reason"),
+            Some(&json!("ack does not match the queued FIFO head"))
+        );
+        assert_eq!(
             records[0].pointer("/response/head_message_id"),
             Some(&Value::Null)
         );
@@ -5660,6 +5691,9 @@ Commands:
 
     #[test]
     fn disabled_check_messages_debug_log_writes_nothing_with_inherited_env() {
+        let _env_guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let path = debug_test_path("disabled");
         let previous = std::env::var_os(ENV_DEBUG_CODEX_PEER_LOG);
         unsafe { std::env::set_var(ENV_DEBUG_CODEX_PEER_LOG, &path) };

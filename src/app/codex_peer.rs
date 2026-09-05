@@ -2215,6 +2215,9 @@ mod debug_logging_tests {
 
     #[test]
     fn production_wiring_reads_renga_debug_codex_peer_log() {
+        let _env_guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
@@ -2225,9 +2228,9 @@ mod debug_logging_tests {
         ));
 
         // This process-wide mutation intentionally verifies the literal env
-        // wiring. The resolver has no OnceLock, and every other test keeps its
-        // test override disabled, so the temporary path cannot leak records to
-        // an inherited live trace even when tests run in parallel.
+        // wiring. The resolver has no OnceLock. This test and the mcp-peer
+        // inherited-env test share a process-wide lock so their temporary
+        // values cannot race while the rest of the suite uses injected paths.
         set_codex_peer_debug_log_path_test_override(None);
         let previous = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
         std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", &path);
