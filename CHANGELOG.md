@@ -38,6 +38,15 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Changed
 
+- **Peer sends to unresolved or cross-tab targets now report
+  `delivery=undeliverable` instead of `delivery=delivered`.** Both cases use the
+  same success-shaped result, queue no body, and disclose no cross-tab pane
+  existence. This is an intentional observable behavior change: the previous
+  response already documented that no delivery occurred, so callers could not
+  safely treat its `Delivered` label as confirmation. Name and `focused`
+  selectors are now resolved within the sender's tab, including for inactive
+  sender tabs.
+
 - **`check_messages` now pages queued peer bodies and requires an explicit
   receipt ack before removing the FIFO head.** Existing `{}` calls remain valid;
   additive cursor, response-budget, delivery, and pending-count keys support

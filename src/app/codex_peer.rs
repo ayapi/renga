@@ -872,6 +872,10 @@ impl App {
         }
     }
 
+    fn resolve_peer_send_target(&self, sender_ws: usize, target: &PaneRef) -> Option<usize> {
+        self.workspaces.get(sender_ws)?.resolve_pane_ref(target)
+    }
+
     fn prepare_peer_send(
         &mut self,
         from_pane: usize,
@@ -886,19 +890,11 @@ impl App {
                     format!("sender pane {from_pane} not found"),
                 )
             })?;
-        let (target_ws, target_id) = match self.resolve_pane_across_workspaces(target) {
-            Some(pair) => pair,
-            None => {
-                return Ok(PreparedPeerSend::Immediate(
-                    ipc::PeerSendOutcome::Undeliverable,
-                ))
-            }
-        };
-        if sender_ws != target_ws {
+        let Some(target_id) = self.resolve_peer_send_target(sender_ws, target) else {
             return Ok(PreparedPeerSend::Immediate(
                 ipc::PeerSendOutcome::Undeliverable,
             ));
-        }
+        };
         if let Some(outcome) = self.duplicate_peer_send_outcome(target_id, from_pane, &body) {
             // Same (target, from, body) within the dedupe window —
             // treat as a no-op so duplicate dispatcher acks /
@@ -916,7 +912,7 @@ impl App {
             .map(|(n, _)| n.clone());
         let from_kind = self.peer_client_kinds.get(&from_pane).copied();
         let nudge = if self.peer_delivery_ready.contains(&target_id)
-            && self.pane_expects_codex_peer_delivery(target_ws, target_id)
+            && self.pane_expects_codex_peer_delivery(sender_ws, target_id)
         {
             Some(PendingCodexPeerMessage {
                 from_pane,
@@ -965,8 +961,8 @@ impl App {
         reply: oneshot::Sender<std::result::Result<ipc::PeerSendOutcome, ipc::CodedError>>,
     ) {
         let target_id = self
-            .resolve_pane_across_workspaces(target)
-            .map(|(_, id)| id);
+            .resolve_pane_across_workspaces(&PaneRef::Id(from_pane))
+            .and_then(|(sender_ws, _)| self.resolve_peer_send_target(sender_ws, target));
         if let Some(pending) = self.pending_peer_deliveries.values_mut().find(|pending| {
             Some(pending.target_pane) == target_id
                 && pending.message.from_pane == from_pane

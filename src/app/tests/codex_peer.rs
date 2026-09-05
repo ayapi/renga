@@ -695,6 +695,105 @@ fn peer_send_returns_undeliverable_for_cross_tab_name_without_queued_state() {
 }
 
 #[test]
+fn peer_send_from_inactive_tab_resolves_duplicate_name_in_sender_tab() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sender_tab_target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            Some("worker".into()),
+            None,
+            None,
+        )
+        .expect("split sender tab");
+    app.handle_peer_register_client(sender_tab_target, PeerClientKind::Claude)
+        .expect("register sender-tab target");
+    app.handle_peer_set_ready(sender_tab_target, PeerClientKind::Claude, true)
+        .expect("ready sender-tab target");
+
+    let active_tab_target = app
+        .handle_new_tab(None, Some("worker".into()), None, None, None)
+        .expect("new active tab with duplicate name")
+        .id;
+    assert_ne!(active_tab_target, sender_tab_target);
+    let (_sub_id, rx) = app.event_bus.subscribe();
+
+    let outcome = app
+        .handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Name("worker".into()),
+            "route within sender tab".into(),
+        )
+        .expect("peer send");
+    assert_eq!(outcome, ipc::PeerSendOutcome::Delivered);
+    let target_pane = rx
+        .try_iter()
+        .find_map(|event| match event {
+            ipc::Event::PeerInbox { target_pane, .. } => Some(target_pane),
+            _ => None,
+        })
+        .expect("PeerInbox for sender-tab target");
+    assert_eq!(target_pane, sender_tab_target);
+    assert_ne!(target_pane, active_tab_target);
+    app.shutdown();
+}
+
+#[test]
+fn peer_send_from_inactive_tab_joins_sender_tabs_duplicate_name_delivery() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sender_tab_target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            Some("worker".into()),
+            None,
+            None,
+        )
+        .expect("split sender tab");
+    app.handle_peer_register_client(sender_tab_target, PeerClientKind::Claude)
+        .expect("register sender-tab target");
+    app.handle_peer_set_ready(sender_tab_target, PeerClientKind::Claude, true)
+        .expect("ready sender-tab target");
+    let active_tab_target = app
+        .handle_new_tab(None, Some("worker".into()), None, None, None)
+        .expect("new active tab with duplicate name")
+        .id;
+    assert_ne!(active_tab_target, sender_tab_target);
+    let (_sub_id, rx) = app.event_bus.subscribe();
+    let (first_tx, first_rx) = oneshot::channel();
+    let (second_tx, second_rx) = oneshot::channel();
+    let target = ipc::PaneRef::Name("worker".into());
+
+    app.begin_peer_send(sender_id, &target, "same body".into(), first_tx);
+    app.begin_peer_send(sender_id, &target, "same body".into(), second_tx);
+
+    assert_eq!(
+        app.pending_peer_deliveries.len(),
+        1,
+        "identical in-flight sends must join one delivery (renga-bcb)"
+    );
+    let delivery_id = peer_delivery_id(&rx);
+    assert_eq!(
+        app.pending_peer_deliveries[&delivery_id].target_pane,
+        sender_tab_target
+    );
+    assert_eq!(app.pending_peer_deliveries[&delivery_id].replies.len(), 2);
+    app.handle_peer_inbox_ack(sender_tab_target, delivery_id)
+        .expect("receipt");
+    for reply in [first_rx, second_rx] {
+        assert_eq!(
+            reply.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(),
+            ipc::PeerSendOutcome::Delivered
+        );
+    }
+    app.shutdown();
+}
+
+#[test]
 fn handle_peer_send_queues_codex_nudge_and_emits_peer_inbox() {
     let mut app = App::new(40, 80).expect("App::new");
     let (_sub_id, rx) = app.event_bus.subscribe();

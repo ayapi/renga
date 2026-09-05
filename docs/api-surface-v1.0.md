@@ -89,6 +89,10 @@ reachable: <reason>)"`.
 **Unresolved and cross-tab targets**: both return
 `{ "delivery": "undeliverable" }`, a success-shaped result that queues no body.
 The response does not reveal whether the pane exists in another tab (Q5).
+Adding the `undeliverable` value is additive. Relabeling these formerly
+successful no-delivery cases is an observable behavior change that is
+intentionally accepted: the previous contract already said no delivery
+occurred, so its `Delivered` label was not reliable confirmation.
 
 **Same-payload dedupe (post-1.1)**: identical `(target, sender, body)` triples
 arriving within a small dedupe window (~5s) are collapsed server-side to a
@@ -509,6 +513,9 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | `set_summary` | `from_pane: usize`, `summary: string` | Empty `summary` clears. >256 `chars` rejected with `summary_too_long`. |
 
 `PaneRef` = `{ id: usize } | { name: string } | "focused"`.
+For `peer_send`, consistent with other tab-scoped pane operations, the
+reference is resolved only within `from_pane`'s tab; `focused` means the
+focused pane in that sender tab, even when it is inactive.
 
 ### 3.4 Response envelope — stable
 
