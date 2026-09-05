@@ -36,6 +36,7 @@ mod parent_watch;
 
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -54,7 +55,8 @@ const SERVER_NAME: &str = "renga-peers";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ENV_PANE_ID: &str = "RENGA_PANE_ID";
 pub(crate) const ENV_CLIENT_KIND: &str = "RENGA_PEER_CLIENT_KIND";
-static CLIENT_KIND_DEBUG_RECORD_SEQUENCE: std::sync::atomic::AtomicU64 =
+const ENV_DEBUG_CODEX_PEER_LOG: &str = "RENGA_DEBUG_CODEX_PEER_LOG";
+static PEER_DEBUG_RECORD_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
 fn log_stderr(msg: &str) {
@@ -134,17 +136,46 @@ fn acknowledge_peer_inbox(ctx: &PeerCtx, delivery_id: u64) {
     let Mode::Connected { pane_id, endpoint } = &ctx.mode else {
         return;
     };
-    match client::send_request(
+    let result = client::send_request(
         endpoint,
         &Request::PeerInboxAck {
             pane_id: *pane_id,
             delivery_id,
         },
-    ) {
+    );
+    match &result {
         Ok(Response::Ok { .. }) => {}
         Ok(other) => log_stderr(&format!("peer inbox receipt returned: {other:?}")),
         Err(e) => log_stderr(&format!("peer inbox receipt failed: {e}")),
     }
+    let Some(path) = ctx.debug_log_path.as_deref() else {
+        return;
+    };
+    let (ok, error) = match result {
+        Ok(Response::Ok { .. }) => (true, None),
+        Ok(other) => (false, Some(format!("unexpected response: {other:?}"))),
+        Err(error) => (false, Some(error.to_string())),
+    };
+    log_peer_inbox_ack_sent(path, *pane_id, delivery_id, ok, error.as_deref());
+}
+
+fn log_peer_inbox_ack_sent(
+    path: &Path,
+    pane_id: usize,
+    delivery_id: u64,
+    ok: bool,
+    error: Option<&str>,
+) {
+    append_peer_debug_record(
+        path,
+        Some(pane_id),
+        json!({
+            "action": "peer_inbox_ack_sent",
+            "delivery_id": delivery_id,
+            "ok": ok,
+            "error": error,
+        }),
+    );
 }
 
 const PEER_RECEIPT_CACHE_CAP: usize = 4096;
@@ -212,6 +243,7 @@ struct PeerCtx {
     events: EventSink,
     inbox: InboxSink,
     push: PushSink,
+    debug_log_path: Option<PathBuf>,
 }
 
 /// Soft cap on the per-process lifecycle event buffer used by
@@ -317,13 +349,14 @@ impl PeerCtx {
         let events = new_event_sink();
         let inbox = new_inbox_sink();
         let push = Arc::new(Mutex::new(PushState::default()));
+        let debug_log_path = std::env::var_os(ENV_DEBUG_CODEX_PEER_LOG).map(PathBuf::from);
         let client_kind_raw = std::env::var(ENV_CLIENT_KIND);
         let client_kind = client_kind_raw
             .as_ref()
             .ok()
             .and_then(|s| parse_client_kind(s))
             .unwrap_or(PeerClientKind::Claude);
-        log_client_kind_resolution(&client_kind_raw, client_kind);
+        log_client_kind_resolution(debug_log_path.as_deref(), &client_kind_raw, client_kind);
         let pane_id = match std::env::var(ENV_PANE_ID) {
             Ok(s) => match s.parse::<usize>() {
                 Ok(v) => v,
@@ -336,6 +369,7 @@ impl PeerCtx {
                         inbox,
                         push,
                         client_kind,
+                        debug_log_path,
                     };
                 }
             },
@@ -350,6 +384,7 @@ impl PeerCtx {
                     inbox,
                     push,
                     client_kind,
+                    debug_log_path,
                 };
             }
         };
@@ -360,6 +395,7 @@ impl PeerCtx {
                 inbox,
                 push,
                 client_kind,
+                debug_log_path,
             },
             Err(e) => PeerCtx {
                 mode: Mode::Detached {
@@ -369,6 +405,7 @@ impl PeerCtx {
                 inbox,
                 push,
                 client_kind,
+                debug_log_path,
             },
         }
     }
@@ -383,10 +420,11 @@ fn parse_client_kind(raw: &str) -> Option<PeerClientKind> {
 }
 
 fn log_client_kind_resolution(
+    debug_log_path: Option<&Path>,
     client_kind_raw: &std::result::Result<String, std::env::VarError>,
     client_kind: PeerClientKind,
 ) {
-    let Some(path) = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG") else {
+    let Some(path) = debug_log_path else {
         return;
     };
 
@@ -407,15 +445,7 @@ fn log_client_kind_resolution(
     let pane_id = pane_id_raw
         .as_deref()
         .and_then(|raw| raw.parse::<usize>().ok());
-    let timestamp_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis());
-    let record_sequence =
-        CLIENT_KIND_DEBUG_RECORD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let record = json!({
-        "timestamp_unix_ms": timestamp_unix_ms,
-        "process_id": std::process::id(),
-        "record_sequence": record_sequence,
         "action": "client_kind_resolved",
         "pane_id": pane_id,
         "renga_peer_client_kind_state": client_kind_env_state,
@@ -427,14 +457,30 @@ fn log_client_kind_resolution(
         "renga_socket_present": std::env::var_os(ENV_SOCKET).is_some(),
         "renga_token_present": std::env::var_os(ENV_TOKEN).is_some(),
     });
-    let Ok(mut line) = serde_json::to_vec(&record) else {
+    append_peer_debug_record(path, pane_id, record);
+}
+
+fn append_peer_debug_record(path: &Path, pane_id: Option<usize>, mut record: Value) {
+    let Some(record) = record.as_object_mut() else {
+        return;
+    };
+    let timestamp_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let record_sequence =
+        PEER_DEBUG_RECORD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    record.insert("timestamp_unix_ms".to_string(), json!(timestamp_unix_ms));
+    record.insert("process_id".to_string(), json!(std::process::id()));
+    record.insert("record_sequence".to_string(), json!(record_sequence));
+    record.insert("pane_id".to_string(), json!(pane_id));
+    let Ok(mut line) = serde_json::to_vec(record) else {
         return;
     };
     line.push(b'\n');
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(std::path::PathBuf::from(path))
+        .open(path)
     {
         let _ = file.write_all(&line);
     }
@@ -1422,7 +1468,7 @@ fn check_messages_page_response(
     ))
 }
 
-fn handle_check_messages(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
+fn handle_check_messages_inner(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     let budget = match parse_check_response_budget(args) {
         Ok(value) => value,
         Err(message) => return err_response(id, -32602, &message),
@@ -1486,6 +1532,100 @@ fn handle_check_messages(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     match check_messages_page_response(id, entry, offset, pending_after, budget) {
         Ok(response) => response,
         Err(message) => err_response(id, -32602, &message),
+    }
+}
+
+fn handle_check_messages(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
+    let Some(path) = ctx.debug_log_path.as_deref() else {
+        return handle_check_messages_inner(id, args, ctx);
+    };
+    let ack = args.get("ack");
+    let has_cursor = args.get("message_id").is_some() || args.get("offset_bytes").is_some();
+    let (inbox_len_before, ack_would_be_accepted) = {
+        let inbox = ctx.inbox.lock().unwrap_or_else(|p| p.into_inner());
+        let ack_would_be_accepted = parse_check_response_budget(args).is_ok()
+            && !has_cursor
+            && ack
+                .and_then(Value::as_object)
+                .zip(inbox.messages.front())
+                .is_some_and(|(ack, head)| {
+                    ack.get("message_id").and_then(Value::as_str) == Some(&head.message_id)
+                        && ack.get("token").and_then(Value::as_str) == Some(&head.ack_token)
+                });
+        (inbox.messages.len(), ack_would_be_accepted)
+    };
+    let response = handle_check_messages_inner(id, args, ctx);
+    let inbox_len_after = ctx
+        .inbox
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .messages
+        .len();
+
+    let call_shape = if args.get("ack").is_some() {
+        "ack"
+    } else if args.get("message_id").is_some() || args.get("offset_bytes").is_some() {
+        "cursor"
+    } else {
+        "empty"
+    };
+    let ack_result = if ack.is_none() {
+        "none".to_string()
+    } else if ack_would_be_accepted {
+        "accepted".to_string()
+    } else {
+        let reason = response
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown reason");
+        format!("rejected:{reason}")
+    };
+    let structured = response.pointer("/result/structuredContent");
+    let delivery = structured.and_then(|value| value.get("delivery"));
+    let body_len = delivery
+        .and_then(|value| value.get("body_chunk"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            structured
+                .and_then(|value| value.pointer("/messages/0/body"))
+                .and_then(Value::as_str)
+        })
+        .map(str::len);
+    append_peer_debug_record(
+        path,
+        peer_ctx_pane_id(ctx),
+        json!({
+            "action": "check_messages",
+            "call_shape": call_shape,
+            "args": {
+                "message_id": args.get("message_id").and_then(Value::as_str),
+                "offset_bytes": args.get("offset_bytes").and_then(Value::as_u64),
+                "ack": ack.map(|value| json!({
+                    "message_id": value.get("message_id").and_then(Value::as_str),
+                    "token_present": value.get("token").is_some(),
+                })),
+            },
+            "ack_result": ack_result,
+            "response": {
+                "head_message_id": delivery.and_then(|value| value.get("message_id")).and_then(Value::as_str),
+                "count": structured.and_then(|value| value.get("count")).and_then(Value::as_u64),
+                "pending_after": structured.and_then(|value| value.get("pending_after")).and_then(Value::as_u64),
+                "has_more": structured.and_then(|value| value.get("has_more")).and_then(Value::as_bool),
+                "ack_token_present": delivery.and_then(|value| value.get("ack_token")).is_some(),
+                "page_offset": delivery.and_then(|value| value.get("offset_bytes")).and_then(Value::as_u64),
+                "body_len": body_len,
+            },
+            "inbox_len_before": inbox_len_before,
+            "inbox_len_after": inbox_len_after,
+        }),
+    );
+    response
+}
+
+fn peer_ctx_pane_id(ctx: &PeerCtx) -> Option<usize> {
+    match &ctx.mode {
+        Mode::Connected { pane_id, .. } => Some(*pane_id),
+        Mode::Detached { .. } => None,
     }
 }
 
@@ -3148,6 +3288,9 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                         body,
                         ts_ms,
                     } if target_pane == pane_id => {
+                        let receipt_cache_hit =
+                            delivery_id.is_some_and(|id| receipt_cache.contains(id));
+                        let body_len = body.len();
                         let retained = retain_peer_delivery_once(&mut receipt_cache, delivery_id, || {
                             if client_kind.receive_mode() == ipc::PeerReceiveMode::Pull {
                                 queue_pull_message(&inbox, QueuedPeerMessage {
@@ -3167,6 +3310,21 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                                 deliver_push_frame(&registration_ctx, note)
                             }
                         });
+                        let inbox_len_after = inbox
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .messages
+                            .len();
+                        log_peer_inbox_received(
+                            &registration_ctx,
+                            delivery_id,
+                            from_pane,
+                            body_len,
+                            inbox_len_after,
+                        );
+                        if receipt_cache_hit {
+                            log_peer_receipt_cache_hit(&registration_ctx, delivery_id);
+                        }
                         if retained {
                             if let Some(delivery_id) = delivery_id {
                                 acknowledge_peer_inbox(&registration_ctx, delivery_id);
@@ -3246,6 +3404,43 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
             }
         })
         .expect("spawn inbox subscriber thread");
+}
+
+fn log_peer_inbox_received(
+    ctx: &PeerCtx,
+    delivery_id: Option<u64>,
+    from_pane: usize,
+    body_len: usize,
+    inbox_len_after: usize,
+) {
+    let Some(path) = ctx.debug_log_path.as_deref() else {
+        return;
+    };
+    append_peer_debug_record(
+        path,
+        peer_ctx_pane_id(ctx),
+        json!({
+            "action": "peer_inbox_received",
+            "delivery_id": delivery_id,
+            "from_pane": from_pane,
+            "body_len": body_len,
+            "inbox_len_after": inbox_len_after,
+        }),
+    );
+}
+
+fn log_peer_receipt_cache_hit(ctx: &PeerCtx, delivery_id: Option<u64>) {
+    let Some(path) = ctx.debug_log_path.as_deref() else {
+        return;
+    };
+    append_peer_debug_record(
+        path,
+        peer_ctx_pane_id(ctx),
+        json!({
+            "action": "peer_receipt_cache_hit",
+            "delivery_id": delivery_id,
+        }),
+    );
 }
 
 /// True for events that belong in the `poll_events` ring buffer. A
@@ -5121,6 +5316,7 @@ Commands:
             events: new_event_sink(),
             inbox: new_inbox_sink(),
             push: Arc::new(Mutex::new(PushState::default())),
+            debug_log_path: None,
         }
     }
 
@@ -5134,11 +5330,34 @@ Commands:
             events,
             inbox: new_inbox_sink(),
             push: Arc::new(Mutex::new(PushState::default())),
+            debug_log_path: None,
         }
     }
 
     fn connected_ctx_with(events: EventSink) -> PeerCtx {
         connected_ctx_with_kind(events, PeerClientKind::Claude)
+    }
+
+    fn connected_ctx_with_debug_log(path: PathBuf) -> PeerCtx {
+        let mut ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
+        ctx.debug_log_path = Some(path);
+        ctx
+    }
+
+    fn debug_test_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "renga-mcp-peer-{label}-{}-{}.jsonl",
+            std::process::id(),
+            PEER_DEBUG_RECORD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    fn read_debug_records(path: &Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .expect("debug log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSONL record"))
+            .collect()
     }
 
     fn pane_exited_value(id: usize, seq_ts: u64) -> Value {
@@ -5302,6 +5521,209 @@ Commands:
             .and_then(Value::as_str)
             .unwrap_or("")
             .contains("receipt, not completion"));
+    }
+
+    #[test]
+    fn check_messages_debug_log_records_empty_call_once() {
+        let path = debug_test_path("empty");
+        let ctx = connected_ctx_with_debug_log(path.clone());
+
+        let response = handle_check_messages(&json!(1), &json!({}), &ctx);
+
+        assert_eq!(structured(&response).get("count"), Some(&json!(0)));
+        let records = read_debug_records(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].get("action"), Some(&json!("check_messages")));
+        assert_eq!(records[0].get("call_shape"), Some(&json!("empty")));
+        assert_eq!(records[0].get("ack_result"), Some(&json!("none")));
+        assert_eq!(records[0].pointer("/response/count"), Some(&json!(0)));
+        assert_eq!(records[0].get("inbox_len_before"), Some(&json!(0)));
+        assert_eq!(records[0].get("inbox_len_after"), Some(&json!(0)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn check_messages_debug_log_records_cursor_call_once_without_body_or_token() {
+        let path = debug_test_path("cursor");
+        let ctx = connected_ctx_with_debug_log(path.clone());
+        enqueue_test_message(&ctx, "message body that must stay private".repeat(300));
+        let first = handle_check_messages_inner(&json!(1), &json!({}), &ctx);
+        let message_id = first
+            .pointer("/result/structuredContent/delivery/message_id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let next_offset = first
+            .pointer("/result/structuredContent/delivery/next_offset_bytes")
+            .and_then(Value::as_u64)
+            .unwrap();
+
+        handle_check_messages(
+            &json!(2),
+            &json!({"message_id": message_id, "offset_bytes": next_offset}),
+            &ctx,
+        );
+
+        let text = std::fs::read_to_string(&path).expect("debug log");
+        assert!(!text.contains("message body"));
+        assert!(!text.contains("ack_token\""));
+        let records = read_debug_records(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].get("call_shape"), Some(&json!("cursor")));
+        assert_eq!(
+            records[0].pointer("/args/message_id"),
+            Some(&json!(message_id))
+        );
+        assert_eq!(
+            records[0].pointer("/args/offset_bytes"),
+            Some(&json!(next_offset))
+        );
+        assert!(
+            records[0]
+                .pointer("/response/body_len")
+                .unwrap()
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn check_messages_debug_log_records_ack_call_once_without_token() {
+        let path = debug_test_path("ack");
+        let ctx = connected_ctx_with_debug_log(path.clone());
+        enqueue_test_message(&ctx, "ack me".to_string());
+        let first = handle_check_messages_inner(&json!(1), &json!({}), &ctx);
+        let message_id = first
+            .pointer("/result/structuredContent/delivery/message_id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let token = first
+            .pointer("/result/structuredContent/delivery/ack_token")
+            .and_then(Value::as_str)
+            .unwrap();
+
+        handle_check_messages(
+            &json!(2),
+            &json!({"ack": {"message_id": message_id, "token": token}}),
+            &ctx,
+        );
+
+        let text = std::fs::read_to_string(&path).expect("debug log");
+        assert!(!text.contains(token));
+        let records = read_debug_records(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].get("call_shape"), Some(&json!("ack")));
+        assert_eq!(records[0].get("ack_result"), Some(&json!("accepted")));
+        assert_eq!(
+            records[0].pointer("/args/ack/message_id"),
+            Some(&json!(message_id))
+        );
+        assert_eq!(
+            records[0].pointer("/args/ack/token_present"),
+            Some(&json!(true))
+        );
+        assert_eq!(records[0].get("inbox_len_before"), Some(&json!(1)));
+        assert_eq!(records[0].get("inbox_len_after"), Some(&json!(0)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn check_messages_debug_log_records_rejected_ack_and_null_response() {
+        let path = debug_test_path("rejected-ack");
+        let ctx = connected_ctx_with_debug_log(path.clone());
+        enqueue_test_message(&ctx, "still queued".to_string());
+
+        let response = handle_check_messages(
+            &json!(1),
+            &json!({"ack": {"message_id": "m1", "token": "wrong"}}),
+            &ctx,
+        );
+
+        assert!(response.get("error").is_some());
+        let records = read_debug_records(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].get("call_shape"), Some(&json!("ack")));
+        assert_eq!(
+            records[0].get("ack_result"),
+            Some(&json!("rejected:ack does not match the queued FIFO head"))
+        );
+        assert_eq!(
+            records[0].pointer("/response/head_message_id"),
+            Some(&Value::Null)
+        );
+        assert_eq!(records[0].pointer("/response/count"), Some(&Value::Null));
+        assert_eq!(records[0].get("inbox_len_before"), Some(&json!(1)));
+        assert_eq!(records[0].get("inbox_len_after"), Some(&json!(1)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn disabled_check_messages_debug_log_writes_nothing_with_inherited_env() {
+        let path = debug_test_path("disabled");
+        let previous = std::env::var_os(ENV_DEBUG_CODEX_PEER_LOG);
+        unsafe { std::env::set_var(ENV_DEBUG_CODEX_PEER_LOG, &path) };
+        let ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
+
+        handle_check_messages(&json!(1), &json!({}), &ctx);
+        log_peer_inbox_received(&ctx, Some(1), 2, 3, 4);
+        log_peer_receipt_cache_hit(&ctx, Some(1));
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var(ENV_DEBUG_CODEX_PEER_LOG, value) },
+            None => unsafe { std::env::remove_var(ENV_DEBUG_CODEX_PEER_LOG) },
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn peer_inbox_debug_records_contain_metadata_not_body() {
+        let path = debug_test_path("inbox-events");
+        let ctx = connected_ctx_with_debug_log(path.clone());
+
+        log_peer_inbox_received(&ctx, Some(71), 9, "private payload".len(), 2);
+        log_peer_receipt_cache_hit(&ctx, Some(71));
+        log_peer_inbox_ack_sent(&path, 1, 71, true, None);
+        log_peer_inbox_ack_sent(&path, 1, 72, false, Some("send failed"));
+
+        let text = std::fs::read_to_string(&path).expect("debug log");
+        assert!(!text.contains("private payload"));
+        let records = read_debug_records(&path);
+        assert_eq!(records.len(), 4);
+        assert_eq!(
+            records[0].get("action"),
+            Some(&json!("peer_inbox_received"))
+        );
+        assert_eq!(records[0].get("delivery_id"), Some(&json!(71)));
+        assert_eq!(records[0].get("from_pane"), Some(&json!(9)));
+        assert_eq!(records[0].get("body_len"), Some(&json!(15)));
+        assert_eq!(records[0].get("inbox_len_after"), Some(&json!(2)));
+        assert_eq!(
+            records[1].get("action"),
+            Some(&json!("peer_receipt_cache_hit"))
+        );
+        assert_eq!(records[1].get("delivery_id"), Some(&json!(71)));
+        assert_eq!(
+            records[2].get("action"),
+            Some(&json!("peer_inbox_ack_sent"))
+        );
+        assert_eq!(records[2].get("delivery_id"), Some(&json!(71)));
+        assert_eq!(records[2].get("ok"), Some(&json!(true)));
+        assert_eq!(records[2].get("error"), Some(&Value::Null));
+        assert_eq!(
+            records[3].get("action"),
+            Some(&json!("peer_inbox_ack_sent"))
+        );
+        assert_eq!(records[3].get("delivery_id"), Some(&json!(72)));
+        assert_eq!(records[3].get("ok"), Some(&json!(false)));
+        assert_eq!(records[3].get("error"), Some(&json!("send failed")));
+        for record in records {
+            assert_eq!(record.get("pane_id"), Some(&json!(1)));
+            assert!(record.get("process_id").is_some());
+            assert!(record.get("record_sequence").is_some());
+            assert!(record.get("timestamp_unix_ms").is_some());
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     fn collect_queued_body(ctx: &PeerCtx, args: Value) -> (String, String, String, usize) {
