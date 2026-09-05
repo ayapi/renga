@@ -264,6 +264,7 @@ fn finish_frame_at(finished_at: Instant, visible_panes: Vec<usize>) {
 #[cfg(test)]
 mod debug_logging_tests {
     use super::*;
+    use crate::pane::Pane;
 
     fn temp_log_path(label: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()
@@ -341,6 +342,47 @@ mod debug_logging_tests {
         assert_eq!(record["enqueued_at_ms"], 1234);
         assert_eq!(record["queue_wait_ms"], 7);
         assert!(record["command_ms"].is_number());
+        std::fs::remove_file(path).expect("remove debug JSONL");
+        configure(None);
+    }
+
+    #[test]
+    fn scrollbar_info_records_parser_lock_wait_for_its_pane() {
+        let path = temp_log_path("scrollbar-lock");
+        configure(Some(path.as_os_str().to_owned()));
+        let started_at = Instant::now();
+        begin_frame(started_at);
+
+        let (event_tx, _event_rx) = std::sync::mpsc::channel();
+        let pane = Pane::new(9991, 24, 80, event_tx).expect("headless pane");
+        let parser = pane.parser.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = parser.lock().unwrap_or_else(|error| error.into_inner());
+            locked_tx.send(()).expect("signal held parser lock");
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        locked_rx.recv().expect("wait for held parser lock");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let _ = pane.scrollbar_info();
+        holder.join().expect("lock holder exits");
+        finish_frame_at(
+            started_at + Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 + 1),
+            vec![pane.id],
+        );
+
+        let contents = std::fs::read_to_string(&path).expect("debug JSONL");
+        let lines: Vec<_> = contents.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let record: Value = serde_json::from_str(lines[0]).expect("one JSON object");
+        let wait_ms = record[FIELD_LOCK_WAIT_MS_BY_PANE][pane.id.to_string()]
+            .as_u64()
+            .expect("pane lock wait milliseconds");
+        assert!(
+            wait_ms >= 200,
+            "scrollbar lock wait should include contention, got {wait_ms} ms"
+        );
         std::fs::remove_file(path).expect("remove debug JSONL");
         configure(None);
     }

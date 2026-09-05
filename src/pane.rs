@@ -420,7 +420,9 @@ impl Pane {
                 .context("Failed to resize PTY")?;
         }
 
+        let lock_started = crate::app::frame_diagnostics::lock_wait_started();
         let mut parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        crate::app::frame_diagnostics::record_lock_wait(self.id, lock_started);
         parser.screen_mut().set_size(rows, cols);
         // Clear the screen buffer to avoid rendering stale content at the new size.
         // The TUI app (e.g. Claude Code) receives SIGWINCH and will redraw.
@@ -448,7 +450,9 @@ impl Pane {
     /// Get scrollbar info: (current_offset, max_offset).
     /// max_offset is estimated by trying to scroll to a large value and checking.
     pub fn scrollbar_info(&self) -> (usize, usize) {
+        let lock_started = crate::app::frame_diagnostics::lock_wait_started();
         let parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        crate::app::frame_diagnostics::record_lock_wait(self.id, lock_started);
         let screen = parser.screen();
         let current = screen.scrollback();
         // Estimate max by checking: set_scrollback clamps to actual scrollback length
@@ -476,7 +480,9 @@ impl Pane {
 
     /// Check if the terminal is scrolled back.
     pub fn is_scrolled_back(&self) -> bool {
+        let lock_started = crate::app::frame_diagnostics::lock_wait_started();
         let parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        crate::app::frame_diagnostics::record_lock_wait(self.id, lock_started);
         parser.screen().scrollback() > 0
     }
 
