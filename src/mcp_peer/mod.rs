@@ -699,9 +699,10 @@ removing the FIFO head: assemble every body page using the returned message_id a
 next_offset_bytes, then explicitly ack only after the complete body was received. If a response is \
 truncated, retry the same cursor without ack and optionally lower max_response_bytes. The ack \
 confirms receipt, not completion of the requested work, and its response contains only that \
-confirmation, never the next message body. The next message arrives through its own nudge. If an \
-ack response reports pending_after greater than zero, call check_messages({}) immediately to read \
-it. Use send_message when a reply, \
+confirmation, never the next message body. If an ack response reports pending_after greater than \
+zero, call check_messages({}) again immediately \
+to read it; no nudge will follow for messages that arrived while one was pending. Use send_message \
+when a reply, \
 clarification, status update, or handoff is actually needed.\n\n\
 MCP approvals in Codex are pane-local. On a newly launched pane, the first check_messages and \
 send_message calls may need approval before peer messaging becomes reliable.\n\n"
@@ -816,7 +817,7 @@ fn tools_spec() -> Value {
         },
         {
             "name": "check_messages",
-            "description": "Read one bounded page from the queued peer inbox without removing it. Read structuredContent.messages[0].body when a complete message fits; otherwise append structuredContent.delivery.body_chunk and call check_messages again with the returned message_id / next_offset_bytes. Assemble the complete body before acting on it, then acknowledge receipt with ack {message_id, token}; only that explicit ack removes the message. The ack response is confirmation only and never contains the next message body; the next message arrives through its own nudge. If pending_after is greater than zero in an ack response, call check_messages({}) immediately to read it. If a response is truncated, retry the same cursor without ack and optionally lower max_response_bytes.",
+            "description": "Read one bounded page from the queued peer inbox without removing it. Read structuredContent.messages[0].body when a complete message fits; otherwise append structuredContent.delivery.body_chunk and call check_messages again with the returned message_id / next_offset_bytes. Assemble the complete body before acting on it, then acknowledge receipt with ack {message_id, token}; only that explicit ack removes the message. The ack response is confirmation only and never contains the next message body. If pending_after is greater than zero, call check_messages({}) again immediately to read it; no nudge will follow for messages that arrived while one was pending. If a response is truncated, retry the same cursor without ack and optionally lower max_response_bytes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1310,8 +1311,9 @@ fn acknowledged_check_messages_response(
         format!("Acknowledged {message_id}. No queued messages.")
     } else {
         format!(
-            "Acknowledged {message_id}. {pending_after} message(s) still queued; call \
-check_messages({{}}) to read the next."
+            "Acknowledged {message_id}. {pending_after} message(s) still queued. Call \
+check_messages({{}}) again immediately to read the next; no nudge will follow for messages that \
+arrived while one was pending."
         )
     };
     ok_response(
@@ -3514,6 +3516,7 @@ fn subscription_retry_state_after_attempt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::App;
 
     #[test]
     fn peer_send_result_only_claims_delivered_for_explicit_outcome() {
@@ -5520,9 +5523,9 @@ Commands:
         assert!(instructions.contains("retry the same cursor without ack"));
         assert!(instructions.contains("confirms receipt, not completion"));
         assert!(instructions.contains("response contains only that confirmation"));
-        assert!(instructions.contains("next message arrives through its own nudge"));
         assert!(instructions.contains("pending_after greater than zero"));
-        assert!(instructions.contains("call check_messages({}) immediately"));
+        assert!(instructions.contains("call check_messages({}) again immediately"));
+        assert!(instructions.contains("no nudge will follow"));
     }
 
     fn enqueue_test_message(ctx: &PeerCtx, body: String) {
@@ -5556,9 +5559,9 @@ Commands:
         assert!(description.contains("only that explicit ack removes the message"));
         assert!(description.contains("retry the same cursor without ack"));
         assert!(description.contains("ack response is confirmation only"));
-        assert!(description.contains("next message arrives through its own nudge"));
         assert!(description.contains("pending_after is greater than zero"));
-        assert!(description.contains("call check_messages({}) immediately"));
+        assert!(description.contains("call check_messages({}) again immediately"));
+        assert!(description.contains("no nudge will follow"));
         assert_eq!(
             check.pointer("/inputSchema/properties/max_response_bytes/default"),
             Some(&json!(4096))
@@ -5692,6 +5695,12 @@ Commands:
         );
         assert_eq!(records[0].get("inbox_len_before"), Some(&json!(1)));
         assert_eq!(records[0].get("inbox_len_after"), Some(&json!(0)));
+        assert_eq!(records[0].pointer("/response/count"), Some(&json!(0)));
+        assert_eq!(
+            records[0].pointer("/response/head_message_id"),
+            Some(&Value::Null),
+            "an accepted ack records an empty response head, distinct from its accepted status"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -5940,6 +5949,7 @@ Commands:
             drained.pointer("/result/structuredContent/ack_required"),
             Some(&json!(false))
         );
+        // A final ack is confirmation, not the byte-identical empty-inbox response.
         assert_eq!(
             drained
                 .pointer("/result/content/0/text")
@@ -6118,6 +6128,118 @@ Commands:
         );
         assert_eq!(duplicate_ack.pointer("/error/code"), Some(&json!(-32602)));
         assert_eq!(ctx.inbox.lock().unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn coalesced_nudge_ack_text_drives_fresh_check_for_second_message() {
+        let mut app = App::new(40, 80).expect("App::new");
+        let (_subscription_id, events) = app.event_bus.subscribe();
+        let sender_id = app.ws().focused_pane_id;
+        let codex_id = app
+            .handle_split(
+                &ipc::PaneRef::Focused,
+                ipc::Direction::Vertical,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("split succeeds");
+        app.peer_client_kinds
+            .insert(codex_id, PeerClientKind::Codex);
+        app.peer_delivery_ready.insert(codex_id);
+        app.handle_focus(&ipc::PaneRef::Id(sender_id))
+            .expect("refocus sender");
+        while events.try_recv().is_ok() {}
+
+        app.handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(codex_id),
+            "first request".to_string(),
+        )
+        .expect("first send");
+        app.handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(codex_id),
+            "second request".to_string(),
+        )
+        .expect("second send");
+        assert_eq!(
+            app.pending_codex_peer_messages
+                .get(&codex_id)
+                .map(VecDeque::len),
+            Some(1),
+            "the second arrival shares the already-pending nudge"
+        );
+
+        let ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
+        for event in events.try_iter() {
+            if let ipc::Event::PeerInbox {
+                target_pane,
+                from_pane,
+                from_name,
+                from_kind,
+                body,
+                ts_ms,
+                ..
+            } = event
+            {
+                assert_eq!(target_pane, codex_id);
+                queue_pull_message(
+                    &ctx.inbox,
+                    QueuedPeerMessage {
+                        from_id: from_pane.to_string(),
+                        from_name,
+                        from_kind,
+                        body,
+                        sent_at: ts_ms_to_string(ts_ms),
+                    },
+                );
+            }
+        }
+        assert_eq!(ctx.inbox.lock().unwrap().messages.len(), 2);
+
+        let first = handle_check_messages(&json!(1), &json!({}), &ctx);
+        let message_id = first
+            .pointer("/result/structuredContent/delivery/message_id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let token = first
+            .pointer("/result/structuredContent/delivery/ack_token")
+            .and_then(Value::as_str)
+            .unwrap();
+        let acknowledged = handle_check_messages(
+            &json!(2),
+            &json!({"ack": {"message_id": message_id, "token": token}}),
+            &ctx,
+        );
+        assert_eq!(
+            acknowledged.pointer("/result/structuredContent/pending_after"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            acknowledged.pointer("/result/structuredContent/has_more"),
+            Some(&json!(true))
+        );
+        let acknowledgement_text = acknowledged
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(acknowledgement_text.contains("Call check_messages({}) again immediately"));
+        assert!(acknowledgement_text.contains("no nudge will follow"));
+        assert!(
+            acknowledged
+                .pointer("/result/structuredContent/delivery")
+                .is_none(),
+            "the acknowledgement must not chain the second body"
+        );
+
+        let second = handle_check_messages(&json!(3), &json!({}), &ctx);
+        assert_eq!(
+            second.pointer("/result/structuredContent/messages/0/body"),
+            Some(&json!("second request"))
+        );
+        app.shutdown();
     }
 
     #[test]

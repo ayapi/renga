@@ -32,7 +32,7 @@ renga mcp install --client codex --codex-auto-approve-peer-tools
 - **Claude Code** は MCP の experimental channel 機能を使うので、起動時に毎回 `--dangerously-load-development-channels server:renga-peers` が必要です。
 - **Codex** は `renga mcp install --client codex` で入れた MCP 登録を使います。これが入っていれば plain `codex` 起動で足ります。非フォーカスの worker pane が落ち着いたら renga が `check_messages` を促す nudge を送り、実際の peer 本文は `check_messages` で読みます。対象の Codex pane がフォーカス中なら、PTY 注入を即座にせずローカル通知 overlay を表示します。
 
-`check_messages` は大きさを制限した page を 1 つだけ返し、応答を生成しただけでは FIFO の先頭を削除しません。`messages[0].body` があれば全文です。無ければ `delivery.body_chunk` を連結し、返された `message_id` と `next_offset_bytes` で続きを取得します。全文を受け取ってからだけ `ack {message_id, token}` を返してください。この ack は依頼の作業完了ではなく、本文の受領確認です。ツール応答が切れた場合は ack せず同じ cursor を再試行し、必要なら `max_response_bytes` を下げます。既定の 4096 bytes は JSON-RPC 応答用の transport page size であり、Codex の context 閾値を測定した値ではありません。`pending_after` は、未 ack の先頭より後ろで待つ件数です。
+`check_messages` は大きさを制限した page を 1 つだけ返し、応答を生成しただけでは FIFO の先頭を削除しません。`messages[0].body` があれば全文です。無ければ `delivery.body_chunk` を連結し、返された `message_id` と `next_offset_bytes` で続きを取得します。全文を受け取ってからだけ `ack {message_id, token}` を返してください。この ack は依頼の作業完了ではなく、本文の受領確認です。ツール応答が切れた場合は ack せず同じ cursor を再試行し、必要なら `max_response_bytes` を下げます。既定の 4096 bytes は JSON-RPC 応答用の transport page size であり、Codex の context 閾値を測定した値ではありません。`pending_after` は、未 ack の先頭より後ろで待つ件数です。ack 応答には次の本文を含めません。`pending_after > 0` なら直ちに `check_messages({})` をもう一度呼んでください。nudge が pending の間に届いたメッセージはその nudge を共有するため、追加の nudge は届きません。
 
 Claude の起動フラグを毎回手で打たなくて済むように、renga 側から 2 つの経路を用意しています:
 

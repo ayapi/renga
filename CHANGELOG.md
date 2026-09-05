@@ -40,8 +40,10 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 - **Successful `check_messages` acknowledgements no longer include the next
   queued peer body.** They return confirmation metadata only; each following
-  message is read by a fresh check prompted by its own nudge. The additive
-  `acknowledged_message_id` identifies the removed FIFO head. (renga-069)
+  message is read by a fresh check. When another message arrived while a nudge
+  was already pending, the ack response explicitly prompts that check because
+  no additional nudge follows. The additive `acknowledged_message_id`
+  identifies the removed FIFO head. (renga-069)
 
 - **Peer sends to unresolved or cross-tab targets now report
   `delivery=undeliverable` instead of `delivery=delivered`.** Both cases use the

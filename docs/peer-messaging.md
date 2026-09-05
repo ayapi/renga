@@ -39,7 +39,10 @@ Only after the complete body is received should the caller send the returned
 tool response is truncated, retry the same cursor without ack and optionally
 lower `max_response_bytes`. The default 4096-byte serialized-response budget is
 a transport page size, not a Codex context threshold. `pending_after` reports
-how many messages are waiting behind an unacknowledged head.
+how many messages are waiting behind an unacknowledged head. An ack response
+never contains the next body. If it reports `pending_after > 0`, call
+`check_messages({})` again immediately: messages that arrived while a nudge was
+already pending share that nudge, so no additional nudge follows for them.
 
 renga gives you two shortcuts so you don't have to type the Claude launch flag by hand:
 

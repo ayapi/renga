@@ -196,9 +196,10 @@ Caller loop: read `messages[0].body` when present; otherwise append
 `next_offset_bytes`. Do not act on a partial body. Once `complete=true` and the
 entire body is assembled, call again with `ack {message_id, token}`. A response
 lost or truncated before ack is idempotently retrievable with the same cursor.
-The ack response contains confirmation only. The next message is announced by
-its own nudge and is read with a fresh `check_messages({})` call; if the ack
-response already reports `pending_after > 0`, make that fresh call immediately.
+The ack response contains confirmation only. Read the next message with a fresh
+`check_messages({})` call. If the ack response reports `pending_after > 0`, make
+that fresh call immediately and continue while `has_more=true`; no new nudge
+follows for messages that arrived while a prior nudge was still pending.
 The serialized frame includes the JSON-RPC request id, so changing the id's
 digit count can move a retried page's final character; following each returned
 `next_offset_bytes` still reconstructs the body without loss.
@@ -700,12 +701,27 @@ because downstream is required to read the `[code]` token for branching.
   **additively introduced**. Their absence is unknown and must not be read as
   no-more, no-ack-needed, zero pending messages, or confirmed receipt.
 - Adding `acknowledged_message_id` is additive: older clients ignore it, while
-  newer clients can associate a confirmation with the removed FIFO head. By
-  contrast, omitting `delivery` and the next body from a successful ack response
-  is an intentional observable behavior change. Field evidence showed that LLM
-  callers treated an ack result as confirmation context and did not process a
-  chained body as a new coworker request; the following nudge and fresh
-  `check_messages({})` call now provide that distinct request context.
+  newer clients can associate a confirmation with the removed FIFO head.
+- Omitting `delivery` and the next body from a successful ack response is an
+  intentional observable behavior change and therefore falls under the
+  semantic-change definition in `semver-policy.md` §3. It does not require a
+  major release for this bug fix because all three compatibility conditions
+  remain true:
+  1. No documented output field is removed or renamed. `messages` and `count`
+     remain present, and `[]` / `0` were already valid values in empty and paged
+     responses.
+  2. `delivery`, `pending_after`, `has_more`, and `ack_required` are already
+     classified here as additively introduced. Their absence is unknown and
+     cannot mean no-more or confirmed receipt, so a conforming caller draws no
+     new conclusion when `delivery` is absent from an ack response.
+  3. The §1.4 caller loop still reaches every queued message while
+     `has_more=true`; the new shape adds one fresh `check_messages({})`
+     round-trip after the ack.
+
+  Field evidence showed why the observable change is necessary: LLM callers
+  treated an ack result as confirmation context and did not process a chained
+  body as a new coworker request. A fresh `check_messages({})` call gives the
+  next body its own request context.
 - **Unknown `[code]` tokens**: treat as the equivalent of `internal`.
 
 These rules let renga add fields and variants additively without bumping the
