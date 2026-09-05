@@ -710,9 +710,10 @@ major version.
   `"focused"` only where documented (`spawn_*`, `set_pane_identity`); other
   tools require an explicit `target`.
 - **Tab scoping (Q4)**: `list_panes`, `focus_pane`, `send_message`,
-  `inspect_pane`, `send_keys`, `set_pane_identity`, `close_pane`, and
-  `peer_send` are **scoped to the current tab**. Panes on other tabs are not
-  addressable in v1.0.
+  `inspect_pane`, `send_keys`, `set_pane_identity`, and `close_pane` are
+  **scoped to the current tab**. Panes on other tabs are not addressable in
+  v1.0. A `peer_send` target is scoped to the sender's tab, including when
+  that tab is inactive.
 - **Unresolved and cross-tab `peer_send` targets share one result (Q5)**:
   `delivery=undeliverable` raises no error, queues no body, and does not reveal
   whether a matching pane exists in another tab.

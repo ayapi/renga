@@ -165,12 +165,11 @@ pub enum Request {
         /// The caller's own pane id (from `RENGA_PANE_ID` env).
         from_pane: usize,
     },
-    /// Deliver `body` to `target`'s peer inbox. Unresolved and cross-tab
-    /// targets return `Undeliverable` without revealing which case
-    /// occurred. On delivery the server emits an `Event::PeerInbox` on
-    /// the event bus. If the target MCP client has not registered yet,
-    /// delivery is queued by pane id and emitted in send order after
-    /// registration.
+    /// Deliver `body` to `target`'s peer inbox. Targets that do not
+    /// resolve in the sender's tab return `Undeliverable`. On delivery
+    /// the server emits an `Event::PeerInbox` on the event bus. If the
+    /// target MCP client has not registered yet, delivery is queued by
+    /// pane id and emitted in send order after registration.
     PeerSend {
         from_pane: usize,
         target: PaneRef,

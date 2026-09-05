@@ -624,6 +624,7 @@ fn assert_peer_send_undeliverable_without_queued_state(
     assert!(rx
         .try_iter()
         .all(|event| !matches!(event, ipc::Event::PeerInbox { .. })));
+    // Mirrors the peer-send response shape in ipc/server.rs.
     let response = serde_json::to_vec(&serde_json::json!({ "delivery": outcome }))
         .expect("serialize peer-send response");
     assert_eq!(response, br#"{"delivery":"undeliverable"}"#);
