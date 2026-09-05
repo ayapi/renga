@@ -698,8 +698,10 @@ checkpoints even if no pane-local nudge appeared. check_messages returns one bou
 removing the FIFO head: assemble every body page using the returned message_id and \
 next_offset_bytes, then explicitly ack only after the complete body was received. If a response is \
 truncated, retry the same cursor without ack and optionally lower max_response_bytes. The ack \
-confirms receipt, not completion of the requested work. Check pending_after so messages waiting \
-behind an unacknowledged head do not go unnoticed. Use send_message when a reply, \
+confirms receipt, not completion of the requested work, and its response contains only that \
+confirmation, never the next message body. The next message arrives through its own nudge. If an \
+ack response reports pending_after greater than zero, call check_messages({}) immediately to read \
+it. Use send_message when a reply, \
 clarification, status update, or handoff is actually needed.\n\n\
 MCP approvals in Codex are pane-local. On a newly launched pane, the first check_messages and \
 send_message calls may need approval before peer messaging becomes reliable.\n\n"
@@ -814,7 +816,7 @@ fn tools_spec() -> Value {
         },
         {
             "name": "check_messages",
-            "description": "Read one bounded page from the queued peer inbox without removing it. Read structuredContent.messages[0].body when a complete message fits; otherwise append structuredContent.delivery.body_chunk and call check_messages again with the returned message_id / next_offset_bytes. Assemble the complete body before acting on it, then acknowledge receipt with ack {message_id, token}; only that explicit ack removes the message. If a response is truncated, retry the same cursor without ack and optionally lower max_response_bytes. Check pending_after for messages waiting behind the unacknowledged FIFO head.",
+            "description": "Read one bounded page from the queued peer inbox without removing it. Read structuredContent.messages[0].body when a complete message fits; otherwise append structuredContent.delivery.body_chunk and call check_messages again with the returned message_id / next_offset_bytes. Assemble the complete body before acting on it, then acknowledge receipt with ack {message_id, token}; only that explicit ack removes the message. The ack response is confirmation only and never contains the next message body; the next message arrives through its own nudge. If pending_after is greater than zero in an ack response, call check_messages({}) immediately to read it. If a response is truncated, retry the same cursor without ack and optionally lower max_response_bytes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -836,7 +838,7 @@ fn tools_spec() -> Value {
                     },
                     "ack": {
                         "type": "object",
-                        "description": "Confirms complete receipt, not completion of the requested work. Removes only the matching FIFO head, then returns the next head in the same call.",
+                        "description": "Confirms complete receipt, not completion of the requested work. Removes only the matching FIFO head and returns confirmation without the next message body.",
                         "properties": {
                             "message_id": { "type": "string" },
                             "token": { "type": "string" }
@@ -1299,6 +1301,36 @@ fn empty_check_messages_response(id: &Value) -> Value {
     )
 }
 
+fn acknowledged_check_messages_response(
+    id: &Value,
+    message_id: &str,
+    pending_after: usize,
+) -> Value {
+    let text = if pending_after == 0 {
+        format!("Acknowledged {message_id}. No queued messages.")
+    } else {
+        format!(
+            "Acknowledged {message_id}. {pending_after} message(s) still queued; call \
+check_messages({{}}) to read the next."
+        )
+    };
+    ok_response(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": {
+                "messages": [],
+                "count": 0,
+                "pending_after": pending_after,
+                "has_more": pending_after > 0,
+                "ack_required": false,
+                "acknowledged_message_id": message_id,
+            },
+            "isError": false,
+        }),
+    )
+}
+
 fn check_messages_response(
     id: &Value,
     entry: &InboxEntry,
@@ -1500,6 +1532,8 @@ fn handle_check_messages_inner(id: &Value, args: &Value, ctx: &PeerCtx) -> Value
             return err_response(id, -32602, "ack does not match the queued FIFO head");
         }
         inbox.messages.pop_front();
+        let pending_after = inbox.messages.len();
+        return acknowledged_check_messages_response(id, message_id, pending_after);
     }
 
     let Some(entry) = inbox.messages.front() else {
@@ -5485,7 +5519,10 @@ Commands:
         assert!(instructions.contains("explicitly ack only after the complete body was received"));
         assert!(instructions.contains("retry the same cursor without ack"));
         assert!(instructions.contains("confirms receipt, not completion"));
-        assert!(instructions.contains("Check pending_after"));
+        assert!(instructions.contains("response contains only that confirmation"));
+        assert!(instructions.contains("next message arrives through its own nudge"));
+        assert!(instructions.contains("pending_after greater than zero"));
+        assert!(instructions.contains("call check_messages({}) immediately"));
     }
 
     fn enqueue_test_message(ctx: &PeerCtx, body: String) {
@@ -5518,7 +5555,10 @@ Commands:
         assert!(description.contains("Assemble the complete body before acting"));
         assert!(description.contains("only that explicit ack removes the message"));
         assert!(description.contains("retry the same cursor without ack"));
-        assert!(description.contains("Check pending_after"));
+        assert!(description.contains("ack response is confirmation only"));
+        assert!(description.contains("next message arrives through its own nudge"));
+        assert!(description.contains("pending_after is greater than zero"));
+        assert!(description.contains("call check_messages({}) immediately"));
         assert_eq!(
             check.pointer("/inputSchema/properties/max_response_bytes/default"),
             Some(&json!(4096))
@@ -5883,10 +5923,28 @@ Commands:
             Some(0)
         );
         assert_eq!(
+            drained.pointer("/result/structuredContent/messages"),
+            Some(&json!([]))
+        );
+        assert!(
+            drained
+                .pointer("/result/structuredContent/delivery")
+                .is_none(),
+            "a successful ack must not include a delivery"
+        );
+        assert_eq!(
+            drained.pointer("/result/structuredContent/acknowledged_message_id"),
+            Some(&json!(message_id))
+        );
+        assert_eq!(
+            drained.pointer("/result/structuredContent/ack_required"),
+            Some(&json!(false))
+        );
+        assert_eq!(
             drained
                 .pointer("/result/content/0/text")
                 .and_then(|v| v.as_str()),
-            Some("No queued messages.")
+            Some(format!("Acknowledged {message_id}. No queued messages.").as_str())
         );
     }
 
@@ -5897,6 +5955,7 @@ Commands:
         let body = sentence.repeat(55);
         assert!((1500..=2200).contains(&body.chars().count()));
         enqueue_test_message(&ctx, body.clone());
+        enqueue_test_message(&ctx, "next after pages".to_string());
 
         let (assembled, message_id, token, pages) = collect_queued_body(&ctx, json!({}));
         assert!(
@@ -5904,14 +5963,31 @@ Commands:
             "the real-world-sized Japanese body must use multiple pages"
         );
         assert_eq!(assembled, body);
-        let empty = handle_check_messages(
+        let acknowledged = handle_check_messages(
             &json!(999),
             &json!({"ack": {"message_id": message_id, "token": token}}),
             &ctx,
         );
         assert_eq!(
-            structured(&empty).get("count").and_then(Value::as_u64),
+            structured(&acknowledged)
+                .get("count")
+                .and_then(Value::as_u64),
             Some(0)
+        );
+        assert_eq!(
+            acknowledged.pointer("/result/structuredContent/pending_after"),
+            Some(&json!(1))
+        );
+        assert!(
+            acknowledged
+                .pointer("/result/structuredContent/delivery")
+                .is_none(),
+            "ack after all pages must not include the next message"
+        );
+        let next = handle_check_messages(&json!(1000), &json!({}), &ctx);
+        assert_eq!(
+            next.pointer("/result/structuredContent/messages/0/body"),
+            Some(&json!("next after pages"))
         );
     }
 
@@ -5969,6 +6045,11 @@ Commands:
             done.pointer("/result/structuredContent/has_more"),
             Some(&json!(false))
         );
+        assert_eq!(
+            done.pointer("/result/structuredContent/acknowledged_message_id"),
+            Some(&json!(message_id))
+        );
+        assert!(done.pointer("/result/structuredContent/delivery").is_none());
     }
 
     #[test]
@@ -5999,11 +6080,29 @@ Commands:
             .pointer("/result/structuredContent/delivery/ack_token")
             .and_then(Value::as_str)
             .unwrap();
-        let advanced = handle_check_messages(
+        let acknowledged = handle_check_messages(
             &json!(3),
             &json!({"ack": {"message_id": message_id, "token": token}}),
             &ctx,
         );
+        // The ack response deliberately does not advance into the next body: callers process
+        // that body as a fresh request after its own nudge and check_messages({}) call.
+        assert_eq!(
+            acknowledged.pointer("/result/structuredContent/messages"),
+            Some(&json!([]))
+        );
+        assert_eq!(
+            acknowledged.pointer("/result/structuredContent/pending_after"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            acknowledged.pointer("/result/structuredContent/has_more"),
+            Some(&json!(true))
+        );
+        assert!(acknowledged
+            .pointer("/result/structuredContent/delivery")
+            .is_none());
+        let advanced = handle_check_messages(&json!(4), &json!({}), &ctx);
         assert_eq!(
             advanced.pointer("/result/structuredContent/messages/0/body"),
             Some(&json!("new arrival"))
@@ -6013,7 +6112,7 @@ Commands:
             Some(&json!(0))
         );
         let duplicate_ack = handle_check_messages(
-            &json!(4),
+            &json!(5),
             &json!({"ack": {"message_id": message_id, "token": token}}),
             &ctx,
         );
@@ -6035,6 +6134,12 @@ Commands:
             assert_eq!(response.pointer("/error/code"), Some(&json!(-32602)));
             assert_eq!(ctx.inbox.lock().unwrap().messages.len(), 1);
         }
+        let retained = handle_check_messages(&json!(2), &json!({}), &ctx);
+        assert_eq!(
+            retained.pointer("/result/structuredContent/messages/0/body"),
+            Some(&json!("keep me")),
+            "rejected acknowledgements and cursors must leave the FIFO head readable"
+        );
     }
 
     #[test]

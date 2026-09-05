@@ -38,6 +38,11 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Changed
 
+- **Successful `check_messages` acknowledgements no longer include the next
+  queued peer body.** They return confirmation metadata only; each following
+  message is read by a fresh check prompted by its own nudge. The additive
+  `acknowledged_message_id` identifies the removed FIFO head. (renga-069)
+
 - **Peer sends to unresolved or cross-tab targets now report
   `delivery=undeliverable` instead of `delivery=delivered`.** Both cases use the
   same success-shaped result, queue no body, and disclose no cross-tab pane

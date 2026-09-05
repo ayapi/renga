@@ -163,12 +163,13 @@ message; only an explicit receipt acknowledgement removes the FIFO head.
 | `max_response_bytes` | integer 1..=1048576 | no | Maximum serialized JSON-RPC response size. Default `4096`. This is a transport page size, **not** a measured Codex context threshold; if a client still truncates the response, retry the same cursor without ack using a smaller value. |
 | `message_id` | string | no | Opaque id from `delivery.message_id`. Echo it when requesting a continuation page. |
 | `offset_bytes` | non-negative integer | no | UTF-8 byte position from `delivery.next_offset_bytes`. Default `0`; a non-zero value requires `message_id`. |
-| `ack` | `{message_id, token}` | no | Confirms complete receipt, not completion of the requested work. Cannot be combined with cursor fields. A valid ack removes that FIFO head and the same call returns the next head, if any. |
+| `ack` | `{message_id, token}` | no | Confirms complete receipt, not completion of the requested work. Cannot be combined with cursor fields. A valid ack removes that FIFO head and returns only an acknowledgement; it never returns the next head. |
 
 Every successful result retains `content`, `structuredContent.messages[]`,
 `count`, and `isError`. It always adds `pending_after`, `has_more`, and
-`ack_required`; `structuredContent.delivery` is added only when a FIFO head
-exists:
+`ack_required`. A successful ack also adds `acknowledged_message_id`.
+`structuredContent.delivery` is added only when a call reads a FIFO head, never
+to an ack response:
 
 - When the complete body fits at offset 0, `messages[0]` retains the v1.0 entry
   shape (`from_id`, `from_name`, `from_kind`, `body`, `sent_at`) and `count=1`.
@@ -182,6 +183,10 @@ exists:
 - `pending_after` is the number of messages waiting behind the unacknowledged
   head. `has_more` stays true while any head remains, including a fully returned
   head that still needs ack.
+- A successful ack returns `messages=[]`, `count=0`, `ack_required=false`, and
+  no `delivery`. Its `acknowledged_message_id` identifies the removed head;
+  `pending_after` is the number still queued and `has_more` is whether that
+  number is non-zero.
 - `content` contains concise handling guidance and metadata only. The peer body
   appears once under `structuredContent`, avoiding the previous text/structured
   duplication.
@@ -191,6 +196,9 @@ Caller loop: read `messages[0].body` when present; otherwise append
 `next_offset_bytes`. Do not act on a partial body. Once `complete=true` and the
 entire body is assembled, call again with `ack {message_id, token}`. A response
 lost or truncated before ack is idempotently retrievable with the same cursor.
+The ack response contains confirmation only. The next message is announced by
+its own nudge and is read with a fresh `check_messages({})` call; if the ack
+response already reports `pending_after > 0`, make that fresh call immediately.
 The serialized frame includes the JSON-RPC request id, so changing the id's
 digit count can move a retried page's final character; following each returned
 `next_offset_bytes` still reconstructs the body without loss.
@@ -687,9 +695,17 @@ because downstream is required to read the `[code]` token for branching.
   neither may be interpreted as `delivered` or `queued`.
 - The `check_messages` input keys `max_response_bytes`, `message_id`,
   `offset_bytes`, and `ack`, plus result keys `delivery`, `pending_after`,
-  `has_more`, `ack_required`, and all fields nested under `delivery`, are
+  `has_more`, `ack_required`, `acknowledged_message_id`, and all fields nested
+  under `delivery`, are
   **additively introduced**. Their absence is unknown and must not be read as
   no-more, no-ack-needed, zero pending messages, or confirmed receipt.
+- Adding `acknowledged_message_id` is additive: older clients ignore it, while
+  newer clients can associate a confirmation with the removed FIFO head. By
+  contrast, omitting `delivery` and the next body from a successful ack response
+  is an intentional observable behavior change. Field evidence showed that LLM
+  callers treated an ack result as confirmation context and did not process a
+  chained body as a new coworker request; the following nudge and fresh
+  `check_messages({})` call now provide that distinct request context.
 - **Unknown `[code]` tokens**: treat as the equivalent of `internal`.
 
 These rules let renga add fields and variants additively without bumping the
