@@ -2211,6 +2211,42 @@ mod debug_logging_tests {
     }
 
     #[test]
+    fn production_wiring_reads_renga_debug_codex_peer_log() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "renga-codex-peer-production-wiring-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+
+        // This process-wide mutation intentionally verifies the literal env
+        // wiring. The resolver has no OnceLock, and every other test keeps its
+        // test override disabled, so the temporary path cannot leak records to
+        // an inherited live trace even when tests run in parallel.
+        set_codex_peer_debug_log_path_test_override(None);
+        let previous = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+        std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", &path);
+        let resolved = codex_peer_debug_log_path();
+        log_codex_peer_kind_update(23, None, PeerClientKind::Codex, "production_wiring_test");
+        match previous {
+            Some(value) => std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", value),
+            None => std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG"),
+        }
+        set_codex_peer_debug_log_path_test_override(Some(None));
+
+        assert_eq!(resolved.as_deref(), Some(path.as_os_str()));
+        let contents = std::fs::read_to_string(&path).expect("debug JSONL");
+        let lines: Vec<_> = contents.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let record: serde_json::Value = serde_json::from_str(lines[0]).expect("one JSON object");
+        assert_eq!(record["action"], "client_kind_updated");
+        assert_eq!(record["pane_id"], 23);
+        std::fs::remove_file(path).expect("remove debug JSONL");
+    }
+
+    #[test]
     fn debug_capture_preserves_composer_and_writes_single_jsonl_record_per_state() {
         let mut parser = vt100::Parser::new(20, 80, 0);
         parser.process(
