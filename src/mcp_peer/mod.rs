@@ -1181,6 +1181,9 @@ fn peer_send_result_text(to_id: &str, data: &Value) -> String {
         Some("pending_user_confirmation") => {
             format!("Pending user confirmation for {to_id}.")
         }
+        Some("undeliverable") => format!(
+            "Not delivered to {to_id}: no such pane in this tab (pane ids and names are tab-scoped)."
+        ),
         // Older renga servers return a successful response without the
         // delivery field and may have dropped an unregistered peer send.
         // Unknown future values are equally unverified, so only the explicit
@@ -3289,6 +3292,10 @@ mod tests {
         assert_eq!(
             peer_send_result_text("2", &json!({ "delivery": "pending_user_confirmation" })),
             "Pending user confirmation for 2."
+        );
+        assert_eq!(
+            peer_send_result_text("2", &json!({ "delivery": "undeliverable" })),
+            "Not delivered to 2: no such pane in this tab (pane ids and names are tab-scoped)."
         );
 
         for data in [json!({}), json!({ "delivery": "future_value" })] {

@@ -605,64 +605,56 @@ fn handle_peer_send_loops_back_to_sender_pane() {
     app.shutdown();
 }
 
-fn assert_peer_send_rejected_without_queued_state(
+fn assert_peer_send_undeliverable_without_queued_state(
     app: &mut App,
     sender_id: usize,
     target: &ipc::PaneRef,
-    expected_code: &'static str,
-) -> ipc::CodedError {
+) -> Vec<u8> {
+    let (_sub_id, rx) = app.event_bus.subscribe();
+    while rx.try_recv().is_ok() {}
     let (reply_tx, reply_rx) = oneshot::channel();
     app.begin_peer_send(sender_id, target, "must not be queued".into(), reply_tx);
-    let error = reply_rx
+    let outcome = reply_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("immediate peer-send reply")
-        .expect_err("peer send must not report Delivered");
-    assert_eq!(error.code, Some(expected_code));
+        .expect("undeliverable is a success-shaped outcome");
+    assert_eq!(outcome, ipc::PeerSendOutcome::Undeliverable);
     assert!(app.pending_peer_inbox.is_empty());
     assert!(app.pending_peer_deliveries.is_empty());
-    error
+    assert!(rx
+        .try_iter()
+        .all(|event| !matches!(event, ipc::Event::PeerInbox { .. })));
+    let response = serde_json::to_vec(&serde_json::json!({ "delivery": outcome }))
+        .expect("serialize peer-send response");
+    assert_eq!(response, br#"{"delivery":"undeliverable"}"#);
+    response
 }
 
 #[test]
-fn peer_send_rejects_unknown_id_without_queued_state() {
+fn peer_send_returns_undeliverable_for_unknown_id_without_queued_state() {
     let mut app = App::new(40, 80).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
     let target = ipc::PaneRef::Id(usize::MAX);
 
-    let error = assert_peer_send_rejected_without_queued_state(
-        &mut app,
-        sender_id,
-        &target,
-        ipc::err_code::PANE_NOT_FOUND,
-    );
-    assert_eq!(error.message, format!("pane not found: {target:?}"));
+    assert_peer_send_undeliverable_without_queued_state(&mut app, sender_id, &target);
     app.shutdown();
 }
 
 #[test]
-fn peer_send_rejects_unknown_name_without_queued_state() {
+fn peer_send_returns_undeliverable_for_unknown_name_without_queued_state() {
     let mut app = App::new(40, 80).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
     let target = ipc::PaneRef::Name("missing-peer".into());
 
-    let error = assert_peer_send_rejected_without_queued_state(
-        &mut app,
-        sender_id,
-        &target,
-        ipc::err_code::PANE_NOT_FOUND,
-    );
-    assert_eq!(error.message, format!("pane not found: {target:?}"));
+    assert_peer_send_undeliverable_without_queued_state(&mut app, sender_id, &target);
     app.shutdown();
 }
 
 #[test]
-fn handle_peer_send_silently_drops_cross_tab_target() {
-    // Cross-tab delivery is a silent no-op by design — callers
-    // cannot enumerate panes in other tabs by probing ids. A
-    // PeerInbox event would leak "pane X exists somewhere", so
-    // the handler must emit nothing at all.
+fn peer_send_returns_undeliverable_for_cross_tab_id_without_queued_state() {
+    // Cross-tab and unresolved targets use the same response so callers
+    // cannot discover panes in other tabs by probing ids.
     let mut app = App::new(40, 80).expect("App::new");
-    let (_sub_id, rx) = app.event_bus.subscribe();
     let sender_id = app.ws().focused_pane_id;
     // Open a fresh tab; its pane id is distinct from sender's.
     let other_tab_pane = app
@@ -673,21 +665,32 @@ fn handle_peer_send_silently_drops_cross_tab_target() {
         other_tab_pane, sender_id,
         "new_tab must allocate a fresh pane id"
     );
-    // Drain PaneStarted / tab-switch events.
-    while rx.try_recv().is_ok() {}
-
-    app.handle_peer_send(
+    let unresolved_response = assert_peer_send_undeliverable_without_queued_state(
+        &mut app,
+        sender_id,
+        &ipc::PaneRef::Id(usize::MAX),
+    );
+    let cross_tab_response = assert_peer_send_undeliverable_without_queued_state(
+        &mut app,
         sender_id,
         &ipc::PaneRef::Id(other_tab_pane),
-        "should be silently dropped".to_string(),
-    )
-    .expect("cross-tab send reports success");
-    let got_inbox = std::iter::from_fn(|| rx.try_recv().ok())
-        .any(|ev| matches!(ev, ipc::Event::PeerInbox { .. }));
-    assert!(
-        !got_inbox,
-        "cross-tab PeerSend must NOT emit a PeerInbox event"
     );
+    assert_eq!(cross_tab_response, unresolved_response);
+    app.shutdown();
+}
+
+#[test]
+fn peer_send_returns_undeliverable_for_cross_tab_name_without_queued_state() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let other_tab_pane = app
+        .handle_new_tab(None, Some("other-peer".into()), None, None, None)
+        .expect("new tab succeeds")
+        .id;
+    assert_ne!(other_tab_pane, sender_id);
+    let target = ipc::PaneRef::Name("other-peer".into());
+
+    assert_peer_send_undeliverable_without_queued_state(&mut app, sender_id, &target);
     app.shutdown();
 }
 

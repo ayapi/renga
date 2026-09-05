@@ -69,6 +69,8 @@ is `"Queued for <to_id> (peer client not registered yet)."`; delivery occurs
 after that subscriber reports readiness, in original send order.
 If a ready Codex target requires user acceptance before its pane-local nudge
 can be delivered, the result is `"Pending user confirmation for <to_id>."`.
+If the target does not resolve in the caller's tab, the result is
+`"Not delivered to <to_id>: no such pane in this tab (pane ids and names are tab-scoped)."`.
 If the server omits `delivery` or returns an unknown value, the result is
 `"Message sent to <to_id>; delivery state unconfirmed (renga server may predate queued delivery)."`.
 The server is authoritative for this state; during a client/server version
@@ -84,9 +86,9 @@ not retained there and therefore does not consume that queue budget.
 **Detached fallback (frozen prefix)**: `"(message dropped — renga not
 reachable: <reason>)"`.
 
-**Cross-tab silent no-op**: `peer_send` to a pane on another tab silently
-succeeds with no delivery (Q5). v1.0 keeps this behavior; cross-tab routing is
-deferred to a future minor release.
+**Unresolved and cross-tab targets**: both return
+`{ "delivery": "undeliverable" }`, a success-shaped result that queues no body.
+The response does not reveal whether the pane exists in another tab (Q5).
 
 **Same-payload dedupe (post-1.1)**: identical `(target, sender, body)` triples
 arriving within a small dedupe window (~5s) are collapsed server-side to a
@@ -499,7 +501,7 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | `subscribe` | `pane_id?: usize` | Switches to event-stream mode after ack. Bundled MCP peers identify their pane; generic consumers omit the additively introduced key. |
 | `inspect` | `target: PaneRef`, `lines?`, `include_cursor: bool` (default false) | |
 | `peer_list` | `from_pane: usize` | |
-| `peer_send` | `from_pane: usize`, `target: PaneRef`, `body: string` | Cross-tab silently no-ops (Q5). Ok data is `{ "delivery": "delivered"\|"queued"\|"pending_user_confirmation" }`. |
+| `peer_send` | `from_pane: usize`, `target: PaneRef`, `body: string` | Unresolved and cross-tab targets return the same success-shaped `undeliverable` result and queue no body (Q5). Ok data is `{ "delivery": "delivered"\|"queued"\|"pending_user_confirmation"\|"undeliverable" }`. |
 | `peer_register_client` | `pane_id: usize`, `kind: claude\|codex` | Posted by `renga mcp-peer` on startup. |
 | `peer_set_ready` | `pane_id: usize`, `kind: claude\|codex`, `ready: bool` | Internal peer lifecycle update. `ready=true` means the event subscriber can receive; for push clients this is sent only after MCP initialization. Kind is repeated atomically with readiness. |
 | `peer_inbox_ack` | `pane_id: usize`, `delivery_id: u64` | Internal mcp-peer receipt sent only after the target process retains the message. Separate from the later `check_messages` ack. |
@@ -522,7 +524,7 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 Request-specific `ok.data` shapes include
 `split: { "id": usize, "startup_command"?: string | null }` and
 `new_tab: { "id": usize, "startup_command"?: string | null }` and
-`peer_send: { "delivery": "delivered" | "queued" | "pending_user_confirmation" }`;
+`peer_send: { "delivery": "delivered" | "queued" | "pending_user_confirmation" | "undeliverable" }`;
 lifecycle setters such
 as `peer_register_client` and `peer_set_ready` return `null`. For `split` and
 `new_tab`, a string is the effective command queued by the server, explicit
@@ -632,7 +634,7 @@ these as `[<code>] <human message>` in JSON-RPC error message strings.
 | `parse` | every request | Request JSON failed to parse. |
 | `protocol` | every request | Protocol violation (wrong message at wrong time). |
 | `internal` | every request | Server invariant violation. |
-| `pane_not_found` | pane-targeted requests | `PaneRef` did not resolve. |
+| `pane_not_found` | pane-targeted requests | `PaneRef` did not resolve. Exception: `peer_send` returns `delivery=undeliverable` instead, so unresolved and cross-tab targets remain indistinguishable. |
 | `pane_vanished` | pane-targeted requests | Resolved then disappeared mid-flight. Rare. |
 | `split_refused` | `split`, `spawn_*`, `new_tab` (and layout TOML apply) | MAX_PANES = 16, or below `min_pane_width` / `min_pane_height`. |
 | `io_error` | requests with PTY side-effects | OS-level write/spawn failure. |
@@ -641,6 +643,7 @@ these as `[<code>] <human message>` in JSON-RPC error message strings.
 | `name_in_use` | `split`, `new_tab`, `set_pane_identity` | Another pane in the same tab holds the requested name. |
 | `name_invalid` | `split`, `new_tab`, `set_pane_identity` | Name empty / all-digits / non-`[A-Za-z0-9_-]`. |
 | `summary_too_long` | `set_summary` | Summary input exceeds 256 Unicode scalar values. Pre-mutation rejection. |
+| `peer_queue_full` | `peer_send` | Target's pre-registration queue reached its message-count or byte cap. |
 | `peer_delivery_unconfirmed` | `peer_send` | Target mcp-peer did not confirm local retention before the sender reply deadline. Safe to retry. |
 | `codex_not_installed` | `spawn_codex_pane` | Codex's `~/.codex/config.toml` is missing the renga-peers entry, the file is unreadable, or the `RENGA_PEER_CLIENT_KIND=codex` env-var passthrough is absent. Surfaced from the MCP layer (not `renga::ipc::err_code`); branch on the `[code]` token same as the others. Run `renga mcp install --client codex` to remediate. |
 
@@ -672,9 +675,9 @@ because downstream is required to read the `[code]` token for branching.
   optional-when-unset and additively introduced, use the conservative latter
   interpretation and treat its absence as unknown.
 - **Unknown `peer_send.delivery` values** are unverified outcomes. The
-  additively introduced `pending_user_confirmation` value therefore degrades
-  to the documented unconfirmed result on older MCP clients; it must not be
-  interpreted as `delivered` or `queued`.
+  additively introduced `pending_user_confirmation` and `undeliverable` values
+  therefore degrade to the documented unconfirmed result on older MCP clients;
+  neither may be interpreted as `delivered` or `queued`.
 - The `check_messages` input keys `max_response_bytes`, `message_id`,
   `offset_bytes`, and `ack`, plus result keys `delivery`, `pending_after`,
   `has_more`, `ack_required`, and all fields nested under `delivery`, are
@@ -703,9 +706,9 @@ major version.
   `inspect_pane`, `send_keys`, `set_pane_identity`, `close_pane`, and
   `peer_send` are **scoped to the current tab**. Panes on other tabs are not
   addressable in v1.0.
-- **Cross-tab `peer_send` is a silent no-op (Q5)**: no error is raised;
-  delivery silently fails. v1.0 keeps this for backward compat; the
-  cross-tab story is reopened in v1.1+.
+- **Unresolved and cross-tab `peer_send` targets share one result (Q5)**:
+  `delivery=undeliverable` raises no error, queues no body, and does not reveal
+  whether a matching pane exists in another tab.
 - **Detached-mode ok-text fallbacks**: `list_peers` and `send_message` return
   the documented ok-text prefixes (§1.1, §1.2) instead of JSON-RPC errors when
   the renga IPC server is unreachable. The prefixes are part of the wire ABI.

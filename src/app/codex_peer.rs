@@ -841,8 +841,9 @@ pub(crate) fn write_input_to_pane(
 
 impl App {
     /// Route `body` from `from_pane` to `target` when both share a
-    /// workspace. Cross-tab targets are silently dropped so the MCP
-    /// server cannot enumerate panes in other tabs by probing ids.
+    /// workspace. Unresolved and cross-tab targets are both reported
+    /// as undeliverable so callers cannot use the response to discover
+    /// panes in other tabs.
     /// Self-sends loop back to the sender pane: tooling like
     /// claude-org-ja's peer_notify resolves "secretary" from a shell
     /// running inside the secretary pane, and a silent drop there
@@ -885,15 +886,18 @@ impl App {
                     format!("sender pane {from_pane} not found"),
                 )
             })?;
-        let (target_ws, target_id) =
-            self.resolve_pane_across_workspaces(target).ok_or_else(|| {
-                ipc::CodedError::new(
-                    ipc::err_code::PANE_NOT_FOUND,
-                    format!("pane not found: {target:?}"),
-                )
-            })?;
+        let (target_ws, target_id) = match self.resolve_pane_across_workspaces(target) {
+            Some(pair) => pair,
+            None => {
+                return Ok(PreparedPeerSend::Immediate(
+                    ipc::PeerSendOutcome::Undeliverable,
+                ))
+            }
+        };
         if sender_ws != target_ws {
-            return Ok(PreparedPeerSend::Immediate(ipc::PeerSendOutcome::Delivered));
+            return Ok(PreparedPeerSend::Immediate(
+                ipc::PeerSendOutcome::Undeliverable,
+            ));
         }
         if let Some(outcome) = self.duplicate_peer_send_outcome(target_id, from_pane, &body) {
             // Same (target, from, body) within the dedupe window —
