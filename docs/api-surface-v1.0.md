@@ -709,11 +709,11 @@ major version.
   when no selector is given. MCP tools that accept a `target` default to
   `"focused"` only where documented (`spawn_*`, `set_pane_identity`); other
   tools require an explicit `target`.
-- **Tab scoping (Q4)**: `list_panes`, `focus_pane`, `send_message`,
-  `inspect_pane`, `send_keys`, `set_pane_identity`, and `close_pane` are
+- **Tab scoping (Q4)**: `list_panes`, `focus_pane`, `inspect_pane`,
+  `send_keys`, `set_pane_identity`, and `close_pane` are
   **scoped to the current tab**. Panes on other tabs are not addressable in
-  v1.0. A `peer_send` target is scoped to the sender's tab, including when
-  that tab is inactive.
+  v1.0. A `peer_send` target (`send_message` on the MCP side) is scoped to the
+  sender's tab, including when that tab is inactive.
 - **Unresolved and cross-tab `peer_send` targets share one result (Q5)**:
   `delivery=undeliverable` raises no error, queues no body, and does not reveal
   whether a matching pane exists in another tab.
