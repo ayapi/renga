@@ -5575,7 +5575,11 @@ fn pane_close_removes_unconfirmed_delivery_instead_of_requeueing_it() {
     app.handle_close(&ipc::PaneRef::Id(target)).unwrap();
 
     assert_eq!(
-        reply_rx.recv().unwrap().unwrap_err().code,
+        reply_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err()
+            .code,
         Some(ipc::err_code::PANE_VANISHED)
     );
     assert!(!app.pending_peer_deliveries.contains_key(&delivery_id));
@@ -5602,7 +5606,11 @@ fn pane_close_does_not_report_unconfirmed_push_delivery_as_lost() {
     app.handle_close(&ipc::PaneRef::Id(target)).unwrap();
 
     assert_eq!(
-        reply_rx.recv().unwrap().unwrap_err().code,
+        reply_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err()
+            .code,
         Some(ipc::err_code::PANE_VANISHED)
     );
     assert!(!app.pending_peer_deliveries.contains_key(&delivery_id));
@@ -5718,6 +5726,38 @@ fn codex_sender_loss_notice_uses_the_normal_nudge_path() {
         .unwrap();
     assert!(app.pending_codex_peer_messages.contains_key(&sender));
     assert!(!app.peer_handovers.contains_key(&sender));
+    app.shutdown();
+}
+
+#[test]
+fn closing_loss_notice_recipient_does_not_report_the_notice_as_lost() {
+    let (mut app, sender, lost_target, _delivery_id, rx) = retain_one_codex_handover();
+    app.handle_peer_set_ready(sender, PeerClientKind::Codex, true)
+        .unwrap();
+    app.lose_peer_handovers(lost_target, "subscriber_gone_timeout");
+    let notice_delivery_id = rx
+        .try_iter()
+        .find_map(|event| match event {
+            ipc::Event::PeerInbox {
+                delivery_id: Some(id),
+                target_pane,
+                from_pane,
+                ..
+            } if target_pane == sender && from_pane == lost_target => Some(id),
+            _ => None,
+        })
+        .expect("loss notice delivery");
+    assert!(
+        app.pending_peer_deliveries[&notice_delivery_id]
+            .message
+            .system_generated
+    );
+
+    app.handle_close(&ipc::PaneRef::Id(sender)).unwrap();
+
+    assert!(rx
+        .try_iter()
+        .all(|event| !matches!(event, ipc::Event::PeerMessageLost { .. })));
     app.shutdown();
 }
 

@@ -117,6 +117,9 @@ returns this timeout error on direct delivery, never an unverified `Delivered`
 result. A queued pre-registration message is retained after its flush times out;
 the pane becomes unready, so later sends remain `Queued` until the event stream
 reconnects and publishes readiness again.
+Closing the target pane instead returns `pane_vanished` immediately for every
+in-flight `peer_send` and does not requeue it, overriding the normal
+`peer_delivery_unconfirmed` deadline behavior.
 Retry throttling is transport-internal and does not change observable delivery:
 duplicate `PeerInbox` events remain safe for receivers to discard by `delivery_id`.
 

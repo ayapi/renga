@@ -677,6 +677,11 @@ fn reconcile_peer_inbox(ctx: &PeerCtx) -> bool {
         .copied()
         .collect::<Vec<_>>();
     let consumed_overflow = ctx.unreported_consumed_overflow.load(Ordering::Acquire);
+    #[cfg(test)]
+    if let Some(barrier) = &ctx.reconcile_snapshot_barrier {
+        barrier.wait();
+        barrier.wait();
+    }
     let request = Request::PeerInboxReconcile {
         pane_id: *pane_id,
         held: held.clone(),
@@ -830,6 +835,8 @@ struct PeerCtx {
     #[cfg(test)]
     request_sink_response: Option<Response>,
     #[cfg(test)]
+    reconcile_snapshot_barrier: Option<Arc<std::sync::Barrier>>,
+    #[cfg(test)]
     push_ready_delay: Duration,
 }
 
@@ -970,6 +977,8 @@ impl PeerCtx {
                         #[cfg(test)]
                         request_sink_response: None,
                         #[cfg(test)]
+                        reconcile_snapshot_barrier: None,
+                        #[cfg(test)]
                         push_ready_delay: PUSH_READY_DELAY,
                     };
                 }
@@ -997,6 +1006,8 @@ impl PeerCtx {
                     #[cfg(test)]
                     request_sink_response: None,
                     #[cfg(test)]
+                    reconcile_snapshot_barrier: None,
+                    #[cfg(test)]
                     push_ready_delay: PUSH_READY_DELAY,
                 };
             }
@@ -1018,6 +1029,8 @@ impl PeerCtx {
                 #[cfg(test)]
                 request_sink_response: None,
                 #[cfg(test)]
+                reconcile_snapshot_barrier: None,
+                #[cfg(test)]
                 push_ready_delay: PUSH_READY_DELAY,
             },
             Err(e) => PeerCtx {
@@ -1037,6 +1050,8 @@ impl PeerCtx {
                 request_sink: None,
                 #[cfg(test)]
                 request_sink_response: None,
+                #[cfg(test)]
+                reconcile_snapshot_barrier: None,
                 #[cfg(test)]
                 push_ready_delay: PUSH_READY_DELAY,
             },
@@ -6713,6 +6728,7 @@ Commands:
             debug_log_path: None,
             request_sink: None,
             request_sink_response: None,
+            reconcile_snapshot_barrier: None,
             push_ready_delay: PUSH_READY_DELAY,
         }
     }
@@ -6734,6 +6750,7 @@ Commands:
             debug_log_path: None,
             request_sink: None,
             request_sink_response: None,
+            reconcile_snapshot_barrier: None,
             push_ready_delay: PUSH_READY_DELAY,
         }
     }
@@ -7178,6 +7195,33 @@ Commands:
     }
 
     #[test]
+    fn failed_async_consumed_report_remains_for_reconciliation() {
+        let (mut ctx, requests) =
+            connected_ctx_with_requests(PeerClientKind::Codex, PUSH_READY_DELAY);
+        ctx.request_sink_response = Some(Response::Err {
+            message: "temporary failure".into(),
+            code: Some(ipc::err_code::APP_TIMEOUT.into()),
+        });
+        retain_unreported_consumed(&ctx, 61);
+        let sender = spawn_peer_inbox_ack_sender(ctx.clone());
+
+        assert_eq!(request_peer_inbox_consumed(&ctx, Some(61)), "sent");
+        sender.finish();
+
+        assert_eq!(ctx.unreported_consumed.lock().unwrap().as_slices().0, &[61]);
+        ctx.request_sink_response = Some(Response::ok_unit());
+        assert!(reconcile_peer_inbox(&ctx));
+        assert!(ctx.unreported_consumed.lock().unwrap().is_empty());
+        assert!(matches!(
+            requests.lock().unwrap().last(),
+            Some(Request::PeerInboxReconcile {
+                consumed,
+                ..
+            }) if consumed == &[61]
+        ));
+    }
+
+    #[test]
     fn rejected_consumed_request_keeps_ack_response_unchanged() {
         let mut ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
         ctx.request_sink = Some(Arc::new(Mutex::new(Vec::new())));
@@ -7264,6 +7308,32 @@ Commands:
         assert!(!reconcile_peer_inbox(&ctx));
         assert_eq!(ctx.unreported_consumed.lock().unwrap().as_slices().0, &[52]);
         assert_eq!(ctx.unreported_consumed_overflow.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn successful_reconcile_preserves_concurrent_consumed_overflow() {
+        let (mut ctx, requests) =
+            connected_ctx_with_requests(PeerClientKind::Codex, PUSH_READY_DELAY);
+        ctx.unreported_consumed_overflow.store(3, Ordering::Release);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        ctx.reconcile_snapshot_barrier = Some(barrier.clone());
+        let reconcile_ctx = ctx.clone();
+        let reconcile = thread::spawn(move || reconcile_peer_inbox(&reconcile_ctx));
+
+        barrier.wait();
+        ctx.unreported_consumed_overflow
+            .fetch_add(1, Ordering::AcqRel);
+        barrier.wait();
+
+        assert!(reconcile.join().unwrap());
+        assert_eq!(ctx.unreported_consumed_overflow.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            requests.lock().unwrap().last(),
+            Some(Request::PeerInboxReconcile {
+                consumed_overflow: 3,
+                ..
+            })
+        ));
     }
 
     #[test]

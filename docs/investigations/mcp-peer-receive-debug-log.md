@@ -174,8 +174,12 @@ For Codex pull peers, App tracking now continues after `peer_inbox_ack`: the
 handover ledger retains `(delivery_id, from_pane, from_name, body, ts_ms)` until
 the matching `peer_inbox_consumed` request arrives from a successful
 `check_messages` head ack. Consumed reports share the asynchronous receipt FIFO;
-ids whose report has not succeeded remain in a bounded process-local set. On
-reconnect, `peer_inbox_reconcile` compares held and unreported-consumed ids
+ids whose report has not succeeded remain in a bounded process-local set.
+An immediately delivered body larger than the ledger's 1 MiB cap is evicted as
+soon as it is handed over, so a later disappearance cannot produce a loss
+notice for that delivery.
+
+On reconnect, `peer_inbox_reconcile` compares held and unreported-consumed ids
 before readiness flushes new messages. Per-registration generations keep a
 newly flushed delivery out of an older reconciliation snapshot. Missing ids,
 pane closure, or a 30-second subscriber disconnect drain the applicable ledger
@@ -196,7 +200,9 @@ The App trace actions are `peer_handover_tracked`,
 exists). The mcp-peer traces `peer_inbox_consumed_unreported`,
 `peer_inbox_consumed_queued`, `peer_inbox_consumed_sent`, and reconciliation
 counts/overflow; the `check_messages` record also includes
-`consumed_after_ack`. The log remains completely silent when
+`consumed_after_ack`, whose values include `sent`, `sent_sync_fallback`,
+`rejected_sync_fallback`, `rejected_sender_unavailable`, and
+`rejected_queue_closed`. The log remains completely silent when
 `RENGA_DEBUG_CODEX_PEER_LOG` is unset. If the process dies after popping a local
 head but before retaining its id in the unreported set, reconciliation can still
 classify that already-read message as lost; this is the sole unavoidable
