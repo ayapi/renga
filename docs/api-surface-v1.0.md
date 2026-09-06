@@ -810,10 +810,9 @@ specified in section 3.5.
   explicitly best-effort rather than a delivery guarantee.
 - Surfacing summaries in the `list_panes` and `list_peers` text output is an
   intentional semantic change under `semver-policy.md` §3. It does not require
-  a major release because entries without a summary remain byte-identical (all
-  10 no-summary fixtures in the compatibility probe were unchanged), entries
-  with a summary gain only the additive line already documented in section
-  1.3, and no existing line is removed or renamed.
+  a major release because entries without a summary remain byte-identical,
+  entries with a summary gain only the additive line already documented in
+  section 1.3, and no existing line is removed or renamed.
 - **Unknown `[code]` tokens**: treat as the equivalent of `internal`.
 
 These rules let renga add fields and variants additively without bumping the
