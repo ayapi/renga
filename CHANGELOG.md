@@ -13,9 +13,9 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 - **Trace-only draw component attribution.** Slow-frame diagnostics now split
   `ui::render` time across panes, Claude transcript monitoring, file tree,
-  preview, tabs, status bar, and overlays, and record monitor I/O/path changes,
-  preview type/area, image re-encoding, and sidebar visibility without
-  changing runtime behavior when tracing is disabled.
+  preview, tabs, status bar, the macOS tip, and overlays, and record monitor
+  I/O/path changes, preview type/area, image re-encoding, and sidebar
+  visibility without changing runtime behavior when tracing is disabled.
   (renga-9vc)
 
 - **Trace-only process lifecycle and peer subscription diagnostics.** When

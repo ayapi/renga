@@ -145,7 +145,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         let started_at = crate::app::frame_diagnostics::phase_started();
         render_macos_tip(app, frame, chunks[2]);
         if let Some(started_at) = started_at {
-            crate::app::frame_diagnostics::record_draw_component("overlay", started_at.elapsed());
+            crate::app::frame_diagnostics::record_draw_component("macos_tip", started_at.elapsed());
         }
     }
     if show_status {

@@ -414,6 +414,7 @@ mod debug_logging_tests {
         record_draw_component("pane:3", Duration::from_millis(1));
         record_draw_component("file_tree", Duration::from_millis(1));
         record_draw_component("claude_monitor", Duration::from_millis(1));
+        record_draw_component("macos_tip", Duration::from_millis(1));
         record_draw_component("preview", Duration::from_millis(1));
         record_draw_component("status_bar", Duration::from_millis(1));
         record_draw_component("overlay", Duration::from_millis(1));
@@ -477,6 +478,7 @@ mod debug_logging_tests {
             json!({
                 "claude_monitor": 1,
                 "file_tree": 1,
+                "macos_tip": 1,
                 "overlay": 1,
                 "pane:3": 2,
                 "preview": 1,

@@ -59,7 +59,7 @@ the frame threshold.
   terminal diff output, flush, and cursor operations.
 - `draw_ms_by_component`: disjoint portions of `ui::render`, grouped as
   `pane:<id>`, `claude_monitor`, `file_tree`, `preview`, `tabs`, `status_bar`,
-  and `overlay`.
+  `macos_tip`, and `overlay` (IME or Codex peer notification).
   Their sum does not exceed `render_breakdown_ms.draw`; uncategorized layout
   and background work accounts for any remainder.
 - `preview_kind`: the displayed preview type: `image`, `text`, `binary`, or
@@ -102,10 +102,11 @@ A large `draw` with a small `present` instead points to work inside
 tree, or preview rendering, rather than the host console.
 
 Use `draw_ms_by_component` to distinguish pane, Claude transcript monitoring,
-file-tree, preview, tab, status-bar, and overlay costs. Each `pane:<id>` entry
-covers `render_single_pane` only. Layout calculation, pane resizing, monitor
-cwd collection, background painting, and other uncategorized work remain in
-`render_breakdown_ms.draw` minus the component sum. For image previews,
+file-tree, preview, tab, status-bar, macOS tip, and IME/peer-notification costs.
+Each `pane:<id>` entry covers `render_single_pane` only. Layout calculation,
+pane resizing, monitor cwd collection, background painting, and other
+uncategorized work remain in `render_breakdown_ms.draw` minus the component
+sum. For image previews,
 `preview_image_reencoded: true` directly identifies a resize-and-encode frame;
 this uses the read-only API exposed by ratatui-image 10.0.6 rather than an
 estimate from elapsed time.
