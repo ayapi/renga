@@ -72,17 +72,16 @@ the frame threshold.
   a drag.
 - `sidebar_visible`: whether the file-tree sidebar was displayed in the frame.
 - `claude_monitor_lines_parsed` and `claude_monitor_bytes_read`: complete
-  transcript lines passed to the Claude event parser and bytes read from
-  Claude JSONL files during the frame. Bytes include a trailing incomplete
-  line even though that line is not passed to the parser.
-- `claude_monitor_path_changes`: number of panes whose selected Claude JSONL
-  path changed during the frame. A nonzero value together with large monitor
-  byte/line counts distinguishes a full reread after a path change from an
-  ordinary incremental read.
+  transcript lines parsed and bytes read by the background Claude monitor
+  since the preceding emitted `frame_over_budget` record. Activity during
+  frames that stay within budget is carried forward rather than discarded.
+  Bytes include a trailing incomplete line even though that line is not passed
+  to the parser.
+- `claude_monitor_path_changes`: number of background selections of a different
+  Claude JSONL path since the preceding emitted slow-frame record.
 - `claude_monitor_last_mtime_changed`: number of panes where the selected
-  transcript's metadata modification time differed from the prior check. A
-  zero value is the per-frame signal that no checked transcript had been
-  appended since its preceding check.
+  transcript's metadata modification time differed from the prior worker
+  check, accumulated over the same interval.
 - `events_drained`: all `AppEvent` values drained in the iteration.
 - `pty_output_events`: the subset of drained events carrying PTY output.
 - `ipc_commands`: processed commands with `command`, resolved `pane_id`,
@@ -116,11 +115,37 @@ this uses the read-only API exposed by ratatui-image 10.0.6 rather than an
 estimate from elapsed time.
 
 For Claude monitoring, first look for frames with a large
-`claude_monitor_bytes_read`. If `claude_monitor_path_changes` is at least one
-in the same frame, the monitor selected a different transcript and performed
-a full reread; zero path changes means an incremental read. Runs of zero-byte
-records are not abnormal: they only mean no large read occurred in those
-frames, and this log emits only frames that exceed the overall time budget.
+`claude_monitor_bytes_read`. If `claude_monitor_path_changes` is at least one,
+the worker recently selected a different transcript. A large byte count then
+means an unseen transcript was parsed from the start; a small byte count can
+mean the worker returned to a cached transcript and read only its appended
+tail. Zero path changes means ordinary incremental work. These counters cover
+the interval since the previous emitted slow-frame record, not necessarily the
+slow frame itself. Runs of zero-byte records are normal.
+
+Directory scans, metadata checks, transcript reads, and JSON parsing run on the
+dedicated `claude-monitor` thread. Render-side `update()` only coalesces the
+latest `(pane_id, cwd)` request through a bounded non-blocking queue, while
+`state()` clones the last published result. Each worker tick reads at most
+roughly 4 MiB and stops at a complete JSONL line. Parsed state is cached by
+transcript path with an eight-entry per-project LRU and a 64-entry total cap;
+paths currently selected by a pane are retained. Returning to a cached path
+continues from its saved position. Active sub-agent labels now follow stable
+task-id order.
+
+An unseen transcript displays the default Claude state until its initial parse
+finishes; a known transcript is restored from cache immediately. Appends are
+normally visible after the 500 ms request throttle plus worker time. Selecting
+a newly newest transcript retains the existing five-second rescan cadence, so
+that change can take about 5.5 seconds to appear. Initial files larger than
+4 MiB require multiple worker ticks separated by 10 ms yields.
+
+When tracing is enabled, worker batches also emit `claude_monitor_worker` with
+`pane_id`, `path`, `bytes_read`, `lines_parsed`, `resumed_from_cache`, and
+`elapsed_ms`. A full non-blocking wake queue emits
+`claude_monitor_request_dropped` from the worker; the latest coalesced cwd is
+retained. A worker panic or shutdown join timeout emits
+`claude_monitor_worker_stopped` once, and render continues with default state.
 
 When a frame does not draw because `app.dirty` is false, `preview_kind` remains
 `"none"`, `sidebar_visible` remains false, and `preview_area` remains zero.

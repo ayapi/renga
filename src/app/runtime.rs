@@ -113,6 +113,7 @@ impl App {
     }
 
     pub fn shutdown(&mut self) {
+        self.claude_monitor.shutdown();
         // Surface PaneExited for every still-live pane before we tear
         // down the workspaces, so an event-stream subscriber observes
         // the final state consistently with the exactly-once contract.

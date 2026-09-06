@@ -60,10 +60,6 @@ struct FrameData {
     preview_area: (u16, u16),
     preview_image_reencoded: bool,
     sidebar_visible: bool,
-    claude_monitor_lines_parsed: usize,
-    claude_monitor_bytes_read: usize,
-    claude_monitor_path_changes: usize,
-    claude_monitor_last_mtime_changed: usize,
 }
 
 struct IpcCommandMetric {
@@ -154,31 +150,6 @@ pub(crate) fn record_preview_image_reencoded(reencoded: bool) {
     });
 }
 
-pub(crate) fn record_claude_monitor_io(lines_parsed: usize, bytes_read: usize) {
-    STATE.with(|state| {
-        if let Some(frame) = state.borrow_mut().frame.as_mut() {
-            frame.claude_monitor_lines_parsed += lines_parsed;
-            frame.claude_monitor_bytes_read += bytes_read;
-        }
-    });
-}
-
-pub(crate) fn record_claude_monitor_path_change() {
-    STATE.with(|state| {
-        if let Some(frame) = state.borrow_mut().frame.as_mut() {
-            frame.claude_monitor_path_changes += 1;
-        }
-    });
-}
-
-pub(crate) fn record_claude_monitor_mtime_change() {
-    STATE.with(|state| {
-        if let Some(frame) = state.borrow_mut().frame.as_mut() {
-            frame.claude_monitor_last_mtime_changed += 1;
-        }
-    });
-}
-
 pub(crate) fn lock_wait_started() -> Option<Instant> {
     phase_started()
 }
@@ -257,14 +228,21 @@ pub(crate) fn record_ipc_command(
     });
 }
 
-pub(crate) fn finish_frame(visible_panes: impl FnOnce() -> Vec<usize>) {
+pub(crate) fn finish_frame(
+    claude_monitor: &crate::claude_monitor::ClaudeMonitor,
+    visible_panes: impl FnOnce() -> Vec<usize>,
+) {
     if !STATE.with(|state| state.borrow().frame.is_some()) {
         return;
     }
-    finish_frame_at(Instant::now(), visible_panes());
+    finish_frame_at(claude_monitor, Instant::now(), visible_panes());
 }
 
-fn finish_frame_at(finished_at: Instant, visible_panes: Vec<usize>) {
+fn finish_frame_at(
+    claude_monitor: &crate::claude_monitor::ClaudeMonitor,
+    finished_at: Instant,
+    visible_panes: Vec<usize>,
+) {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         let Some(path) = state.path.clone() else {
@@ -280,6 +258,7 @@ fn finish_frame_at(finished_at: Instant, visible_panes: Vec<usize>) {
         if frame_ms <= FRAME_OVER_BUDGET_MS {
             return;
         }
+        let worker_activity = claude_monitor.take_worker_activity();
 
         let mut phase_ms = frame.phase_ms;
         let measured_ms: u128 = [
@@ -355,10 +334,10 @@ fn finish_frame_at(finished_at: Instant, visible_panes: Vec<usize>) {
                 },
                 (FIELD_PREVIEW_IMAGE_REENCODED): frame.preview_image_reencoded,
                 (FIELD_SIDEBAR_VISIBLE): frame.sidebar_visible,
-                (FIELD_CLAUDE_MONITOR_LINES_PARSED): frame.claude_monitor_lines_parsed,
-                (FIELD_CLAUDE_MONITOR_BYTES_READ): frame.claude_monitor_bytes_read,
-                (FIELD_CLAUDE_MONITOR_PATH_CHANGES): frame.claude_monitor_path_changes,
-                (FIELD_CLAUDE_MONITOR_LAST_MTIME_CHANGED): frame.claude_monitor_last_mtime_changed,
+                (FIELD_CLAUDE_MONITOR_LINES_PARSED): worker_activity.lines_parsed,
+                (FIELD_CLAUDE_MONITOR_BYTES_READ): worker_activity.bytes_read,
+                (FIELD_CLAUDE_MONITOR_PATH_CHANGES): worker_activity.path_changes,
+                (FIELD_CLAUDE_MONITOR_LAST_MTIME_CHANGED): worker_activity.mtime_changes,
                 (FIELD_EVENTS_DRAINED): frame.events_drained,
                 (FIELD_PTY_OUTPUT_EVENTS): frame.pty_output_events,
                 (FIELD_IPC_COMMANDS): ipc_commands,
@@ -431,21 +410,27 @@ mod debug_logging_tests {
         record_draw_component("overlay", Duration::from_millis(1));
         record_render_context("image", (42, 17), true);
         record_preview_image_reencoded(true);
-        record_claude_monitor_io(2, 100);
-        record_claude_monitor_io(3, 250);
-        record_claude_monitor_path_change();
-        record_claude_monitor_path_change();
-        record_claude_monitor_mtime_change();
+        let claude_monitor = crate::claude_monitor::ClaudeMonitor::new();
+        claude_monitor.record_worker_activity_for_test(
+            crate::claude_monitor::ClaudeMonitorActivity {
+                bytes_read: 350,
+                lines_parsed: 5,
+                path_changes: 2,
+                mtime_changes: 1,
+            },
+        );
         finish_phase(PHASE_RENDER_DRAW, render_draw_started_at);
         std::thread::sleep(Duration::from_millis(2));
         finish_phase(PHASE_RENDER, render_started_at);
         finish_frame_at(
+            &claude_monitor,
             started_at + Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 + 1),
             vec![3, 7],
         );
         let within_budget_started_at = Instant::now();
         begin_frame(within_budget_started_at);
         finish_frame_at(
+            &crate::claude_monitor::ClaudeMonitor::new(),
             within_budget_started_at + Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 - 1),
             vec![3, 7],
         );
@@ -539,10 +524,53 @@ mod debug_logging_tests {
         let started_at = Instant::now();
         begin_frame(started_at);
         finish_frame_at(
+            &crate::claude_monitor::ClaudeMonitor::new(),
             started_at + Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 + 1),
             vec![1],
         );
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn monitor_activity_survives_frames_that_are_not_logged() {
+        let path = temp_log_path("monitor-carry");
+        configure(Some(path.as_os_str().to_owned()));
+        let monitor = crate::claude_monitor::ClaudeMonitor::new();
+        monitor.record_worker_activity_for_test(crate::claude_monitor::ClaudeMonitorActivity {
+            bytes_read: 4096,
+            lines_parsed: 17,
+            path_changes: 1,
+            mtime_changes: 2,
+        });
+
+        let quick = Instant::now();
+        begin_frame(quick);
+        finish_frame_at(
+            &monitor,
+            quick + Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 - 1),
+            vec![1],
+        );
+        assert!(!path.exists());
+
+        let slow = Instant::now();
+        begin_frame(slow);
+        finish_frame_at(
+            &monitor,
+            slow + Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 + 1),
+            vec![1],
+        );
+        let record: Value = serde_json::from_str(
+            std::fs::read_to_string(&path)
+                .expect("monitor carry JSONL")
+                .trim(),
+        )
+        .expect("one JSON object");
+        assert_eq!(record[FIELD_CLAUDE_MONITOR_BYTES_READ], 4096);
+        assert_eq!(record[FIELD_CLAUDE_MONITOR_LINES_PARSED], 17);
+        assert_eq!(record[FIELD_CLAUDE_MONITOR_PATH_CHANGES], 1);
+        assert_eq!(record[FIELD_CLAUDE_MONITOR_LAST_MTIME_CHANGED], 2);
+        std::fs::remove_file(path).expect("remove debug JSONL");
+        configure(None);
     }
 
     #[test]
@@ -556,7 +584,7 @@ mod debug_logging_tests {
         configure_from_env();
         let started_at = Instant::now() - Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 + 1);
         begin_frame(started_at);
-        finish_frame(|| vec![11]);
+        finish_frame(&crate::claude_monitor::ClaudeMonitor::new(), || vec![11]);
         let contents = std::fs::read_to_string(&path).expect("enabled production-path JSONL");
         assert_eq!(contents.lines().count(), 1);
         let record: Value = serde_json::from_str(contents.trim()).expect("one JSON object");
@@ -574,7 +602,7 @@ mod debug_logging_tests {
         configure_from_env();
         let started_at = Instant::now() - Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 + 1);
         begin_frame(started_at);
-        finish_frame(|| vec![11]);
+        finish_frame(&crate::claude_monitor::ClaudeMonitor::new(), || vec![11]);
         assert!(!path.exists());
     }
 
@@ -629,6 +657,7 @@ mod debug_logging_tests {
         let _ = pane.scrollbar_info();
         holder.join().expect("lock holder exits");
         finish_frame_at(
+            &crate::claude_monitor::ClaudeMonitor::new(),
             started_at + Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 + 1),
             vec![pane.id],
         );

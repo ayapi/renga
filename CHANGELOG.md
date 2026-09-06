@@ -9,6 +9,15 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Claude transcript monitoring no longer blocks rendering.** Directory
+  scans, metadata checks, capped transcript reads, and JSON parsing now run on
+  a dedicated worker. Parsed cumulative state is cached per transcript path,
+  so switching back to a known session resumes at its saved position instead
+  of rereading the whole file. Slow-frame diagnostics retain worker activity
+  until the next emitted record. (renga-cuw, renga-9vc)
+
 ### Added
 
 - **Trace-only draw component attribution.** Slow-frame diagnostics now split

@@ -435,6 +435,7 @@ fn run_tui(cli: cli::Cli) -> Result<()> {
     }
 
     // Main event loop
+    app.claude_monitor.start();
     let process_started_at = Instant::now();
     log_process_start();
     let mut frames_total = 0;
@@ -734,7 +735,7 @@ fn run_event_loop(
         }
 
         if app.should_quit {
-            app::frame_diagnostics::finish_frame(|| {
+            app::frame_diagnostics::finish_frame(&app.claude_monitor, || {
                 app.workspaces[app.active_tab].layout.collect_pane_ids()
             });
             log_heartbeat_if_due(app, &mut heartbeat, Instant::now());
@@ -821,7 +822,7 @@ fn run_event_loop(
             }
         }
 
-        app::frame_diagnostics::finish_frame(|| {
+        app::frame_diagnostics::finish_frame(&app.claude_monitor, || {
             app.workspaces[app.active_tab].layout.collect_pane_ids()
         });
         log_heartbeat_if_due(app, &mut heartbeat, Instant::now());
