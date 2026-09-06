@@ -44,9 +44,10 @@ The TUI-side `client_kind_updated` record catalogs every kind write from
 `kind_update_path` (`register` or `set_ready`). Along with the old/new kind and
 receive mode, it records sticky OSC-title evidence as
 `pane_title_codex_seen` and `pane_title_claude_seen`. Both are `null` if the
-pane cannot be found. `kind_title_mismatch` is `null` until either title has
-been seen, `true` when a Claude update conflicts with a seen Codex title or a
-Codex update conflicts with a Claude-only title, and `false` otherwise.
+pane cannot be found. `kind_title_mismatch` is also `null` when the pane cannot
+be found or until either title has been seen, `true` when a Claude update
+conflicts with a seen Codex title or a Codex update conflicts with a
+Claude-only title, and `false` otherwise.
 
 A misregistration is directly identified by a `client_kind_updated` record
 whose `kind_title_mismatch` is `true`. An earlier

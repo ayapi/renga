@@ -159,12 +159,13 @@ mod tests {
     use super::*;
 
     // Tests in this module mutate process-global environment variables
-    // (`UID`, `XDG_RUNTIME_DIR`, `TMPDIR`, `RENGA_SOCKET`). `cargo test`
+    // (`UID`, `XDG_RUNTIME_DIR`, `TMPDIR`). `cargo test`
     // runs test functions on multiple threads inside a single process,
     // which makes concurrent env reads/writes racy. Guard every env-
     // touching test with this Mutex so they serialize among themselves
     // and — implicitly via the lock — against each other's restore
     // paths. Tests that don't touch env vars don't need the lock.
+    #[cfg(unix)]
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -275,7 +276,11 @@ mod tests {
 
     #[test]
     fn endpoint_from_env_fails_without_var() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Every RENGA_SOCKET writer uses this crate-wide lock, including the
+        // mcp-peer client-kind trace tests in another module.
+        let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var(ENV_SOCKET).ok();
         std::env::remove_var(ENV_SOCKET);
         let result = endpoint_from_env();
