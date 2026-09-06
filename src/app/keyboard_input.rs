@@ -50,7 +50,25 @@ impl App {
                     .accept_codex_peer_notification()
                     .map_err(|e| anyhow::anyhow!(e.to_string()));
             }
-            self.requeue_codex_peer_notification();
+            match key.code {
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown => {
+                    // Cursor navigation belongs to the Codex composer. Keep the
+                    // notice visible while the key follows the normal PTY path.
+                    return Ok(false);
+                }
+                _ => {
+                    // The user started typing or acting, so get the notice out
+                    // of the way and return its message to the next-focus queue.
+                    self.requeue_codex_peer_notification();
+                }
+            }
         }
 
         // Rename mode — swallow all input until Enter/Esc.

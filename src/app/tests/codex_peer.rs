@@ -1204,14 +1204,168 @@ fn focused_codex_notification_esc_dismisses_without_queueing_nudge() {
         "hello focused codex".to_string(),
     )
     .expect("peer send");
+    app.ws_mut()
+        .panes
+        .get_mut(&sibling_id)
+        .expect("pane")
+        .clear_test_input();
 
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     let consumed = app.handle_key_event(esc).expect("dismiss notification");
     assert!(consumed);
     assert!(app.visible_codex_peer_notification().is_none());
+    assert!(app
+        .ws()
+        .panes
+        .get(&sibling_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
     assert!(
         !app.pending_codex_peer_messages.contains_key(&sibling_id),
         "dismissing the notification should not silently queue a PTY nudge"
+    );
+    app.shutdown();
+}
+
+#[test]
+fn focused_codex_notification_navigation_stays_visible_and_reaches_pty() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
+    app.handle_focus(&ipc::PaneRef::Id(sibling_id))
+        .expect("focus sibling");
+    seed_codex_draft(&mut app, sibling_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "hello focused codex".to_string(),
+    )
+    .expect("peer send");
+    let expected_notification = app
+        .visible_codex_peer_notification()
+        .expect("visible notification")
+        .clone();
+    let expected_queue_len = app
+        .pending_codex_peer_messages
+        .get(&sibling_id)
+        .map(VecDeque::len);
+    app.ws_mut()
+        .panes
+        .get_mut(&sibling_id)
+        .expect("pane")
+        .clear_test_input();
+
+    let cases = [
+        (KeyCode::Up, KeyModifiers::NONE, b"\x1b[A".as_slice()),
+        (KeyCode::Down, KeyModifiers::ALT, b"\x1b[B".as_slice()),
+        (KeyCode::Left, KeyModifiers::NONE, b"\x1b[D".as_slice()),
+        (KeyCode::Right, KeyModifiers::CONTROL, b"\x1b[C".as_slice()),
+        (KeyCode::Home, KeyModifiers::SHIFT, b"\x1b[H".as_slice()),
+        (KeyCode::End, KeyModifiers::NONE, b"\x1b[F".as_slice()),
+        (KeyCode::PageUp, KeyModifiers::ALT, b"\x1b[5~".as_slice()),
+        (
+            KeyCode::PageDown,
+            KeyModifiers::CONTROL,
+            b"\x1b[6~".as_slice(),
+        ),
+        (KeyCode::Left, KeyModifiers::SHIFT, b"\x1b[D".as_slice()),
+    ];
+
+    for (code, modifiers, expected_bytes) in cases {
+        let before = app
+            .ws()
+            .panes
+            .get(&sibling_id)
+            .expect("pane")
+            .test_input()
+            .len();
+        let consumed = app
+            .handle_key_event(KeyEvent::new(code, modifiers))
+            .expect("route navigation");
+
+        assert!(!consumed);
+        app.forward_key_to_pty(KeyEvent::new(code, modifiers))
+            .expect("forward navigation to PTY");
+        assert_eq!(
+            app.visible_codex_peer_notification(),
+            Some(&expected_notification)
+        );
+        assert_eq!(
+            app.pending_codex_peer_messages
+                .get(&sibling_id)
+                .map(VecDeque::len),
+            expected_queue_len
+        );
+        assert_eq!(
+            &app.ws().panes.get(&sibling_id).expect("pane").test_input()[before..],
+            expected_bytes
+        );
+    }
+    app.shutdown();
+}
+
+#[test]
+fn focused_codex_notification_printable_requeues_and_reaches_pty() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(sibling_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(sibling_id);
+    app.handle_focus(&ipc::PaneRef::Id(sibling_id))
+        .expect("focus sibling");
+    seed_codex_draft(&mut app, sibling_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "hello focused codex".to_string(),
+    )
+    .expect("peer send");
+    app.ws_mut()
+        .panes
+        .get_mut(&sibling_id)
+        .expect("pane")
+        .clear_test_input();
+
+    let consumed = app
+        .handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+        .expect("route printable character");
+
+    assert!(!consumed);
+    app.forward_key_to_pty(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+        .expect("forward printable character to PTY");
+    assert!(app.visible_codex_peer_notification().is_none());
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&sibling_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::Draft { .. })
+    ));
+    assert_eq!(
+        app.ws().panes.get(&sibling_id).expect("pane").test_input(),
+        b"x"
     );
     app.shutdown();
 }

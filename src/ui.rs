@@ -282,7 +282,7 @@ fn render_codex_peer_notification(app: &mut App, frame: &mut Frame, area: Rect) 
         )),
     ];
     let hint = Line::from(Span::styled(
-        " Alt+Enter/Ctrl+Enter send nudge · Esc ignore ",
+        " Alt/Ctrl+Enter send · Esc ignore · arrows pass ",
         Style::default().fg(TEXT_DIM),
     ));
     let block = Block::default()
