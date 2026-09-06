@@ -14,8 +14,8 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 - **Trace-only peer push lifecycle records under
   `RENGA_DEBUG_CODEX_PEER_LOG`.** The App ready queue and mcp-peer push buffer
   now record queueing, initialization, subscription, flush, emission, cap drop,
-  emission failures, readiness publication, and all three readiness revocation
-  paths without changing delivery behavior or the wire format. (renga-7j8)
+  emission failures, readiness deferral/publication, and all three readiness
+  revocation paths without changing the wire format. (renga-7j8)
 
 - **Codex pull inboxes now request one best-effort follow-up nudge after an
   acknowledgement leaves another message queued.** The additive
@@ -112,6 +112,16 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
   but not a wire-format change. (renga-234)
 
 ### Fixed
+
+- **Claude peer startup now defers readiness publication for 1.5 seconds after
+  MCP initialization.** Claude Code v2.1.261 can discard channel notifications
+  during the short interval after sending `notifications/initialized` but
+  before attaching its channel listener. The later readiness declaration keeps
+  startup messages in App's existing FIFO until the listener has settled;
+  pull/Codex readiness remains immediate, and disconnects cancel pending
+  declarations. This deliberately changes readiness timing without changing
+  the documented `Queued` result, later-delivery behavior, queue limits, or
+  wire shape. (renga-7j8)
 
 - **Codex peer nudges now recognize busy `Working`, `Thinking`, and `Waiting
   for background terminal` statuses even when narrow panes truncate the

@@ -519,7 +519,7 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | `peer_list` | `from_pane: usize` | |
 | `peer_send` | `from_pane: usize`, `target: PaneRef`, `body: string` | Unresolved and cross-tab targets return the same success-shaped `undeliverable` result and queue no body (Q5). Ok data is `{ "delivery": "delivered"\|"queued"\|"pending_user_confirmation"\|"undeliverable" }`. |
 | `peer_register_client` | `pane_id: usize`, `kind: claude\|codex` | Posted by `renga mcp-peer` on startup. |
-| `peer_set_ready` | `pane_id: usize`, `kind: claude\|codex`, `ready: bool` | Internal peer lifecycle update. `ready=true` means the event subscriber can receive; for push clients this is sent only after MCP initialization. Kind is repeated atomically with readiness. |
+| `peer_set_ready` | `pane_id: usize`, `kind: claude\|codex`, `ready: bool` | Internal peer lifecycle update. `ready=true` means the event subscriber can receive. Pull clients publish it as soon as the subscriber is active; push clients publish it after MCP initialization and a short settling delay so Claude Code can attach its channel listener. Kind is repeated atomically with readiness. |
 | `peer_inbox_ack` | `pane_id: usize`, `delivery_id: u64` | Internal mcp-peer receipt sent only after the target process retains the message. Separate from the later `check_messages` ack. |
 | `peer_inbox_head_acknowledged` | `pane_id: usize`, `remaining: usize`, `next_from_pane: usize`, `next_from_name?: string`, `next_from_kind?: claude\|codex` | Best-effort internal request sent by a Codex mcp-peer after a successful `check_messages` ack when another head remains. It preserves the next sender's nudge template metadata. |
 | `set_pane_identity` | `target: PaneRef`, `name?`, `role?` (three-state: missing / null / value) | Uses serde `double_option`. |
@@ -680,6 +680,11 @@ classes into more specific numeric codes; this is **not** a breaking change
 because downstream is required to read the `[code]` token for branching.
 
 ### 5.3 Forward-compat rules — stable
+
+Delaying an internal push-client readiness declaration during startup is not a
+semantic change under the policy in `docs/semver-policy.md` section 3: the same
+documented `Queued` outcome and later delivery remain in effect; only the
+private lifecycle announcement time changes.
 
 - **Unknown event `type` tags**: ignore, do not abort the stream.
 - **Unknown IPC Request `cmd` tags**: the server returns a `parse` error and

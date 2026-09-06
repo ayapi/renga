@@ -56,6 +56,7 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ENV_PANE_ID: &str = "RENGA_PANE_ID";
 pub(crate) const ENV_CLIENT_KIND: &str = "RENGA_PEER_CLIENT_KIND";
 const ENV_DEBUG_CODEX_PEER_LOG: &str = "RENGA_DEBUG_CODEX_PEER_LOG";
+const PUSH_READY_DELAY: Duration = Duration::from_millis(1500);
 static PEER_DEBUG_RECORD_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
@@ -118,14 +119,31 @@ fn set_client_ready(ctx: &PeerCtx, ready: bool) {
     let Mode::Connected { pane_id, endpoint } = &ctx.mode else {
         return;
     };
-    let result = client::send_request(
-        endpoint,
-        &Request::PeerSetReady {
-            pane_id: *pane_id,
-            kind: ctx.client_kind,
-            ready,
-        },
-    );
+    let initialized_age_ms = ctx
+        .push
+        .lock()
+        .unwrap_or_else(|state| state.into_inner())
+        .initialized_at
+        .map(|initialized_at| initialized_at.elapsed().as_millis());
+    let request = Request::PeerSetReady {
+        pane_id: *pane_id,
+        kind: ctx.client_kind,
+        ready,
+    };
+    #[cfg(test)]
+    let result = if let Some(sink) = &ctx.request_sink {
+        sink.lock()
+            .unwrap_or_else(|requests| requests.into_inner())
+            .push(request);
+        Ok(ctx
+            .request_sink_response
+            .clone()
+            .unwrap_or_else(Response::ok_unit))
+    } else {
+        client::send_request(endpoint, &request)
+    };
+    #[cfg(not(test))]
+    let result = client::send_request(endpoint, &request);
     match &result {
         Ok(Response::Ok { .. }) => {}
         Ok(other) => log_stderr(&format!("peer readiness update returned: {other:?}")),
@@ -144,6 +162,7 @@ fn set_client_ready(ctx: &PeerCtx, ready: bool) {
                 "action": "peer_set_ready_sent",
                 "client_kind": kind_label(ctx.client_kind),
                 "ready": ready,
+                "initialized_age_ms": initialized_age_ms,
                 "ok": ok,
                 "error": error,
             }),
@@ -305,6 +324,9 @@ struct PushState {
     initialized: bool,
     initialized_at: Option<Instant>,
     subscribed: bool,
+    ready_generation: u64,
+    ready_scheduled: bool,
+    ready_announced: bool,
     pending: VecDeque<PendingPushFrame>,
 }
 
@@ -330,11 +352,14 @@ struct PeerCtx {
     events: EventSink,
     inbox: InboxSink,
     push: PushSink,
+    ready_publish_lock: Arc<Mutex<()>>,
     debug_log_path: Option<PathBuf>,
     #[cfg(test)]
     request_sink: Option<Arc<Mutex<Vec<Request>>>>,
     #[cfg(test)]
     request_sink_response: Option<Response>,
+    #[cfg(test)]
+    push_ready_delay: Duration,
 }
 
 /// Soft cap on the per-process lifecycle event buffer used by
@@ -440,6 +465,7 @@ impl PeerCtx {
         let events = new_event_sink();
         let inbox = new_inbox_sink();
         let push = Arc::new(Mutex::new(PushState::default()));
+        let ready_publish_lock = Arc::new(Mutex::new(()));
         let debug_log_path = std::env::var_os(ENV_DEBUG_CODEX_PEER_LOG).map(PathBuf::from);
         let client_kind_raw = std::env::var(ENV_CLIENT_KIND);
         let client_kind = client_kind_raw
@@ -459,12 +485,15 @@ impl PeerCtx {
                         events,
                         inbox,
                         push,
+                        ready_publish_lock,
                         client_kind,
                         debug_log_path,
                         #[cfg(test)]
                         request_sink: None,
                         #[cfg(test)]
                         request_sink_response: None,
+                        #[cfg(test)]
+                        push_ready_delay: PUSH_READY_DELAY,
                     };
                 }
             },
@@ -478,12 +507,15 @@ impl PeerCtx {
                     events,
                     inbox,
                     push,
+                    ready_publish_lock,
                     client_kind,
                     debug_log_path,
                     #[cfg(test)]
                     request_sink: None,
                     #[cfg(test)]
                     request_sink_response: None,
+                    #[cfg(test)]
+                    push_ready_delay: PUSH_READY_DELAY,
                 };
             }
         };
@@ -493,12 +525,15 @@ impl PeerCtx {
                 events,
                 inbox,
                 push,
+                ready_publish_lock,
                 client_kind,
                 debug_log_path,
                 #[cfg(test)]
                 request_sink: None,
                 #[cfg(test)]
                 request_sink_response: None,
+                #[cfg(test)]
+                push_ready_delay: PUSH_READY_DELAY,
             },
             Err(e) => PeerCtx {
                 mode: Mode::Detached {
@@ -507,12 +542,15 @@ impl PeerCtx {
                 events,
                 inbox,
                 push,
+                ready_publish_lock,
                 client_kind,
                 debug_log_path,
                 #[cfg(test)]
                 request_sink: None,
                 #[cfg(test)]
                 request_sink_response: None,
+                #[cfg(test)]
+                push_ready_delay: PUSH_READY_DELAY,
             },
         }
     }
@@ -737,10 +775,15 @@ where
     F: FnMut(&Value) -> Result<()>,
 {
     let mut state = ctx.push.lock().unwrap_or_else(|p| p.into_inner());
-    state.initialized = true;
-    state.initialized_at = Some(Instant::now());
+    if !state.initialized {
+        state.initialized = true;
+        state.initialized_at = Some(Instant::now());
+    }
     let subscribed_at_that_time = state.subscribed;
-    let mut outcomes = Vec::with_capacity(state.pending.len());
+    let mut outcomes = ctx
+        .debug_log_path
+        .is_some()
+        .then(|| Vec::with_capacity(state.pending.len()));
     let mut flushed_count = 0usize;
     let mut failed_count = 0usize;
     while let Some(frame) = state.pending.pop_front() {
@@ -755,7 +798,9 @@ where
                 log_stderr(&format!("failed to flush channel notification: {error}"));
             }
         }
-        outcomes.push((frame, result, initialized_age_ms));
+        if let Some(outcomes) = outcomes.as_mut() {
+            outcomes.push((frame, result, initialized_age_ms));
+        }
     }
     log_push_lifecycle(ctx, "push_initialized", || {
         json!({
@@ -764,7 +809,7 @@ where
             "subscribed_at_that_time": subscribed_at_that_time,
         })
     });
-    for (frame, result, initialized_age_ms) in outcomes {
+    for (frame, result, initialized_age_ms) in outcomes.into_iter().flatten() {
         match result {
             Ok(()) => log_push_frame(
                 ctx,
@@ -800,6 +845,11 @@ fn mark_push_subscribed(ctx: &PeerCtx, subscribed: bool) -> bool {
     let mut state = ctx.push.lock().unwrap_or_else(|p| p.into_inner());
     let changed = state.subscribed != subscribed;
     state.subscribed = subscribed;
+    if !subscribed && changed {
+        state.ready_generation = state.ready_generation.saturating_add(1);
+        state.ready_scheduled = false;
+        state.ready_announced = false;
+    }
     if changed {
         log_push_lifecycle(ctx, "push_subscribed", || {
             json!({
@@ -809,6 +859,100 @@ fn mark_push_subscribed(ctx: &PeerCtx, subscribed: bool) -> bool {
         });
     }
     state.initialized && state.subscribed
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeferredPushReady {
+    generation: u64,
+    delay: Duration,
+}
+
+fn configured_push_ready_delay(ctx: &PeerCtx) -> Duration {
+    #[cfg(test)]
+    {
+        ctx.push_ready_delay
+    }
+    #[cfg(not(test))]
+    {
+        let _ = ctx;
+        PUSH_READY_DELAY
+    }
+}
+
+fn prepare_deferred_push_ready_at(ctx: &PeerCtx, now: Instant) -> Option<DeferredPushReady> {
+    if ctx.client_kind.receive_mode() != ipc::PeerReceiveMode::Push {
+        return None;
+    }
+    let mut state = ctx.push.lock().unwrap_or_else(|p| p.into_inner());
+    if !state.initialized || !state.subscribed || state.ready_scheduled || state.ready_announced {
+        return None;
+    }
+    let initialized_at = state.initialized_at?;
+    let target_delay = configured_push_ready_delay(ctx);
+    let elapsed = now.saturating_duration_since(initialized_at);
+    let delay = target_delay.saturating_sub(elapsed);
+    state.ready_scheduled = true;
+    let generation = state.ready_generation;
+    drop(state);
+    log_push_lifecycle(ctx, "peer_set_ready_deferred", || {
+        json!({
+            "client_kind": kind_label(ctx.client_kind),
+            "delay_ms": delay.as_millis(),
+        })
+    });
+    Some(DeferredPushReady { generation, delay })
+}
+
+fn finish_deferred_push_ready(ctx: &PeerCtx, deferred: DeferredPushReady) -> bool {
+    let mut state = ctx.push.lock().unwrap_or_else(|p| p.into_inner());
+    if state.ready_generation != deferred.generation || !state.initialized || !state.subscribed {
+        return false;
+    }
+    state.ready_scheduled = false;
+    if state.ready_announced {
+        return false;
+    }
+    state.ready_announced = true;
+    true
+}
+
+fn schedule_deferred_push_ready(ctx: &PeerCtx) {
+    let Some(deferred) = prepare_deferred_push_ready_at(ctx, Instant::now()) else {
+        return;
+    };
+    let deferred_ctx = ctx.clone();
+    if let Err(error) = thread::Builder::new()
+        .name("renga-mcp-peer-ready-delay".into())
+        .spawn(move || {
+            thread::sleep(deferred.delay);
+            let publish_lock = deferred_ctx.ready_publish_lock.clone();
+            let _publish_guard = publish_lock.lock().unwrap_or_else(|lock| lock.into_inner());
+            if finish_deferred_push_ready(&deferred_ctx, deferred) {
+                set_client_ready(&deferred_ctx, true);
+            }
+        })
+    {
+        let mut state = ctx.push.lock().unwrap_or_else(|p| p.into_inner());
+        if state.ready_generation == deferred.generation {
+            state.ready_scheduled = false;
+        }
+        log_stderr(&format!("failed to spawn peer readiness delay: {error}"));
+    }
+}
+
+fn revoke_push_ready(ctx: &PeerCtx) {
+    let publish_lock = ctx.ready_publish_lock.clone();
+    let _publish_guard = publish_lock.lock().unwrap_or_else(|lock| lock.into_inner());
+    mark_push_subscribed(ctx, false);
+    set_client_ready(ctx, false);
+}
+
+fn publish_ready_after_subscribe(ctx: &PeerCtx) {
+    if ctx.client_kind.receive_mode() == ipc::PeerReceiveMode::Pull {
+        set_client_ready(ctx, true);
+    } else if mark_push_subscribed(ctx, true) {
+        schedule_deferred_push_ready(ctx);
+    }
 }
 
 fn ok_response(id: &Value, result: Value) -> Value {
@@ -3499,7 +3643,7 @@ fn dispatch(req: &Value, ctx: &PeerCtx) -> Result<Vec<Value>> {
         if matches!(method, "notifications/initialized" | "initialized") {
             let subscribed = mark_push_initialized(ctx);
             if ctx.client_kind.receive_mode() == ipc::PeerReceiveMode::Push && subscribed {
-                set_client_ready(ctx, true);
+                schedule_deferred_push_ready(ctx);
             }
         } else if !matches!(method, "notifications/cancelled" | "$/cancel") {
             log_stderr(&format!("ignored unknown notification: {method}"));
@@ -3600,16 +3744,7 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                 || {
                     subscribed_on_ready.store(true, std::sync::atomic::Ordering::Release);
                     register_client_kind(&registration_ctx);
-                    let ready = if registration_ctx.client_kind.receive_mode()
-                        == ipc::PeerReceiveMode::Pull
-                    {
-                        true
-                    } else {
-                        mark_push_subscribed(&registration_ctx, true)
-                    };
-                    if ready {
-                        set_client_ready(&registration_ctx, true);
-                    }
+                    publish_ready_after_subscribe(&registration_ctx);
                 },
                 |event| {
                 // Buffer lifecycle events for `poll_events` before we
@@ -3747,9 +3882,10 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                 );
                 if was_subscribed {
                     if registration_ctx.client_kind.receive_mode() == ipc::PeerReceiveMode::Push {
-                        mark_push_subscribed(&registration_ctx, false);
+                        revoke_push_ready(&registration_ctx);
+                    } else {
+                        set_client_ready(&registration_ctx, false);
                     }
-                    set_client_ready(&registration_ctx, false);
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     if consecutive_failures.is_power_of_two() {
                         log_stderr(&format!(
@@ -3844,6 +3980,28 @@ fn subscription_retry_state_after_attempt(
 mod tests {
     use super::*;
     use crate::app::App;
+
+    struct EnvVarRestore {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn set(name: &'static str, value: &std::ffi::OsStr) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(self.name, value) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
 
     #[test]
     fn peer_send_result_only_claims_delivered_for_explicit_outcome() {
@@ -4048,8 +4206,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let path = debug_test_path("push-disabled");
-        let previous = std::env::var_os(ENV_DEBUG_CODEX_PEER_LOG);
-        unsafe { std::env::set_var(ENV_DEBUG_CODEX_PEER_LOG, &path) };
+        let _env_restore = EnvVarRestore::set(ENV_DEBUG_CODEX_PEER_LOG, path.as_os_str());
         let mut enabled = connected_ctx_with_debug_log(path.clone());
         deliver_push_frame(
             &enabled,
@@ -4075,23 +4232,130 @@ mod tests {
         );
         mark_push_subscribed(&enabled, false);
         mark_push_initialized_with(&enabled, |_| Ok(()));
-        match previous {
-            Some(value) => unsafe { std::env::set_var(ENV_DEBUG_CODEX_PEER_LOG, value) },
-            None => unsafe { std::env::remove_var(ENV_DEBUG_CODEX_PEER_LOG) },
-        }
         assert!(!path.exists());
     }
 
     #[test]
-    fn push_readiness_requires_initialized_and_subscribed_in_either_order() {
-        let initialized_first = connected_ctx_with(new_event_sink());
-        assert!(!mark_push_initialized_with(&initialized_first, |_| Ok(())));
-        assert!(mark_push_subscribed(&initialized_first, true));
+    fn push_readiness_is_deferred_in_both_initialization_orders() {
+        for initialized_first in [true, false] {
+            let (ctx, requests) =
+                connected_ctx_with_requests(PeerClientKind::Claude, Duration::from_millis(40));
+            let initialized = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            });
+            if initialized_first {
+                dispatch(&initialized, &ctx).expect("initialized notification");
+                publish_ready_after_subscribe(&ctx);
+            } else {
+                publish_ready_after_subscribe(&ctx);
+                dispatch(&initialized, &ctx).expect("initialized notification");
+            }
+            assert!(
+                requests.lock().unwrap().is_empty(),
+                "push ready must not publish before the settling delay"
+            );
+            wait_for_request_count(&requests, 1);
+            assert_eq!(ready_values(&requests), [true]);
+        }
+    }
 
-        let subscribed_first = connected_ctx_with(new_event_sink());
-        assert!(!mark_push_subscribed(&subscribed_first, true));
-        assert!(mark_push_initialized_with(&subscribed_first, |_| Ok(())));
-        assert!(!mark_push_subscribed(&subscribed_first, false));
+    #[test]
+    fn pull_readiness_is_published_immediately_after_subscribe() {
+        let (ctx, requests) = connected_ctx_with_requests(PeerClientKind::Codex, PUSH_READY_DELAY);
+        publish_ready_after_subscribe(&ctx);
+        assert_eq!(ready_values(&requests), [true]);
+    }
+
+    #[test]
+    fn push_ready_delay_is_measured_from_initialized_time() {
+        let (ctx, _requests) =
+            connected_ctx_with_requests(PeerClientKind::Claude, PUSH_READY_DELAY);
+        let initialized_at = Instant::now();
+        {
+            let mut state = ctx.push.lock().unwrap();
+            state.initialized = true;
+            state.initialized_at = Some(initialized_at);
+            state.subscribed = true;
+        }
+        let elapsed = Duration::from_millis(400);
+        let deferred =
+            prepare_deferred_push_ready_at(&ctx, initialized_at + elapsed).expect("ready deferral");
+        assert_eq!(deferred.delay, PUSH_READY_DELAY - elapsed);
+    }
+
+    #[test]
+    fn subscription_loss_cancels_deferred_true_and_publishes_false_immediately() {
+        let (ctx, requests) =
+            connected_ctx_with_requests(PeerClientKind::Claude, Duration::from_millis(40));
+        mark_push_initialized_with(&ctx, |_| Ok(()));
+        publish_ready_after_subscribe(&ctx);
+        revoke_push_ready(&ctx);
+        assert_eq!(ready_values(&requests), [false]);
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(ready_values(&requests), [false]);
+    }
+
+    #[test]
+    fn repeated_initialized_notification_schedules_only_one_ready() {
+        let (ctx, requests) =
+            connected_ctx_with_requests(PeerClientKind::Claude, Duration::from_millis(20));
+        publish_ready_after_subscribe(&ctx);
+        let initialized = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        dispatch(&initialized, &ctx).expect("first initialized notification");
+        dispatch(&initialized, &ctx).expect("duplicate initialized notification");
+        wait_for_request_count(&requests, 1);
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(ready_values(&requests), [true]);
+    }
+
+    #[test]
+    fn deferred_ready_trace_records_delay_and_initialized_age() {
+        let path = debug_test_path("ready-deferred");
+        let (mut ctx, requests) =
+            connected_ctx_with_requests(PeerClientKind::Claude, Duration::ZERO);
+        ctx.debug_log_path = Some(path.clone());
+        mark_push_initialized_with(&ctx, |_| Ok(()));
+        publish_ready_after_subscribe(&ctx);
+        wait_for_request_count(&requests, 1);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let records = loop {
+            let records = read_debug_records(&path);
+            if records
+                .iter()
+                .any(|record| record["action"] == "peer_set_ready_sent")
+            {
+                break records;
+            }
+            assert!(Instant::now() < deadline, "ready trace was not written");
+            thread::sleep(Duration::from_millis(2));
+        };
+        let deferred = records
+            .iter()
+            .find(|record| record["action"] == "peer_set_ready_deferred")
+            .expect("deferred trace");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["action"] == "peer_set_ready_deferred")
+                .count(),
+            1
+        );
+        assert!(records
+            .iter()
+            .all(|record| record["action"] != "push_frame_buffered"));
+        assert_eq!(deferred["client_kind"], "claude");
+        assert_eq!(deferred["delay_ms"], 0);
+        let sent = records
+            .iter()
+            .find(|record| record["action"] == "peer_set_ready_sent")
+            .expect("sent trace");
+        assert_eq!(sent["ready"], true);
+        assert!(sent["initialized_age_ms"].is_number());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -5863,9 +6127,11 @@ Commands:
             events: new_event_sink(),
             inbox: new_inbox_sink(),
             push: Arc::new(Mutex::new(PushState::default())),
+            ready_publish_lock: Arc::new(Mutex::new(())),
             debug_log_path: None,
             request_sink: None,
             request_sink_response: None,
+            push_ready_delay: PUSH_READY_DELAY,
         }
     }
 
@@ -5879,14 +6145,48 @@ Commands:
             events,
             inbox: new_inbox_sink(),
             push: Arc::new(Mutex::new(PushState::default())),
+            ready_publish_lock: Arc::new(Mutex::new(())),
             debug_log_path: None,
             request_sink: None,
             request_sink_response: None,
+            push_ready_delay: PUSH_READY_DELAY,
         }
     }
 
     fn connected_ctx_with(events: EventSink) -> PeerCtx {
         connected_ctx_with_kind(events, PeerClientKind::Claude)
+    }
+
+    fn connected_ctx_with_requests(
+        client_kind: PeerClientKind,
+        push_ready_delay: Duration,
+    ) -> (PeerCtx, Arc<Mutex<Vec<Request>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = connected_ctx_with_kind(new_event_sink(), client_kind);
+        ctx.request_sink = Some(requests.clone());
+        ctx.request_sink_response = Some(Response::ok_unit());
+        ctx.push_ready_delay = push_ready_delay;
+        (ctx, requests)
+    }
+
+    fn wait_for_request_count(requests: &Arc<Mutex<Vec<Request>>>, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while requests.lock().unwrap().len() < expected && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(requests.lock().unwrap().len(), expected);
+    }
+
+    fn ready_values(requests: &Arc<Mutex<Vec<Request>>>) -> Vec<bool> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| match request {
+                Request::PeerSetReady { ready, .. } => Some(*ready),
+                _ => None,
+            })
+            .collect()
     }
 
     fn connected_ctx_with_debug_log(path: PathBuf) -> PeerCtx {
@@ -6337,18 +6637,13 @@ Commands:
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let path = debug_test_path("disabled");
-        let previous = std::env::var_os(ENV_DEBUG_CODEX_PEER_LOG);
-        unsafe { std::env::set_var(ENV_DEBUG_CODEX_PEER_LOG, &path) };
+        let _env_restore = EnvVarRestore::set(ENV_DEBUG_CODEX_PEER_LOG, path.as_os_str());
         let ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
 
         handle_check_messages(&json!(1), &json!({}), &ctx);
         log_peer_inbox_received(&ctx, Some(1), 2, 3, 4);
         log_peer_receipt_cache_hit(&ctx, Some(1));
 
-        match previous {
-            Some(value) => unsafe { std::env::set_var(ENV_DEBUG_CODEX_PEER_LOG, value) },
-            None => unsafe { std::env::remove_var(ENV_DEBUG_CODEX_PEER_LOG) },
-        }
         assert!(!path.exists());
     }
 

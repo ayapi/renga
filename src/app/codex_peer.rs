@@ -1073,13 +1073,18 @@ impl App {
         }
     }
 
-    fn queue_peer_inbox_until_ready(
+    fn queue_peer_inbox_until_ready(&mut self, pane_id: usize, message: PendingPeerInboxMessage) {
+        let debug_log_path = codex_peer_debug_log_path();
+        self.queue_peer_inbox_until_ready_with_path(pane_id, message, debug_log_path.as_deref());
+    }
+
+    fn queue_peer_inbox_until_ready_with_path(
         &mut self,
         pane_id: usize,
         mut message: PendingPeerInboxMessage,
+        debug_log_path: Option<&std::ffi::OsStr>,
     ) {
-        let debug_log_path = codex_peer_debug_log_path();
-        message.debug_peer_inbox_sequence = debug_log_path.as_ref().map(|_| {
+        message.debug_peer_inbox_sequence = debug_log_path.map(|_| {
             let sequence = self.peer_inbox_debug_sequences.entry(pane_id).or_insert(0);
             *sequence = sequence.saturating_add(1);
             *sequence
@@ -1090,7 +1095,7 @@ impl App {
             .back()
             .and_then(|message| message.debug_peer_inbox_sequence);
         let queue_len_after = queue.len();
-        log_peer_delivery_record(debug_log_path.as_deref(), || {
+        log_peer_delivery_record(debug_log_path, || {
             serde_json::json!({
                 "action": "peer_inbox_queued_until_ready",
                 "pane_id": pane_id,
@@ -1345,7 +1350,11 @@ impl App {
                         "reason": "unconfirmed_delivery_expired",
                     })
                 });
-                self.queue_peer_inbox_until_ready(pending.target_pane, pending.message);
+                self.queue_peer_inbox_until_ready_with_path(
+                    pending.target_pane,
+                    pending.message,
+                    debug_log_path.as_deref(),
+                );
             } else {
                 let error = ipc::CodedError::new(
                     ipc::err_code::PEER_DELIVERY_UNCONFIRMED,
@@ -2416,6 +2425,28 @@ impl App {
 mod debug_logging_tests {
     use super::*;
 
+    struct EnvVarRestore {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn set(name: &'static str, value: &std::ffi::OsStr) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
     fn debug_test_path(label: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2596,8 +2627,7 @@ mod debug_logging_tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let path = debug_test_path("delivery-disabled");
-        let previous = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
-        std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", &path);
+        let _env_restore = EnvVarRestore::set("RENGA_DEBUG_CODEX_PEER_LOG", path.as_os_str());
         set_codex_peer_debug_log_path_test_override(Some(Some(path.as_os_str().to_owned())));
         let mut enabled = App::new(40, 80).expect("App::new");
         let enabled_sender = enabled.workspaces[enabled.active_tab].focused_pane_id;
@@ -2652,10 +2682,6 @@ mod debug_logging_tests {
             .handle_peer_set_ready(disabled_target, PeerClientKind::Claude, true)
             .expect("flush peer message");
         disabled.shutdown();
-        match previous {
-            Some(value) => std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", value),
-            None => std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG"),
-        }
         assert!(!path.exists());
     }
 
@@ -2763,14 +2789,9 @@ mod debug_logging_tests {
         // inherited-env test share a process-wide lock so their temporary
         // values cannot race while the rest of the suite uses injected paths.
         set_codex_peer_debug_log_path_test_override(None);
-        let previous = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
-        std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", &path);
+        let _env_restore = EnvVarRestore::set("RENGA_DEBUG_CODEX_PEER_LOG", path.as_os_str());
         let resolved = codex_peer_debug_log_path();
         log_codex_peer_kind_update(23, None, PeerClientKind::Codex, "production_wiring_test");
-        match previous {
-            Some(value) => std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", value),
-            None => std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG"),
-        }
         set_codex_peer_debug_log_path_test_override(Some(None));
 
         assert_eq!(resolved.as_deref(), Some(path.as_os_str()));

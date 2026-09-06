@@ -65,13 +65,42 @@ values do not identify the same delivery. The only shared correlation data is
 - `push_frame_dropped_cap`: `delivery_id`, `frame_kind`, and `pending_len` when the
   pre-initialization notification queue is full.
 - `push_initialized`: successful `flushed_count`, `failed_count`, and
-  `subscribed_at_that_time` when the MCP initialized notification is handled.
-  This record precedes the corresponding `initialized_flush` result records.
+  `subscribed_at_that_time`, timestamped after the initialization-time push
+  buffer flush completes. This record precedes the corresponding
+  `initialized_flush` result records in the JSONL stream.
 - `push_subscribed`: `subscribed` and `initialized_at_that_time` whenever the
   event subscription state changes.
-- `peer_set_ready_sent`: `client_kind`, `ready`, `ok`, and `error` after
-  mcp-peer sends App a readiness update. Push initialization and subscription
-  produce `ready=true`; subscription loss produces `ready=false`.
+- `peer_set_ready_deferred`: `client_kind` and the remaining `delay_ms` when a
+  push client has both initialized and subscribed but readiness publication is
+  deferred. It is written once per scheduled delay, not while polling.
+- `peer_set_ready_sent`: `client_kind`, `ready`, `initialized_age_ms`, `ok`, and
+  `error` after mcp-peer sends App a readiness update. Push initialization and
+  subscription produce `ready=true`; subscription loss produces `ready=false`.
+
+### Claude startup onset measurements
+
+Controlled T2-T4 trials on 2026-09-06 with Claude Code v2.1.261 bracketed the
+startup loss after `notifications/initialized`: notifications emitted 8, 37,
+38, and 54 ms afterward were lost, while notifications emitted 148 and 177 ms
+or later arrived. These are one-sided samples from one Windows host in its
+usual Remote Control setup, measured between 10:51 and 10:58 with no Cargo
+build running, three renga TUIs, and several Codex/Claude panes. Claude startup
+speed depends on host load, so concurrent builds or additional panes can make
+the unsafe interval longer than 148 ms.
+
+Push readiness therefore waits 1500 ms from initialization. This is a safety
+margin, not a measured onset: about ten times the earliest successful sample
+and about 28 times the latest lost sample, leaving room for startup CPU
+contention and the bug's originally intermittent character. A report that a
+notification still disappears after this delay should trigger new measurement
+starting from the sample series above. The cost is that every Claude pane's
+first peer message can be delayed by up to 1.5 seconds.
+
+During the delay, App retains messages in `pending_peer_inbox` and does not emit
+`PeerInbox`; the mcp-peer push buffer is not involved. A validating trace should
+therefore contain no delay-window `push_frame_buffered` record. If the event
+subscription ends before the timer fires, `ready=false` is sent immediately
+and the pending `ready=true` is cancelled.
 
 ### App-side ready queue timing
 
