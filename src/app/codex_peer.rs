@@ -840,6 +840,16 @@ pub(crate) fn write_input_to_pane(
 }
 
 impl App {
+    #[cfg(test)]
+    pub(crate) fn pending_codex_peer_front_is_draft(&self, pane_id: usize) -> bool {
+        matches!(
+            self.pending_codex_peer_messages
+                .get(&pane_id)
+                .and_then(|queue| queue.front()),
+            Some(PendingCodexPeerDelivery::Draft { .. })
+        )
+    }
+
     /// Route `body` from `from_pane` to `target` when both share a
     /// workspace. Unresolved and cross-tab targets are both reported
     /// as undeliverable so callers cannot use the response to discover
@@ -1095,6 +1105,83 @@ impl App {
         );
         for reply in pending.replies {
             let _ = reply.send(result.clone());
+        }
+        Ok(())
+    }
+
+    /// Re-arm Codex after it acknowledges one pull-inbox head while another
+    /// head is already waiting. This deliberately enters at the lower queueing
+    /// half of the normal nudge path: `route_focused_codex_peer_message` also
+    /// computes a send caller's confirmation outcome, but an ack re-nudge has
+    /// no such caller. Queueing here retains the existing merge gate and lets
+    /// the normal pending-message processor apply focus and submit timing.
+    pub(crate) fn handle_peer_inbox_head_acknowledged(
+        &mut self,
+        pane_id: usize,
+        remaining: usize,
+        next_from_pane: usize,
+        next_from_name: Option<String>,
+        next_from_kind: Option<PeerClientKind>,
+    ) -> std::result::Result<(), ipc::CodedError> {
+        let next_message = PendingCodexPeerMessage {
+            from_pane: next_from_pane,
+            from_name: next_from_name,
+            from_kind: next_from_kind,
+        };
+        self.resolve_pane_across_workspaces(&PaneRef::Id(pane_id))
+            .ok_or_else(|| {
+                ipc::CodedError::new(
+                    ipc::err_code::PANE_NOT_FOUND,
+                    format!("pane {pane_id} not found for peer inbox re-nudge"),
+                )
+            })?;
+        if self.peer_client_kinds.get(&pane_id) != Some(&PeerClientKind::Codex) {
+            return Err(ipc::CodedError::new(
+                ipc::err_code::PROTOCOL,
+                format!("pane {pane_id} is not a registered Codex peer"),
+            ));
+        }
+
+        let queue_was_empty = self
+            .pending_codex_peer_messages
+            .get(&pane_id)
+            .is_none_or(VecDeque::is_empty);
+        if remaining > 0 {
+            self.push_pending_codex_peer_nudge(pane_id, next_message.clone());
+        }
+
+        if let Some(path) = codex_peer_debug_log_path().as_deref() {
+            let expected_composer_raw = format_codex_peer_message(&next_message);
+            let expected_composer = normalize_codex_composer_expected(&expected_composer_raw);
+            let queue = self.pending_codex_peer_messages.get(&pane_id);
+            let queue_entries_total = queue.map_or(0, VecDeque::len);
+            let delivery_sequence = queue
+                .and_then(|queue| queue.front())
+                .and_then(PendingCodexPeerDelivery::delivery_sequence);
+            log_codex_peer_decision(
+                path,
+                CodexPeerDecision {
+                    pane_id,
+                    delivery_sequence,
+                    now: Instant::now(),
+                    ready_at: None,
+                    expires_at: None,
+                    expected_composer: Some(&expected_composer),
+                    expected_composer_raw: Some(&expected_composer_raw),
+                    screen: None,
+                    composer_matches: None,
+                    retries_remaining: Some(CODEX_PEER_NUDGE_MAX_RETRIES),
+                    queue_entries_total,
+                    other_queue_entries: queue_entries_total.saturating_sub(1),
+                    action: if remaining == 0 {
+                        "renudge_after_ack_skipped_none_pending"
+                    } else if queue_was_empty {
+                        "renudge_after_ack_enqueued"
+                    } else {
+                        "renudge_after_ack_skipped_queue_occupied"
+                    },
+                },
+            );
         }
         Ok(())
     }
@@ -2210,6 +2297,78 @@ mod debug_logging_tests {
         let record: serde_json::Value = serde_json::from_str(lines[0]).expect("one JSON object");
         assert_eq!(record["action"], "client_kind_updated");
         assert_eq!(record["pane_id"], 17);
+        std::fs::remove_file(path).expect("remove debug JSONL");
+    }
+
+    #[test]
+    fn renudge_after_ack_logs_enqueued_and_skipped_reasons() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "renga-codex-peer-renudge-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        set_codex_peer_debug_log_path_test_override(Some(Some(path.as_os_str().to_owned())));
+        let mut app = App::new(40, 80).expect("App::new");
+        let codex_id = app
+            .handle_split(
+                &PaneRef::Focused,
+                ipc::Direction::Vertical,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("split");
+        app.peer_client_kinds
+            .insert(codex_id, PeerClientKind::Codex);
+
+        app.handle_peer_inbox_head_acknowledged(
+            codex_id,
+            1,
+            7,
+            Some("leader".into()),
+            Some(PeerClientKind::Claude),
+        )
+        .expect("enqueue re-nudge");
+        app.handle_peer_inbox_head_acknowledged(
+            codex_id,
+            1,
+            7,
+            Some("leader".into()),
+            Some(PeerClientKind::Claude),
+        )
+        .expect("merge duplicate re-nudge");
+        app.pending_codex_peer_messages.remove(&codex_id);
+        app.handle_peer_inbox_head_acknowledged(
+            codex_id,
+            0,
+            7,
+            Some("leader".into()),
+            Some(PeerClientKind::Claude),
+        )
+        .expect("skip empty inbox");
+        app.shutdown();
+        set_codex_peer_debug_log_path_test_override(Some(None));
+
+        let actions: Vec<String> = std::fs::read_to_string(&path)
+            .expect("debug JSONL")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|record| record["action"].as_str().map(str::to_string))
+            .collect();
+        for expected in [
+            "renudge_after_ack_enqueued",
+            "renudge_after_ack_skipped_queue_occupied",
+            "renudge_after_ack_skipped_none_pending",
+        ] {
+            assert!(
+                actions.iter().any(|action| action == expected),
+                "{actions:?}"
+            );
+        }
         std::fs::remove_file(path).expect("remove debug JSONL");
     }
 

@@ -11,6 +11,14 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Added
 
+- **Codex pull inboxes now request one best-effort follow-up nudge after an
+  acknowledgement leaves another message queued.** The additive
+  `peer_inbox_head_acknowledged` IPC request reuses the existing nudge merge and
+  focus path, is harmless when an older TUI rejects it, and preserves the next
+  sender's id/name/kind in the prompt. This supersedes renga-069's statement
+  that no additional nudge follows; callers must still re-check immediately
+  instead of waiting for the fallback. (renga-fmx)
+
 - **`[shell] program` config key and `--shell` CLI flag** to pick the
   shell launched in every new pane (e.g. `cmd`, `powershell`, `fish`,
   or a full path), instead of the built-in auto-detection (Git Bash →

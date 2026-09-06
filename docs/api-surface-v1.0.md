@@ -198,8 +198,11 @@ entire body is assembled, call again with `ack {message_id, token}`. A response
 lost or truncated before ack is idempotently retrievable with the same cursor.
 The ack response contains confirmation only. Read the next message with a fresh
 `check_messages({})` call. If the ack response reports `pending_after > 0`, make
-that fresh call immediately and continue while `has_more=true`; no new nudge
-follows for messages that arrived while a prior nudge was still pending.
+that fresh call immediately and continue while `has_more=true`; do not wait for
+a nudge. As a best-effort fallback, a Codex mcp-peer asks renga for at most one
+follow-up nudge after each accepted ack that leaves another head queued. It does
+not ask when `pending_after=0`, and an older renga process may reject the new IPC
+request without changing the successful ack response.
 The serialized frame includes the JSON-RPC request id, so changing the id's
 digit count can move a retried page's final character; following each returned
 `next_offset_bytes` still reconstructs the body without loss.
@@ -518,6 +521,7 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | `peer_register_client` | `pane_id: usize`, `kind: claude\|codex` | Posted by `renga mcp-peer` on startup. |
 | `peer_set_ready` | `pane_id: usize`, `kind: claude\|codex`, `ready: bool` | Internal peer lifecycle update. `ready=true` means the event subscriber can receive; for push clients this is sent only after MCP initialization. Kind is repeated atomically with readiness. |
 | `peer_inbox_ack` | `pane_id: usize`, `delivery_id: u64` | Internal mcp-peer receipt sent only after the target process retains the message. Separate from the later `check_messages` ack. |
+| `peer_inbox_head_acknowledged` | `pane_id: usize`, `remaining: usize`, `next_from_pane: usize`, `next_from_name?: string`, `next_from_kind?: claude\|codex` | Best-effort internal request sent by a Codex mcp-peer after a successful `check_messages` ack when another head remains. It preserves the next sender's nudge template metadata. |
 | `set_pane_identity` | `target: PaneRef`, `name?`, `role?` (three-state: missing / null / value) | Uses serde `double_option`. |
 | `set_summary` | `from_pane: usize`, `summary: string` | Empty `summary` clears. >256 `chars` rejected with `summary_too_long`. |
 
@@ -678,6 +682,11 @@ because downstream is required to read the `[code]` token for branching.
 ### 5.3 Forward-compat rules — stable
 
 - **Unknown event `type` tags**: ignore, do not abort the stream.
+- **Unknown IPC Request `cmd` tags**: the server returns a `parse` error and
+  closes only that one-request connection. Clients must treat any rejection or
+  transport failure as "feature not supported on this server version", without
+  branching on the particular error. `peer_inbox_head_acknowledged` follows
+  this rule so a new mcp-peer can safely use it with an older long-running TUI.
 - **Unknown JSON keys** in config/layout/IPC payloads: ignored on read.
 - **Missing JSON keys** have three contract-defined meanings: keys documented
   as optional-when-unset (for example `PaneInfo.name` and `Response::Err.code`)
@@ -702,6 +711,9 @@ because downstream is required to read the `[code]` token for branching.
   no-more, no-ack-needed, zero pending messages, or confirmed receipt.
 - Adding `acknowledged_message_id` is additive: older clients ignore it, while
   newer clients can associate a confirmation with the removed FIFO head.
+- Adding `peer_inbox_head_acknowledged` and its fields is additive and therefore
+  requires a minor release. It is best-effort across mixed versions: failure
+  cannot roll back the already accepted local-inbox ack.
 - Omitting `delivery` and the next body from a successful ack response is an
   intentional observable behavior change and therefore falls under the
   semantic-change definition in `semver-policy.md` §3. It does not require a
@@ -722,6 +734,12 @@ because downstream is required to read the `[code]` token for branching.
   treated an ack result as confirmation context and did not process a chained
   body as a new coworker request. A fresh `check_messages({})` call gives the
   next body its own request context.
+- Replacing the ack text's obsolete "no nudge will follow" statement with
+  "renga may also send a follow-up nudge, but do not wait for it" is an
+  intentional semantic change under `semver-policy.md` §3. It does not require
+  a major release because the structured result is unchanged, the mandatory
+  immediate fresh-check instruction remains, and the newly described nudge is
+  explicitly best-effort rather than a delivery guarantee.
 - **Unknown `[code]` tokens**: treat as the equivalent of `internal`.
 
 These rules let renga add fields and variants additively without bumping the

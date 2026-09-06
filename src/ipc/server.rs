@@ -723,6 +723,20 @@ fn dispatch_request_with_registry(
             delivery_id,
             reply,
         }),
+        Request::PeerInboxHeadAcknowledged {
+            pane_id,
+            remaining,
+            next_from_pane,
+            next_from_name,
+            next_from_kind,
+        } => forward_unit(command_tx, |reply| AppCommand::PeerInboxHeadAcknowledged {
+            pane_id,
+            remaining,
+            next_from_pane,
+            next_from_name,
+            next_from_kind,
+            reply,
+        }),
         Request::SetSummary { from_pane, summary } => {
             let (reply_tx, reply_rx) = oneshot::channel();
             if enqueue_app_command(
@@ -1389,6 +1403,41 @@ mod tests {
             Request::PeerInboxAck {
                 pane_id: 19,
                 delivery_id: 23,
+            },
+            &command_tx,
+        );
+        assert!(matches!(response, Response::Ok { .. }));
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn peer_inbox_head_acknowledged_is_forwarded() {
+        let (command_tx, command_rx) = mpsc::channel();
+        let responder = thread::spawn(move || match command_rx.recv().unwrap() {
+            AppCommand::PeerInboxHeadAcknowledged {
+                pane_id,
+                remaining,
+                next_from_pane,
+                next_from_name,
+                next_from_kind,
+                reply,
+            } => {
+                assert_eq!(pane_id, 19);
+                assert_eq!(remaining, 2);
+                assert_eq!(next_from_pane, 7);
+                assert_eq!(next_from_name.as_deref(), Some("shogun"));
+                assert_eq!(next_from_kind, Some(super::super::PeerClientKind::Claude));
+                reply.send(Ok(())).unwrap();
+            }
+            other => panic!("expected peer inbox head acknowledgement, got {other:?}"),
+        });
+        let response = dispatch_request(
+            Request::PeerInboxHeadAcknowledged {
+                pane_id: 19,
+                remaining: 2,
+                next_from_pane: 7,
+                next_from_name: Some("shogun".into()),
+                next_from_kind: Some(super::super::PeerClientKind::Claude),
             },
             &command_tx,
         );

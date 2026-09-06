@@ -175,6 +175,8 @@ client が renga の外で起動されたか、renga ペインの環境変数を
 
 Codex への配送は pane-driven です。renga が `check_messages` を促す nudge を queue し、Codex ペインが PTY 入力を安全に受けられる状態で、かつ非フォーカスになった時点で流し込みます。busy な間は queue に残ります。フォーカス中に届いた場合は通知 overlay を出し、`Alt+Enter` / `Ctrl+Enter` で `check_messages` 用の文面だけを composer に挿入します。`Esc` なら無視、Enter を押して実行するかどうかは人間が決めます。後でフォーカスが外れれば、worker と同じ queued nudge 経路に戻ります。
 
+ack 後にも pull inbox にメッセージが残る場合、renga は best-effort で follow-up nudge を 1 回要求します。`pending_after > 0` なら直ちに `check_messages({})` を再実行してください。起動中の古い TUI がこの要求に対応しない場合があるため、fallback の nudge を待たないでください。
+
 `check_messages` で受け取った本文が実際の peer 依頼です。単に返事を返すためのチャットではなく、人間からの依頼に近い peer 指示として扱うのが前提です。調査、pane 操作、tool 実行、コード編集などを頼まれたなら、その作業自体を進めてください。
 
 ### Codex の `pending messages` 表示が残るのに `check_messages` は 0 件

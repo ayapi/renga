@@ -162,6 +162,16 @@ pub enum AppCommand {
         delivery_id: u64,
         reply: oneshot::Sender<std::result::Result<(), ipc::CodedError>>,
     },
+    /// A Codex pull-inbox ack exposed another queued head. Request one fresh
+    /// nudge without changing the delivery-receipt ack semantics above.
+    PeerInboxHeadAcknowledged {
+        pane_id: usize,
+        remaining: usize,
+        next_from_pane: usize,
+        next_from_name: Option<String>,
+        next_from_kind: Option<PeerClientKind>,
+        reply: oneshot::Sender<std::result::Result<(), ipc::CodedError>>,
+    },
     /// The IPC server observed the last pane-associated event stream
     /// terminate. Unlike `PeerSetReady`, this is authoritative server
     /// state and does not need client-kind metadata or a reply.

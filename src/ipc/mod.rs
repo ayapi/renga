@@ -194,6 +194,18 @@ pub enum Request {
     /// `check_messages` receipt token, which confirms the later
     /// MCP-client-to-Codex handoff.
     PeerInboxAck { pane_id: usize, delivery_id: u64 },
+    /// Tell the App that a Codex pull-inbox head was acknowledged while
+    /// another message remains. The App turns this into a fresh nudge through
+    /// the normal Codex delivery path.
+    PeerInboxHeadAcknowledged {
+        pane_id: usize,
+        remaining: usize,
+        next_from_pane: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_from_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_from_kind: Option<PeerClientKind>,
+    },
     /// Rename or (re)assign the stable `name` / `role` of an existing
     /// pane. Both fields use three-state semantics over the wire:
     ///
@@ -1197,6 +1209,18 @@ mod tests {
         let r = Request::PeerInboxAck {
             pane_id: 2,
             delivery_id: 17,
+        };
+        assert_eq!(roundtrip(&r), r);
+    }
+
+    #[test]
+    fn peer_inbox_head_acknowledged_request_roundtrips() {
+        let r = Request::PeerInboxHeadAcknowledged {
+            pane_id: 2,
+            remaining: 3,
+            next_from_pane: 1,
+            next_from_name: Some("leader".into()),
+            next_from_kind: Some(PeerClientKind::Claude),
         };
         assert_eq!(roundtrip(&r), r);
     }

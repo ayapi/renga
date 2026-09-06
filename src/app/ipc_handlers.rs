@@ -124,6 +124,23 @@ impl App {
                 let result = self.handle_peer_inbox_ack(pane_id, delivery_id);
                 let _ = reply.send(result);
             }
+            AppCommand::PeerInboxHeadAcknowledged {
+                pane_id,
+                remaining,
+                next_from_pane,
+                next_from_name,
+                next_from_kind,
+                reply,
+            } => {
+                let result = self.handle_peer_inbox_head_acknowledged(
+                    pane_id,
+                    remaining,
+                    next_from_pane,
+                    next_from_name,
+                    next_from_kind,
+                );
+                let _ = reply.send(result);
+            }
             AppCommand::PeerSubscriberGone { pane_id } => {
                 self.handle_peer_subscriber_gone(pane_id);
             }

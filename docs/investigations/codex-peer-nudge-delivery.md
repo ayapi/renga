@@ -296,7 +296,27 @@ D の実測画面:
 
 ---
 
-## 8. 測定上の注意（後続調査者向け）
+## 8. ack 後の follow-up nudge（renga-fmx）
+
+nudge が pending の間に複数の peer message が届くと、後続分は既存の nudge
+に合流する。このため先頭本文の ack 後、pull inbox に次の head が残る場合は、
+mcp-peer が additive IPC request `peer_inbox_head_acknowledged` を App へ 1 回だけ
+送り、通常の pending nudge queue に新しい Draft を積む。Request には次の head
+の送信者 id/name/kind を載せ、既存の nudge 文面を保つ。残り 0 件では送らない。
+
+この経路は best-effort である。新しい mcp-peer が長時間稼働中の古い TUI に
+接続すると未知 Request は `parse` error になるが、ack 自体は既に local inbox
+で成立しており、その成功応答を変えない。呼び手は `pending_after > 0` なら nudge
+を待たず、従来どおり直ちに `check_messages({})` を再実行する。
+
+debug JSONL では mcp-peer の `check_messages` record の `renudge_after_ack` が
+`sent` / `rejected` / `skipped_none_pending` 等を示す。App 側は
+`renudge_after_ack_enqueued`、`renudge_after_ack_skipped_queue_occupied`、
+`renudge_after_ack_skipped_none_pending` を記録する。
+
+---
+
+## 9. 測定上の注意（後続調査者向け）
 
 本調査は途中で3回、誤った結論に到達した。いずれも測定手順の欠陥が原因なので記録しておく。
 

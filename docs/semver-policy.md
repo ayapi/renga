@@ -127,9 +127,10 @@ Adding to a frozen surface is a minor bump. Specifically:
   default — minor.
 - New CLI subcommand — minor.
 - New CLI flag, optional, with a backward-compatible default — minor.
-- New IPC `Request` variant — minor. Existing servers must continue to reject
-  unknown variants with `protocol`; clients must treat that rejection as
-  "feature not supported on this server version".
+- New IPC `Request` variant — minor. Existing servers reject an unknown
+  variant with `parse` and close that request's connection; clients must treat
+  any rejection, regardless of its error kind, as "feature not supported on
+  this server version".
 - New IPC `Response` variant — major (clients can't assume forward-compat on
   status discriminants without an explicit ignore rule, and we do not have one
   for `Response`). Adding a new field to an existing variant is minor.

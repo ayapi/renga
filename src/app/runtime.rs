@@ -203,6 +203,9 @@ impl App {
             }
             AppCommand::PeerSetReady { pane_id, .. } => ("peer_set_ready", Some(*pane_id)),
             AppCommand::PeerInboxAck { pane_id, .. } => ("peer_inbox_ack", Some(*pane_id)),
+            AppCommand::PeerInboxHeadAcknowledged { pane_id, .. } => {
+                ("peer_inbox_head_acknowledged", Some(*pane_id))
+            }
             AppCommand::PeerSubscriberGone { pane_id } => ("peer_subscriber_gone", Some(*pane_id)),
             AppCommand::SetPaneIdentity { target, .. } => ("set_pane_identity", resolve(target)),
             AppCommand::SetSummary { pane_id, .. } => ("set_summary", Some(*pane_id)),

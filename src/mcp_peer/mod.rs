@@ -159,6 +159,66 @@ fn acknowledge_peer_inbox(ctx: &PeerCtx, delivery_id: u64) {
     log_peer_inbox_ack_sent(path, *pane_id, delivery_id, ok, error.as_deref());
 }
 
+fn request_codex_renudge_after_ack(
+    ctx: &PeerCtx,
+    remaining: usize,
+    next: &QueuedPeerMessage,
+) -> &'static str {
+    if remaining == 0 || ctx.client_kind != PeerClientKind::Codex {
+        return if remaining == 0 {
+            "skipped_none_pending"
+        } else {
+            "skipped_not_codex"
+        };
+    }
+    let Mode::Connected { pane_id, endpoint } = &ctx.mode else {
+        return "skipped_detached";
+    };
+    let Ok(next_from_pane) = next.from_id.parse::<usize>() else {
+        log_stderr(&format!(
+            "cannot request Codex re-nudge for non-numeric sender id {:?}",
+            next.from_id
+        ));
+        return "rejected";
+    };
+    let request = Request::PeerInboxHeadAcknowledged {
+        pane_id: *pane_id,
+        remaining,
+        next_from_pane,
+        next_from_name: next.from_name.clone(),
+        next_from_kind: next.from_kind,
+    };
+
+    #[cfg(test)]
+    if let Some(sink) = &ctx.request_sink {
+        sink.lock().unwrap_or_else(|p| p.into_inner()).push(request);
+        return match ctx
+            .request_sink_response
+            .clone()
+            .unwrap_or_else(Response::ok_unit)
+        {
+            Response::Ok { .. } => "sent",
+            other => {
+                log_stderr(&format!("Codex re-nudge request returned: {other:?}"));
+                "rejected"
+            }
+        };
+    }
+
+    let result = client::send_request(endpoint, &request);
+    match result {
+        Ok(Response::Ok { .. }) => "sent",
+        Ok(other) => {
+            log_stderr(&format!("Codex re-nudge request returned: {other:?}"));
+            "rejected"
+        }
+        Err(error) => {
+            log_stderr(&format!("Codex re-nudge request failed: {error}"));
+            "rejected"
+        }
+    }
+}
+
 fn log_peer_inbox_ack_sent(
     path: &Path,
     pane_id: usize,
@@ -244,6 +304,10 @@ struct PeerCtx {
     inbox: InboxSink,
     push: PushSink,
     debug_log_path: Option<PathBuf>,
+    #[cfg(test)]
+    request_sink: Option<Arc<Mutex<Vec<Request>>>>,
+    #[cfg(test)]
+    request_sink_response: Option<Response>,
 }
 
 /// Soft cap on the per-process lifecycle event buffer used by
@@ -370,6 +434,10 @@ impl PeerCtx {
                         push,
                         client_kind,
                         debug_log_path,
+                        #[cfg(test)]
+                        request_sink: None,
+                        #[cfg(test)]
+                        request_sink_response: None,
                     };
                 }
             },
@@ -385,6 +453,10 @@ impl PeerCtx {
                     push,
                     client_kind,
                     debug_log_path,
+                    #[cfg(test)]
+                    request_sink: None,
+                    #[cfg(test)]
+                    request_sink_response: None,
                 };
             }
         };
@@ -396,6 +468,10 @@ impl PeerCtx {
                 push,
                 client_kind,
                 debug_log_path,
+                #[cfg(test)]
+                request_sink: None,
+                #[cfg(test)]
+                request_sink_response: None,
             },
             Err(e) => PeerCtx {
                 mode: Mode::Detached {
@@ -406,6 +482,10 @@ impl PeerCtx {
                 push,
                 client_kind,
                 debug_log_path,
+                #[cfg(test)]
+                request_sink: None,
+                #[cfg(test)]
+                request_sink_response: None,
             },
         }
     }
@@ -701,7 +781,7 @@ truncated, retry the same cursor without ack and optionally lower max_response_b
 confirms receipt, not completion of the requested work, and its response contains only that \
 confirmation, never the next message body. If an ack response reports pending_after greater than \
 zero, call check_messages({}) again immediately \
-to read it; no nudge will follow for messages that arrived while one was pending. Use send_message \
+to read it; renga may also send a follow-up nudge, but do not wait for it. Use send_message \
 when a reply, \
 clarification, status update, or handoff is actually needed.\n\n\
 MCP approvals in Codex are pane-local. On a newly launched pane, the first check_messages and \
@@ -817,7 +897,7 @@ fn tools_spec() -> Value {
         },
         {
             "name": "check_messages",
-            "description": "Read one bounded page from the queued peer inbox without removing it. Read structuredContent.messages[0].body when a complete message fits; otherwise append structuredContent.delivery.body_chunk and call check_messages again with the returned message_id / next_offset_bytes. Assemble the complete body before acting on it, then acknowledge receipt with ack {message_id, token}; only that explicit ack removes the message. The ack response is confirmation only and never contains the next message body. If pending_after is greater than zero, call check_messages({}) again immediately to read it; no nudge will follow for messages that arrived while one was pending. If a response is truncated, retry the same cursor without ack and optionally lower max_response_bytes.",
+            "description": "Read one bounded page from the queued peer inbox without removing it. Read structuredContent.messages[0].body when a complete message fits; otherwise append structuredContent.delivery.body_chunk and call check_messages again with the returned message_id / next_offset_bytes. Assemble the complete body before acting on it, then acknowledge receipt with ack {message_id, token}; only that explicit ack removes the message. The ack response is confirmation only and never contains the next message body. If pending_after is greater than zero, call check_messages({}) again immediately to read it; renga may also send a follow-up nudge, but do not wait for it. If a response is truncated, retry the same cursor without ack and optionally lower max_response_bytes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1312,8 +1392,8 @@ fn acknowledged_check_messages_response(
     } else {
         format!(
             "Acknowledged {message_id}. {pending_after} message(s) still queued. Call \
-check_messages({{}}) again immediately to read the next; no nudge will follow for messages that \
-arrived while one was pending."
+check_messages({{}}) again immediately to read the next; renga may also send a follow-up nudge, \
+but do not wait for it."
         )
     };
     ok_response(
@@ -1502,78 +1582,133 @@ fn check_messages_page_response(
     ))
 }
 
-fn handle_check_messages_inner(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
+struct CheckMessagesHandled {
+    response: Value,
+    renudge_after_ack: Option<&'static str>,
+}
+
+impl CheckMessagesHandled {
+    fn plain(response: Value) -> Self {
+        Self {
+            response,
+            renudge_after_ack: None,
+        }
+    }
+}
+
+fn handle_check_messages_inner(id: &Value, args: &Value, ctx: &PeerCtx) -> CheckMessagesHandled {
     let budget = match parse_check_response_budget(args) {
         Ok(value) => value,
-        Err(message) => return err_response(id, -32602, &message),
+        Err(message) => return CheckMessagesHandled::plain(err_response(id, -32602, &message)),
     };
     let has_cursor = args.get("message_id").is_some() || args.get("offset_bytes").is_some();
     if args.get("ack").is_some() && has_cursor {
-        return err_response(
+        return CheckMessagesHandled::plain(err_response(
             id,
             -32602,
             "ack cannot be combined with message_id or offset_bytes",
-        );
+        ));
     }
 
     let mut inbox = ctx.inbox.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(ack) = args.get("ack") {
         let Some(ack) = ack.as_object() else {
-            return err_response(id, -32602, "ack must be an object");
+            return CheckMessagesHandled::plain(err_response(id, -32602, "ack must be an object"));
         };
         let Some(message_id) = ack.get("message_id").and_then(Value::as_str) else {
-            return err_response(id, -32602, "ack.message_id must be a string");
+            return CheckMessagesHandled::plain(err_response(
+                id,
+                -32602,
+                "ack.message_id must be a string",
+            ));
         };
         let Some(token) = ack.get("token").and_then(Value::as_str) else {
-            return err_response(id, -32602, "ack.token must be a string");
+            return CheckMessagesHandled::plain(err_response(
+                id,
+                -32602,
+                "ack.token must be a string",
+            ));
         };
         let Some(head) = inbox.messages.front() else {
-            return err_response(id, -32602, "ack does not match a queued message");
+            return CheckMessagesHandled::plain(err_response(
+                id,
+                -32602,
+                "ack does not match a queued message",
+            ));
         };
         if head.message_id != message_id || head.ack_token != token {
-            return err_response(id, -32602, "ack does not match the queued FIFO head");
+            return CheckMessagesHandled::plain(err_response(
+                id,
+                -32602,
+                "ack does not match the queued FIFO head",
+            ));
         }
         inbox.messages.pop_front();
         let pending_after = inbox.messages.len();
-        return acknowledged_check_messages_response(id, message_id, pending_after);
+        let next = inbox.messages.front().map(|entry| entry.message.clone());
+        drop(inbox);
+        let renudge_after_ack = match next.as_ref() {
+            Some(next) => request_codex_renudge_after_ack(ctx, pending_after, next),
+            None => "skipped_none_pending",
+        };
+        return CheckMessagesHandled {
+            response: acknowledged_check_messages_response(id, message_id, pending_after),
+            renudge_after_ack: Some(renudge_after_ack),
+        };
     }
 
     let Some(entry) = inbox.messages.front() else {
-        return empty_check_messages_response(id);
+        return CheckMessagesHandled::plain(empty_check_messages_response(id));
     };
     let requested_id = args.get("message_id").and_then(Value::as_str);
     if args.get("message_id").is_some() && requested_id.is_none() {
-        return err_response(id, -32602, "message_id must be a string");
+        return CheckMessagesHandled::plain(err_response(
+            id,
+            -32602,
+            "message_id must be a string",
+        ));
     }
     if let Some(requested_id) = requested_id {
         if requested_id != entry.message_id {
-            return err_response(id, -32602, "message_id does not match the queued FIFO head");
+            return CheckMessagesHandled::plain(err_response(
+                id,
+                -32602,
+                "message_id does not match the queued FIFO head",
+            ));
         }
     }
     let offset = match args.get("offset_bytes") {
         Some(value) => match value.as_u64().and_then(|n| usize::try_from(n).ok()) {
             Some(value) => value,
-            None => return err_response(id, -32602, "offset_bytes must be a non-negative integer"),
+            None => {
+                return CheckMessagesHandled::plain(err_response(
+                    id,
+                    -32602,
+                    "offset_bytes must be a non-negative integer",
+                ))
+            }
         },
         None => 0,
     };
     if offset != 0 && requested_id.is_none() {
-        return err_response(
+        return CheckMessagesHandled::plain(err_response(
             id,
             -32602,
             "a non-zero offset_bytes requires the returned message_id",
-        );
+        ));
     }
     let pending_after = inbox.messages.len().saturating_sub(1);
-    match check_messages_page_response(id, entry, offset, pending_after, budget) {
-        Ok(response) => response,
-        Err(message) => err_response(id, -32602, &message),
-    }
+    CheckMessagesHandled::plain(
+        match check_messages_page_response(id, entry, offset, pending_after, budget) {
+            Ok(response) => response,
+            Err(message) => err_response(id, -32602, &message),
+        },
+    )
 }
 
 fn handle_check_messages(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     let Some(path) = ctx.debug_log_path.as_deref() else {
-        return handle_check_messages_inner(id, args, ctx);
+        return handle_check_messages_inner(id, args, ctx).response;
     };
     let ack = args.get("ack");
     let has_cursor = args.get("message_id").is_some() || args.get("offset_bytes").is_some();
@@ -1590,7 +1725,10 @@ fn handle_check_messages(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
                 });
         (inbox.messages.len(), ack_would_be_accepted)
     };
-    let response = handle_check_messages_inner(id, args, ctx);
+    let CheckMessagesHandled {
+        response,
+        renudge_after_ack,
+    } = handle_check_messages_inner(id, args, ctx);
     let inbox_len_after = ctx
         .inbox
         .lock()
@@ -1643,6 +1781,7 @@ fn handle_check_messages(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
                 })),
             },
             "ack_result": ack_result,
+            "renudge_after_ack": renudge_after_ack,
             "error_reason": error_reason,
             "response": {
                 "head_message_id": delivery.and_then(|value| value.get("message_id")).and_then(Value::as_str),
@@ -5361,6 +5500,8 @@ Commands:
             inbox: new_inbox_sink(),
             push: Arc::new(Mutex::new(PushState::default())),
             debug_log_path: None,
+            request_sink: None,
+            request_sink_response: None,
         }
     }
 
@@ -5375,6 +5516,8 @@ Commands:
             inbox: new_inbox_sink(),
             push: Arc::new(Mutex::new(PushState::default())),
             debug_log_path: None,
+            request_sink: None,
+            request_sink_response: None,
         }
     }
 
@@ -5525,7 +5668,8 @@ Commands:
         assert!(instructions.contains("response contains only that confirmation"));
         assert!(instructions.contains("pending_after greater than zero"));
         assert!(instructions.contains("call check_messages({}) again immediately"));
-        assert!(instructions.contains("no nudge will follow"));
+        assert!(instructions.contains("renga may also send a follow-up nudge"));
+        assert!(!instructions.contains("no nudge will follow"));
     }
 
     fn enqueue_test_message(ctx: &PeerCtx, body: String) {
@@ -5561,7 +5705,8 @@ Commands:
         assert!(description.contains("ack response is confirmation only"));
         assert!(description.contains("pending_after is greater than zero"));
         assert!(description.contains("call check_messages({}) again immediately"));
-        assert!(description.contains("no nudge will follow"));
+        assert!(description.contains("renga may also send a follow-up nudge"));
+        assert!(!description.contains("no nudge will follow"));
         assert_eq!(
             check.pointer("/inputSchema/properties/max_response_bytes/default"),
             Some(&json!(4096))
@@ -5617,7 +5762,7 @@ Commands:
         let path = debug_test_path("cursor");
         let ctx = connected_ctx_with_debug_log(path.clone());
         enqueue_test_message(&ctx, "message body that must stay private".repeat(300));
-        let first = handle_check_messages_inner(&json!(1), &json!({}), &ctx);
+        let first = handle_check_messages_inner(&json!(1), &json!({}), &ctx).response;
         let message_id = first
             .pointer("/result/structuredContent/delivery/message_id")
             .and_then(Value::as_str)
@@ -5663,7 +5808,7 @@ Commands:
         let path = debug_test_path("ack");
         let ctx = connected_ctx_with_debug_log(path.clone());
         enqueue_test_message(&ctx, "ack me".to_string());
-        let first = handle_check_messages_inner(&json!(1), &json!({}), &ctx);
+        let first = handle_check_messages_inner(&json!(1), &json!({}), &ctx).response;
         let message_id = first
             .pointer("/result/structuredContent/delivery/message_id")
             .and_then(Value::as_str)
@@ -5686,6 +5831,10 @@ Commands:
         assert_eq!(records[0].get("call_shape"), Some(&json!("ack")));
         assert_eq!(records[0].get("ack_result"), Some(&json!("accepted")));
         assert_eq!(
+            records[0].get("renudge_after_ack"),
+            Some(&json!("skipped_none_pending"))
+        );
+        assert_eq!(
             records[0].pointer("/args/ack/message_id"),
             Some(&json!(message_id))
         );
@@ -5700,6 +5849,46 @@ Commands:
             records[0].pointer("/response/head_message_id"),
             Some(&Value::Null),
             "an accepted ack records an empty response head, distinct from its accepted status"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejected_renudge_request_keeps_ack_response_unchanged() {
+        let path = debug_test_path("renudge-rejected");
+        let mut ctx = connected_ctx_with_debug_log(path.clone());
+        let request_sink = Arc::new(Mutex::new(Vec::new()));
+        ctx.request_sink = Some(request_sink.clone());
+        ctx.request_sink_response = Some(Response::Err {
+            message: "parse error: unknown variant peer_inbox_head_acknowledged".to_string(),
+            code: Some(ipc::err_code::PARSE.to_string()),
+        });
+        enqueue_test_message(&ctx, "first".to_string());
+        enqueue_test_message(&ctx, "second".to_string());
+        let first = handle_check_messages_inner(&json!(1), &json!({}), &ctx).response;
+        let message_id = first
+            .pointer("/result/structuredContent/delivery/message_id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let token = first
+            .pointer("/result/structuredContent/delivery/ack_token")
+            .and_then(Value::as_str)
+            .unwrap();
+        let expected = acknowledged_check_messages_response(&json!(2), message_id, 1);
+
+        let actual = handle_check_messages(
+            &json!(2),
+            &json!({"ack": {"message_id": message_id, "token": token}}),
+            &ctx,
+        );
+
+        assert_eq!(actual, expected, "best-effort IPC must not alter ack bytes");
+        assert_eq!(request_sink.lock().unwrap().len(), 1);
+        let records = read_debug_records(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("renudge_after_ack"),
+            Some(&json!("rejected"))
         );
         let _ = std::fs::remove_file(path);
     }
@@ -6131,7 +6320,7 @@ Commands:
     }
 
     #[test]
-    fn coalesced_nudge_ack_text_drives_fresh_check_for_second_message() {
+    fn coalesced_nudge_ack_rearms_app_without_a_fresh_check() {
         let mut app = App::new(40, 80).expect("App::new");
         let (_subscription_id, events) = app.event_bus.subscribe();
         let sender_id = app.ws().focused_pane_id;
@@ -6198,6 +6387,13 @@ Commands:
             }
         }
         assert_eq!(ctx.inbox.lock().unwrap().messages.len(), 2);
+        let request_sink = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = ctx;
+        ctx.mode = Mode::Connected {
+            pane_id: codex_id,
+            endpoint: dummy_endpoint(),
+        };
+        ctx.request_sink = Some(request_sink.clone());
 
         let first = handle_check_messages(&json!(1), &json!({}), &ctx);
         let message_id = first
@@ -6226,18 +6422,69 @@ Commands:
             .and_then(Value::as_str)
             .unwrap();
         assert!(acknowledgement_text.contains("Call check_messages({}) again immediately"));
-        assert!(acknowledgement_text.contains("no nudge will follow"));
+        assert!(acknowledgement_text.contains("renga may also send a follow-up nudge"));
+        assert!(!acknowledgement_text.contains("no nudge will follow"));
         assert!(
             acknowledged
                 .pointer("/result/structuredContent/delivery")
                 .is_none(),
             "the acknowledgement must not chain the second body"
         );
+        // The first nudge has done its job by the time Codex can acknowledge
+        // the first body. No fresh check is made here: the ack's IPC request
+        // alone must put a new Draft into the App queue.
+        app.pending_codex_peer_messages.remove(&codex_id);
+        let request = request_sink
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("ack with one queued head requests a re-nudge");
+        match request {
+            Request::PeerInboxHeadAcknowledged {
+                pane_id,
+                remaining,
+                next_from_pane,
+                next_from_name,
+                next_from_kind,
+            } => app
+                .handle_peer_inbox_head_acknowledged(
+                    pane_id,
+                    remaining,
+                    next_from_pane,
+                    next_from_name,
+                    next_from_kind,
+                )
+                .expect("App accepts re-nudge request"),
+            other => panic!("unexpected IPC request: {other:?}"),
+        }
+        assert!(app.pending_codex_peer_front_is_draft(codex_id));
+        assert!(request_sink.lock().unwrap().is_empty());
 
         let second = handle_check_messages(&json!(3), &json!({}), &ctx);
         assert_eq!(
             second.pointer("/result/structuredContent/messages/0/body"),
             Some(&json!("second request"))
+        );
+        let second_message_id = second
+            .pointer("/result/structuredContent/delivery/message_id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let second_token = second
+            .pointer("/result/structuredContent/delivery/ack_token")
+            .and_then(Value::as_str)
+            .unwrap();
+        let final_ack = handle_check_messages(
+            &json!(4),
+            &json!({"ack": {"message_id": second_message_id, "token": second_token}}),
+            &ctx,
+        );
+        assert_eq!(
+            final_ack.pointer("/result/structuredContent/pending_after"),
+            Some(&json!(0))
+        );
+        assert!(
+            request_sink.lock().unwrap().is_empty(),
+            "ack with nothing queued must not request another nudge"
         );
         app.shutdown();
     }
