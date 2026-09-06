@@ -275,8 +275,11 @@ mod tests {
 
     #[test]
     fn wait_returns_when_watched_process_dies() {
+        // WAITFOR signal names are machine-wide, so a fixed name makes
+        // concurrently running test processes evict each other's fixture.
+        let signal_name = format!("renga9fswatch{}", std::process::id());
         let mut child = Command::new("waitfor.exe")
-            .args(["renga9fswatch", "/t", "60"])
+            .args([signal_name.as_str(), "/t", "60"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
