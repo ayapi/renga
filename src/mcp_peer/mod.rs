@@ -2190,7 +2190,7 @@ fn format_peer_list(peers: &[PeerInfo]) -> String {
         }
         if let Some(summary) = &p.summary {
             let summary = summary.replace(['\r', '\n'], " ");
-            if !summary.is_empty() {
+            if !summary.trim().is_empty() {
                 out.push_str(&format!("\n  summary: {summary}"));
             }
         }
@@ -2921,7 +2921,7 @@ fn format_pane_list(panes: &[PaneInfo]) -> String {
         }
         if let Some(summary) = &p.summary {
             let summary = summary.replace(['\r', '\n'], " ");
-            if !summary.is_empty() {
+            if !summary.trim().is_empty() {
                 out.push_str(&format!("\n  summary: {summary}"));
             }
         }
@@ -5288,6 +5288,46 @@ mod tests {
     }
 
     #[test]
+    fn format_peer_list_flattens_newlines_in_summary() {
+        let peers = vec![PeerInfo {
+            id: 2,
+            pending_peer_messages: 0,
+            name: None,
+            role: None,
+            cwd: Some("C:\\repo".into()),
+            kind: None,
+            receive_mode: None,
+            summary: Some("hello\r\nworld".into()),
+        }];
+
+        assert_eq!(
+            format_peer_list(&peers),
+            "Peers in this tab:\n\n- id=2 pending_peer_messages=0\n  cwd: C:\\repo\n  summary: hello  world\n"
+        );
+    }
+
+    #[test]
+    fn format_peer_list_omits_whitespace_only_summaries() {
+        for summary in ["   ", "\n"] {
+            let peers = vec![PeerInfo {
+                id: 2,
+                pending_peer_messages: 0,
+                name: None,
+                role: None,
+                cwd: None,
+                kind: None,
+                receive_mode: None,
+                summary: Some(summary.into()),
+            }];
+
+            assert_eq!(
+                format_peer_list(&peers),
+                "Peers in this tab:\n\n- id=2 pending_peer_messages=0\n"
+            );
+        }
+    }
+
+    #[test]
     fn format_pane_list_includes_single_line_summary_after_cwd() {
         let panes = vec![PaneInfo {
             id: 1,
@@ -5309,6 +5349,32 @@ mod tests {
             format_pane_list(&panes),
             "Panes in this tab:\n\n- id=1 pending_peer_messages=0\n  geometry: x=0 y=0 width=80 height=24\n  cwd: C:\\repo\n  summary: hello world\n"
         );
+    }
+
+    #[test]
+    fn format_pane_list_omits_whitespace_only_summaries() {
+        for summary in ["   ", "\n"] {
+            let panes = vec![PaneInfo {
+                id: 1,
+                pending_peer_messages: 0,
+                name: None,
+                role: None,
+                focused: false,
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+                cwd: None,
+                kind: None,
+                receive_mode: None,
+                summary: Some(summary.into()),
+            }];
+
+            assert_eq!(
+                format_pane_list(&panes),
+                "Panes in this tab:\n\n- id=1 pending_peer_messages=0\n  geometry: x=0 y=0 width=80 height=24\n"
+            );
+        }
     }
 
     #[test]

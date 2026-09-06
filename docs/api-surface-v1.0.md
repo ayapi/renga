@@ -158,7 +158,8 @@ from `RENGA_PANE_ID`) and surfaced as `summary` on every `PaneInfo` /
 `PeerInfo` entry returned by `list_panes` and `list_peers`. Storage is
 in-memory only — does not persist across renga restarts.
 In the text rendering, a present summary appears as a `summary:` line after
-`cwd:`.
+`cwd:`. That line replaces CR and LF characters with spaces and omits a
+whitespace-only summary; the `summary` value carried by IPC remains unchanged.
 
 - An empty string clears the summary (round-trips to `Option::None` /
   omitted key on the wire).
@@ -582,7 +583,9 @@ in `peer_list` data):
 hidden from cross-pane callers).
 
 The MCP text renderings for `list_panes` and `list_peers` print a present
-`summary` as a `summary:` line immediately after `cwd:`.
+`summary` as a `summary:` line immediately after `cwd:`. They replace CR and
+LF characters with spaces to keep the text on one line and omit whitespace-only
+summaries; the IPC `summary` value itself is unchanged.
 
 `pending_peer_messages` is the number of undelivered peer messages / nudges
 owned by that pane: `pending_peer_inbox[pane].len()` plus the live Draft,
@@ -803,6 +806,12 @@ specified in section 3.5.
   a major release because the structured result is unchanged, the mandatory
   immediate fresh-check instruction remains, and the newly described nudge is
   explicitly best-effort rather than a delivery guarantee.
+- Surfacing summaries in the `list_panes` and `list_peers` text output is an
+  intentional semantic change under `semver-policy.md` §3. It does not require
+  a major release because entries without a summary remain byte-identical (all
+  10 no-summary fixtures in the compatibility probe were unchanged), entries
+  with a summary gain only the additive line already documented in section
+  1.3, and no existing line is removed or renamed.
 - **Unknown `[code]` tokens**: treat as the equivalent of `internal`.
 
 These rules let renga add fields and variants additively without bumping the
