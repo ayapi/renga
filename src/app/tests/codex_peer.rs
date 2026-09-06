@@ -4859,6 +4859,43 @@ fn late_follower_ack_removes_requeued_delivery_before_ready_flush() {
 }
 
 #[test]
+fn late_requeued_ack_drops_stale_codex_nudge_after_kind_changes_to_claude() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (_sub_id, rx) = app.event_bus.subscribe();
+    let sender = app.ws().focused_pane_id;
+    let target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split");
+    for body in ["head", "codex-tail"] {
+        app.handle_peer_send(sender, &ipc::PaneRef::Id(target), body.into())
+            .unwrap();
+    }
+    app.handle_peer_set_ready(target, PeerClientKind::Codex, true)
+        .unwrap();
+    let delivery_ids = peer_delivery_ids(&rx, 2);
+    app.pending_peer_deliveries
+        .get_mut(&delivery_ids[0])
+        .unwrap()
+        .expires_at = Instant::now();
+    app.flush_pending_peer_deliveries();
+    app.handle_peer_register_client(target, PeerClientKind::Claude)
+        .unwrap();
+    app.handle_focus(&ipc::PaneRef::Id(sender)).unwrap();
+
+    app.handle_peer_inbox_ack(target, delivery_ids[1]).unwrap();
+
+    assert!(!app.pending_codex_peer_messages.contains_key(&target));
+    app.shutdown();
+}
+
+#[test]
 fn codex_reflush_assigns_the_nudge_only_to_the_current_fifo_tail() {
     let mut app = App::new(40, 80).expect("App::new");
     let (_sub_id, rx) = app.event_bus.subscribe();

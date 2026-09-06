@@ -57,6 +57,8 @@ values do not identify the same delivery. The only shared correlation data is
   subscription teardown has spent one IPC `RESPONSE_TIMEOUT` draining receipts.
   The current request may still finish on its detached IPC helper, while the
   sender discards the reported queued remainder before exiting.
+  If worker creation fails and mcp-peer falls back to synchronous receipts,
+  neither `peer_inbox_ack_queued` nor `peer_inbox_ack_drain_abandoned` is emitted.
 - `peer_receipt_cache_hit`: `delivery_id` when a repeated event is retained
   idempotently instead of being emitted a second time.
 
