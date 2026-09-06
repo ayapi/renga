@@ -894,12 +894,14 @@ fn prepare_deferred_push_ready_at(ctx: &PeerCtx, now: Instant) -> Option<Deferre
     state.ready_scheduled = true;
     let generation = state.ready_generation;
     drop(state);
-    log_push_lifecycle(ctx, "peer_set_ready_deferred", || {
-        json!({
-            "client_kind": kind_label(ctx.client_kind),
-            "delay_ms": delay.as_millis(),
-        })
-    });
+    if !delay.is_zero() {
+        log_push_lifecycle(ctx, "peer_set_ready_deferred", || {
+            json!({
+                "client_kind": kind_label(ctx.client_kind),
+                "delay_ms": delay.as_millis(),
+            })
+        });
+    }
     Some(DeferredPushReady { generation, delay })
 }
 
@@ -920,12 +922,24 @@ fn schedule_deferred_push_ready(ctx: &PeerCtx) {
     let Some(deferred) = prepare_deferred_push_ready_at(ctx, Instant::now()) else {
         return;
     };
+    if deferred.delay.is_zero() {
+        let publish_lock = ctx.ready_publish_lock.clone();
+        // Keep readiness publications ordered across the timer and subscriber
+        // threads so a stale true cannot follow a disconnect's false.
+        let _publish_guard = publish_lock.lock().unwrap_or_else(|lock| lock.into_inner());
+        if finish_deferred_push_ready(ctx, deferred) {
+            set_client_ready(ctx, true);
+        }
+        return;
+    }
     let deferred_ctx = ctx.clone();
     if let Err(error) = thread::Builder::new()
         .name("renga-mcp-peer-ready-delay".into())
         .spawn(move || {
             thread::sleep(deferred.delay);
             let publish_lock = deferred_ctx.ready_publish_lock.clone();
+            // The IPC runs under this lock so a disconnect cannot publish
+            // false and then be overwritten by this older timer's true.
             let _publish_guard = publish_lock.lock().unwrap_or_else(|lock| lock.into_inner());
             if finish_deferred_push_ready(&deferred_ctx, deferred) {
                 set_client_ready(&deferred_ctx, true);
@@ -942,6 +956,8 @@ fn schedule_deferred_push_ready(ctx: &PeerCtx) {
 
 fn revoke_push_ready(ctx: &PeerCtx) {
     let publish_lock = ctx.ready_publish_lock.clone();
+    // A disconnect may wait for an in-flight readiness IPC, but no live
+    // subscriber can lose work during this teardown-only wait.
     let _publish_guard = publish_lock.lock().unwrap_or_else(|lock| lock.into_inner());
     mark_push_subscribed(ctx, false);
     set_client_ready(ctx, false);
@@ -4316,7 +4332,7 @@ mod tests {
     fn deferred_ready_trace_records_delay_and_initialized_age() {
         let path = debug_test_path("ready-deferred");
         let (mut ctx, requests) =
-            connected_ctx_with_requests(PeerClientKind::Claude, Duration::ZERO);
+            connected_ctx_with_requests(PeerClientKind::Claude, Duration::from_millis(20));
         ctx.debug_log_path = Some(path.clone());
         mark_push_initialized_with(&ctx, |_| Ok(()));
         publish_ready_after_subscribe(&ctx);
@@ -4344,17 +4360,32 @@ mod tests {
                 .count(),
             1
         );
-        assert!(records
-            .iter()
-            .all(|record| record["action"] != "push_frame_buffered"));
         assert_eq!(deferred["client_kind"], "claude");
-        assert_eq!(deferred["delay_ms"], 0);
+        assert!(deferred["delay_ms"].as_u64().is_some_and(|delay| delay > 0));
         let sent = records
             .iter()
             .find(|record| record["action"] == "peer_set_ready_sent")
             .expect("sent trace");
         assert_eq!(sent["ready"], true);
         assert!(sent["initialized_age_ms"].is_number());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn elapsed_delay_publishes_synchronously_without_deferred_trace() {
+        let path = debug_test_path("ready-elapsed");
+        let (mut ctx, requests) =
+            connected_ctx_with_requests(PeerClientKind::Claude, Duration::ZERO);
+        ctx.debug_log_path = Some(path.clone());
+        mark_push_initialized_with(&ctx, |_| Ok(()));
+
+        publish_ready_after_subscribe(&ctx);
+
+        assert_eq!(ready_values(&requests), [true]);
+        let records = read_debug_records(&path);
+        assert!(records
+            .iter()
+            .all(|record| record["action"] != "peer_set_ready_deferred"));
         let _ = std::fs::remove_file(path);
     }
 

@@ -72,10 +72,12 @@ values do not identify the same delivery. The only shared correlation data is
   event subscription state changes.
 - `peer_set_ready_deferred`: `client_kind` and the remaining `delay_ms` when a
   push client has both initialized and subscribed but readiness publication is
-  deferred. It is written once per scheduled delay, not while polling.
+  deferred. It is written once per nonzero scheduled delay, not while polling;
+  an already elapsed delay publishes synchronously without this record.
 - `peer_set_ready_sent`: `client_kind`, `ready`, `initialized_age_ms`, `ok`, and
   `error` after mcp-peer sends App a readiness update. Push initialization and
   subscription produce `ready=true`; subscription loss produces `ready=false`.
+  `initialized_age_ms` is `null` when the process has not initialized yet.
 
 ### Claude startup onset measurements
 
@@ -100,7 +102,8 @@ During the delay, App retains messages in `pending_peer_inbox` and does not emit
 `PeerInbox`; the mcp-peer push buffer is not involved. A validating trace should
 therefore contain no delay-window `push_frame_buffered` record. If the event
 subscription ends before the timer fires, `ready=false` is sent immediately
-and the pending `ready=true` is cancelled.
+and the pending `ready=true` is cancelled. The App-side no-emission invariant is
+covered by `handle_peer_send_waits_for_target_peer_registration`.
 
 ### App-side ready queue timing
 
