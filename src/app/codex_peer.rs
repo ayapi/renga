@@ -397,8 +397,55 @@ pub(crate) fn codex_prompt_allows_peer_nudge_on_screen(screen: &vt100::Screen) -
 
 fn looks_like_codex_placeholder(text: &str) -> bool {
     let normalized = text.trim();
-    normalized.eq_ignore_ascii_case("Ask Codex anything...")
-        || normalized.eq_ignore_ascii_case("Ask Codex anything")
+    let without_trailing_ellipsis = normalized
+        .strip_suffix("...")
+        .or_else(|| normalized.strip_suffix('…'))
+        .unwrap_or(normalized)
+        .trim_end();
+    ["Ask Codex anything", "Ask Codex to do anything"]
+        .iter()
+        .any(|placeholder| without_trailing_ellipsis.eq_ignore_ascii_case(placeholder))
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::looks_like_codex_placeholder;
+
+    #[test]
+    fn recognizes_known_codex_placeholders_case_insensitively() {
+        for placeholder in [
+            "Ask Codex anything",
+            "Ask Codex anything...",
+            "Ask Codex anything…",
+            "Ask Codex to do anything",
+            "Ask Codex to do anything...",
+            "Ask Codex to do anything…",
+            "ASK CODEX ANYTHING",
+            "ask codex anything...",
+            "ASK CODEX TO DO ANYTHING",
+            "ask codex to do anything…",
+        ] {
+            assert!(
+                looks_like_codex_placeholder(placeholder),
+                "expected placeholder: {placeholder:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_placeholder_prompts_and_drafts() {
+        for text in [
+            "Ask me anything",
+            "Ask Codex",
+            "Ask Codex to refactor foo",
+            "Ask someone to do anything",
+        ] {
+            assert!(
+                !looks_like_codex_placeholder(text),
+                "expected real input: {text:?}"
+            );
+        }
+    }
 }
 
 fn screen_row_has_visible_text(screen: &vt100::Screen, row: u16, cols: u16) -> bool {

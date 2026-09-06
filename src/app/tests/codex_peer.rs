@@ -4307,6 +4307,32 @@ fn dim_codex_placeholder_is_not_a_draft() {
 }
 
 #[test]
+fn current_codex_placeholder_without_dim_is_not_a_draft() {
+    let mut parser = vt100::Parser::new(40, 80, 0);
+    parser.process(
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Ask Codex to do anything\x1b[3;1H  gpt-5.6-sol medium \xC2\xB7 cwd\x1b[3;20H",
+    );
+
+    assert_eq!(
+        codex_composer_has_draft_on_screen(parser.screen()),
+        Some(false)
+    );
+}
+
+#[test]
+fn similarly_worded_codex_draft_without_dim_remains_protected() {
+    let mut parser = vt100::Parser::new(40, 80, 0);
+    parser.process(
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Ask Codex to refactor foo\x1b[3;1H  gpt-5.6-sol medium \xC2\xB7 cwd\x1b[3;20H",
+    );
+
+    assert_eq!(
+        codex_composer_has_draft_on_screen(parser.screen()),
+        Some(true)
+    );
+}
+
+#[test]
 fn unknown_codex_placeholder_at_prompt_is_not_a_draft_without_dim() {
     let mut parser = vt100::Parser::new(40, 80, 0);
     parser.process(b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Write tests for @filename\x1b[1;3H");

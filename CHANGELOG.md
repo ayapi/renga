@@ -11,6 +11,10 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Fixed
 
+- **Codex's current composer placeholder is no longer mistaken for a draft.**
+  Placeholder recognition now covers `Ask Codex to do anything` without
+  classifying similarly worded user input as placeholder text. (renga-axa)
+
 - **Shell prompt and OSC 7 detection now handles non-CSI control strings and
   split reads.** The shell prompt latch strips OSC window-title and other
   non-CSI control strings so Git Bash without renga's setup hook, and any shell
