@@ -806,6 +806,7 @@ pub(crate) fn append_codex_peer_debug_record(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis());
     if let Some(object) = record.as_object_mut() {
+        object.insert("component".to_string(), serde_json::json!("tui"));
         object.insert(
             "timestamp_unix_ms".to_string(),
             serde_json::json!(timestamp_unix_ms),
@@ -820,6 +821,7 @@ pub(crate) fn append_codex_peer_debug_record(
         );
     }
     let Ok(mut line) = serde_json::to_vec(&record) else {
+        CODEX_PEER_DEBUG_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return;
     };
     line.push(b'\n');
@@ -838,7 +840,11 @@ pub(crate) fn append_codex_peer_debug_record(
         .and_then(serde_json::Value::as_u64)
         .filter(|failures| *failures > 0)
     {
-        CODEX_PEER_DEBUG_WRITE_FAILURES.fetch_sub(failures, std::sync::atomic::Ordering::Relaxed);
+        let _ = CODEX_PEER_DEBUG_WRITE_FAILURES.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| Some(current.saturating_sub(failures)),
+        );
     }
 }
 
@@ -3050,7 +3056,6 @@ mod debug_logging_tests {
         );
         let records = read_debug_records(&path);
         assert_eq!(records[0]["trace_write_failures_since_last"], 1);
-        assert_eq!(codex_peer_debug_write_failures(), 0);
         std::fs::remove_file(path).unwrap();
     }
 

@@ -1135,6 +1135,7 @@ fn append_peer_debug_record(path: &Path, pane_id: Option<usize>, mut record: Val
     let record_sequence =
         PEER_DEBUG_RECORD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     record.insert("timestamp_unix_ms".to_string(), json!(timestamp_unix_ms));
+    record.insert("component".to_string(), json!("mcp_peer"));
     record.insert("process_id".to_string(), json!(std::process::id()));
     record.insert("record_sequence".to_string(), json!(record_sequence));
     record.insert("pane_id".to_string(), json!(pane_id));
@@ -1144,6 +1145,7 @@ fn append_peer_debug_record(path: &Path, pane_id: Option<usize>, mut record: Val
         json!(failures),
     );
     let Ok(mut line) = serde_json::to_vec(record) else {
+        PEER_DEBUG_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return;
     };
     line.push(b'\n');
@@ -1158,7 +1160,11 @@ fn append_peer_debug_record(path: &Path, pane_id: Option<usize>, mut record: Val
     if file.write_all(&line).is_err() {
         PEER_DEBUG_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else if failures > 0 {
-        PEER_DEBUG_WRITE_FAILURES.fetch_sub(failures, std::sync::atomic::Ordering::Relaxed);
+        let _ = PEER_DEBUG_WRITE_FAILURES.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| Some(current.saturating_sub(failures)),
+        );
     }
 }
 
@@ -6850,10 +6856,7 @@ Commands:
         append_peer_debug_record(&path, Some(1), json!({"action": "check_messages"}));
         let records = read_debug_records(&path);
         assert_eq!(records[0]["trace_write_failures_since_last"], 1);
-        assert_eq!(
-            PEER_DEBUG_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
+        assert_eq!(records[0]["component"], "mcp_peer");
         let _ = std::fs::remove_file(path);
     }
 

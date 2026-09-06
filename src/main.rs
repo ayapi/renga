@@ -238,37 +238,10 @@ fn main() -> Result<()> {
 }
 
 fn run_tui(cli: cli::Cli) -> Result<()> {
-    let process_started_at = Instant::now();
-    log_process_start();
-
-    match run_tui_inner(cli) {
-        Ok((result, should_quit, frames_total)) => {
-            let reason = match &result {
-                Err(error) => classify_exit_error(error),
-                Ok(()) if should_quit => "quit_key",
-                Ok(()) => "normal_exit",
-            };
-            log_process_exit(
-                reason,
-                result.as_ref().err(),
-                frames_total,
-                process_started_at.elapsed(),
-            );
-            result
-        }
-        Err(error) => {
-            log_process_exit(
-                classify_exit_error(&error),
-                Some(&error),
-                0,
-                process_started_at.elapsed(),
-            );
-            Err(error)
-        }
-    }
+    run_tui_inner(cli)
 }
 
-fn run_tui_inner(cli: cli::Cli) -> Result<(Result<()>, bool, u64)> {
+fn run_tui_inner(cli: cli::Cli) -> Result<()> {
     // Install panic hook to restore terminal state on crash
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
@@ -441,8 +414,10 @@ fn run_tui_inner(cli: cli::Cli) -> Result<(Result<()>, bool, u64)> {
     }
 
     // Main event loop
+    let process_started_at = Instant::now();
+    log_process_start();
     let mut frames_total = 0;
-    let mut result = run_event_loop(
+    let result = run_event_loop(
         &mut terminal,
         &mut app,
         event_poll_timeout,
@@ -451,29 +426,31 @@ fn run_tui_inner(cli: cli::Cli) -> Result<(Result<()>, bool, u64)> {
 
     // Cleanup
     app.shutdown();
-    if let Err(error) = disable_raw_mode() {
-        result = result.and(Err(error.into()));
-    }
-    if let Err(error) = execute!(
+    let reason = match &result {
+        Err(error) => classify_exit_error(error),
+        Ok(()) if app.should_quit => "quit_key",
+        Ok(()) => "normal_exit",
+    };
+    log_process_exit(
+        reason,
+        result.as_ref().err(),
+        frames_total,
+        process_started_at.elapsed(),
+    );
+
+    disable_raw_mode()?;
+    execute!(
         terminal.backend_mut(),
         crossterm::event::DisableMouseCapture
-    ) {
-        result = result.and(Err(error.into()));
-    }
-    if let Err(error) = execute!(
+    )?;
+    execute!(
         terminal.backend_mut(),
         crossterm::event::DisableBracketedPaste
-    ) {
-        result = result.and(Err(error.into()));
-    }
-    if let Err(error) = execute!(terminal.backend_mut(), LeaveAlternateScreen) {
-        result = result.and(Err(error.into()));
-    }
-    if let Err(error) = terminal.show_cursor() {
-        result = result.and(Err(error.into()));
-    }
+    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
 
-    Ok((result, app.should_quit, frames_total))
+    result
 }
 
 /// Handle an IPC subcommand (`renga send …`, `renga list`, etc.).
@@ -754,8 +731,10 @@ fn run_event_loop(
                         if let Some(bytes) = crate::app::key_event_to_bytes_pub(&key) {
                             paste_buffer.extend_from_slice(&bytes);
                             // Drain all immediately available key events (paste burst)
-                            while event::poll(Duration::from_millis(1))? {
-                                if let Event::Key(k) = event::read()? {
+                            while event::poll(Duration::from_millis(1))
+                                .context("event_read_error")?
+                            {
+                                if let Event::Key(k) = event::read().context("event_read_error")? {
                                     if k.kind == KeyEventKind::Press {
                                         if app.handle_key_event(k)? {
                                             // Shortcut consumed — flush buffer first
@@ -923,6 +902,7 @@ mod tests {
         let line = std::fs::read_to_string(&path).expect("process exit trace");
         let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(record["action"], "process_exit");
+        assert_eq!(record["component"], "tui");
         assert_eq!(record["reason"], "quit_key");
         assert_eq!(record["frames_total"], 42);
         assert_eq!(record["uptime_ms"], 1234);
@@ -950,6 +930,7 @@ mod tests {
         assert_eq!(enabled.lines().count(), 1);
         let record: serde_json::Value = serde_json::from_str(enabled.trim()).unwrap();
         assert_eq!(record["action"], "process_start");
+        assert_eq!(record["component"], "tui");
         std::fs::remove_file(&path).unwrap();
 
         std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG");

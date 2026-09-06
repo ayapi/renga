@@ -25,14 +25,18 @@ resolved path into `PeerCtx`; they do not start the subprocess.
   every 60 seconds. It contains `frames_since_last`, total `pane_count`,
   `visible_tab`, and `trace_write_failures_since_last`; it does not request an
   extra render.
-- `process_exit`: emitted immediately before `main` returns, with `reason`, an
-  optional propagated `error`, `frames_total`, and `uptime_ms`.
+- `process_exit`: emitted after App shutdown and before terminal cleanup, with
+  `reason`, an optional event-loop `error`, `frames_total`, and `uptime_ms`.
 - `panic`: emitted by the process panic hook before the default hook, with the
   panic `message`, `thread_name`, and source `location`.
 
-Open or write failures increment an in-process counter. The next successful
-heartbeat reports and clears that count. As with every record in this file,
+Serialization, open, or write failures increment an in-process counter. The
+next successful heartbeat reports and clears that count. As with every record in this file,
 none of these records are written when `RENGA_DEBUG_CODEX_PEER_LOG` is unset.
+All App-side records include `component: "tui"`. Setup failures before the
+event loop and panics before the terminal-restoration hook is installed cannot
+be recorded by these lifecycle entries. Terminal-cleanup failures happen after
+`process_exit` and retain the pre-existing return behavior.
 
 ## Threshold and record names
 

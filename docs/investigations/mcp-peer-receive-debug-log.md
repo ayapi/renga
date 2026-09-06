@@ -26,8 +26,10 @@ values do not identify the same delivery. The only shared correlation data is
 `client_kind_resolved` also serves as the mcp-peer process-start identity
 record. It includes the package `version`, executable path and modification
 time, and an argument summary. Every successful mcp-peer record carries
-`trace_write_failures_since_last`; an open or write failure is counted and the
-next successful record reports and clears the count.
+`trace_write_failures_since_last`; a serialization, open, or write failure is
+counted and the next successful record reports and clears the count.
+The `component: "mcp_peer"` field distinguishes this process's counter and
+records from TUI records appended to the same file.
 
 ### `check_messages`
 
