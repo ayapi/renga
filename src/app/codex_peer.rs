@@ -1159,7 +1159,10 @@ impl App {
             self.next_peer_delivery_id = self.next_peer_delivery_id.saturating_add(1).max(1);
             delivery_id
         });
-        let nudge = message.requeued_nudge.take().or(nudge);
+        // Readiness flushes recompute which single tail message should carry a
+        // Codex nudge. A preserved nudge is only for an ack that arrives while
+        // the message is still back in the pre-registration queue.
+        message.requeued_nudge = None;
         let now = Instant::now();
         self.pending_peer_deliveries.insert(
             delivery_id,
@@ -1256,7 +1259,9 @@ impl App {
                 self.pending_peer_inbox.remove(&pane_id);
             }
             if let Some(mut message) = requeued {
-                let nudge = message.requeued_nudge.take();
+                let nudge = (self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex))
+                    .then(|| message.requeued_nudge.take())
+                    .flatten();
                 message.requeued_delivery_id = None;
                 let _ = self.finish_confirmed_peer_delivery(pane_id, message, nudge);
             }
@@ -1387,6 +1392,9 @@ impl App {
     }
 
     pub(crate) fn flush_pending_peer_deliveries(&mut self) {
+        if self.pending_peer_deliveries.is_empty() {
+            return;
+        }
         let now = Instant::now();
         let heads_by_pane = self.pending_peer_delivery_heads();
         let mut expired: Vec<u64> = self
@@ -1469,7 +1477,6 @@ impl App {
         }
 
         let heads_by_pane = self.pending_peer_delivery_heads();
-        let debug_log_path = codex_peer_debug_log_path();
         let mut retries = Vec::new();
         for (id, pending) in &mut self.pending_peer_deliveries {
             if now < pending.next_retry_at {
@@ -1482,6 +1489,7 @@ impl App {
             if *id != head_delivery_id {
                 if !pending.retry_blocked_behind_head {
                     pending.retry_blocked_behind_head = true;
+                    let debug_log_path = codex_peer_debug_log_path();
                     log_peer_delivery_record(debug_log_path.as_deref(), || {
                         serde_json::json!({
                             "action": "peer_delivery_retry_blocked_behind_head",
@@ -1495,6 +1503,7 @@ impl App {
             }
             pending.retry_blocked_behind_head = false;
             pending.next_retry_at = now + PEER_INBOX_ACK_RETRY_INTERVAL;
+            let debug_log_path = codex_peer_debug_log_path();
             log_peer_delivery_record(debug_log_path.as_deref(), || {
                 serde_json::json!({
                     "action": "peer_delivery_retry_emitted",
@@ -2766,7 +2775,7 @@ mod debug_logging_tests {
             .unwrap_or_else(|error| error.into_inner());
         let path = debug_test_path("delivery-disabled");
         let _env_restore = EnvVarRestore::set("RENGA_DEBUG_CODEX_PEER_LOG", path.as_os_str());
-        set_codex_peer_debug_log_path_test_override(Some(Some(path.as_os_str().to_owned())));
+        set_codex_peer_debug_log_path_test_override(None);
         let mut enabled = App::new(40, 80).expect("App::new");
         let enabled_sender = enabled.workspaces[enabled.active_tab].focused_pane_id;
         let enabled_target = enabled
@@ -2789,11 +2798,21 @@ mod debug_logging_tests {
         enabled
             .handle_peer_set_ready(enabled_target, PeerClientKind::Claude, true)
             .expect("flush peer message");
+        enabled
+            .pending_peer_deliveries
+            .values_mut()
+            .next()
+            .expect("pending delivery")
+            .next_retry_at = Instant::now();
+        enabled.flush_pending_peer_deliveries();
         enabled.shutdown();
         assert!(
             path.exists(),
             "enabled production paths must write the file"
         );
+        assert!(read_debug_records(&path)
+            .iter()
+            .any(|record| record["action"] == "peer_delivery_retry_emitted"));
         std::fs::remove_file(&path).expect("remove enabled debug JSONL");
 
         set_codex_peer_debug_log_path_test_override(Some(None));
@@ -2819,6 +2838,13 @@ mod debug_logging_tests {
         disabled
             .handle_peer_set_ready(disabled_target, PeerClientKind::Claude, true)
             .expect("flush peer message");
+        disabled
+            .pending_peer_deliveries
+            .values_mut()
+            .next()
+            .expect("pending delivery")
+            .next_retry_at = Instant::now();
+        disabled.flush_pending_peer_deliveries();
         disabled.shutdown();
         assert!(!path.exists());
     }

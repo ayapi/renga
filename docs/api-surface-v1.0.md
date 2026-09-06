@@ -694,6 +694,11 @@ semantic change under the policy in `docs/semver-policy.md` section 3: the same
 documented `Queued` outcome and later delivery remain in effect; only the
 private lifecycle announcement time changes.
 
+After an unconfirmed queue flush is retained for retry, a later flush reuses
+the original `delivery_id`; ids therefore need not increase monotonically in
+event emission order. Receivers remain safe by deduplicating `delivery_id` as
+specified in section 3.5.
+
 - **Unknown event `type` tags**: ignore, do not abort the stream.
 - **Unknown IPC Request `cmd` tags**: the server returns a `parse` error and
   closes only that one-request connection. Clients must treat any rejection or

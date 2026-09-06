@@ -39,7 +39,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc, Arc, Condvar, Mutex,
 };
 use std::thread;
@@ -211,11 +211,14 @@ fn acknowledge_peer_inbox(ctx: &PeerCtx, delivery_id: u64) {
     log_peer_inbox_ack_sent(path, *pane_id, delivery_id, ok, error.as_deref());
 }
 
-#[derive(Clone)]
 struct PeerInboxAckQueue {
     sender: mpsc::Sender<u64>,
     depth: Arc<AtomicUsize>,
+    in_flight: Arc<AtomicBool>,
+    cancel_drain: Arc<AtomicBool>,
     ctx: PeerCtx,
+    handle: thread::JoinHandle<()>,
+    done: mpsc::Receiver<()>,
 }
 
 impl PeerInboxAckQueue {
@@ -243,25 +246,146 @@ impl PeerInboxAckQueue {
             ));
         }
     }
+
+    fn finish(self) {
+        self.finish_with_timeout(ipc::RESPONSE_TIMEOUT);
+    }
+
+    fn finish_with_timeout(self, timeout: Duration) {
+        let PeerInboxAckQueue {
+            sender,
+            depth,
+            in_flight,
+            cancel_drain,
+            ctx,
+            handle,
+            done,
+        } = self;
+        drop(sender);
+        match done.recv_timeout(timeout) {
+            Ok(()) => {
+                if handle.join().is_err() {
+                    log_stderr("peer inbox receipt sender panicked while draining");
+                }
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = handle.join();
+                log_stderr("peer inbox receipt sender stopped before reporting drain completion");
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        cancel_drain.store(true, Ordering::Release);
+        let dropped_count = depth.load(Ordering::Acquire);
+        let pending_count = dropped_count + usize::from(in_flight.load(Ordering::Acquire));
+        if let Some(path) = ctx.debug_log_path.as_deref() {
+            let pane_id = match &ctx.mode {
+                Mode::Connected { pane_id, .. } => Some(*pane_id),
+                Mode::Detached { .. } => None,
+            };
+            append_peer_debug_record(
+                path,
+                pane_id,
+                json!({
+                    "action": "peer_inbox_ack_drain_abandoned",
+                    "pending_count": pending_count,
+                    "dropped_count": dropped_count,
+                }),
+            );
+        }
+        log_stderr(&format!(
+            "peer inbox receipt drain exceeded {:?}; dropping {dropped_count} queued receipt(s)",
+            timeout
+        ));
+        drop(handle);
+    }
+
+    #[cfg(test)]
+    fn depth(&self) -> usize {
+        self.depth.load(Ordering::Acquire)
+    }
 }
 
-fn spawn_peer_inbox_ack_sender(ctx: PeerCtx) -> (PeerInboxAckQueue, thread::JoinHandle<()>) {
+enum PeerInboxAckSender {
+    Async(PeerInboxAckQueue),
+    Sync(PeerCtx),
+}
+
+impl PeerInboxAckSender {
+    fn enqueue(&self, delivery_id: u64) {
+        match self {
+            Self::Async(queue) => queue.enqueue(delivery_id),
+            Self::Sync(ctx) => acknowledge_peer_inbox(ctx, delivery_id),
+        }
+    }
+
+    fn finish(self) {
+        if let Self::Async(queue) = self {
+            queue.finish();
+        }
+    }
+
+    #[cfg(test)]
+    fn finish_with_timeout(self, timeout: Duration) {
+        if let Self::Async(queue) = self {
+            queue.finish_with_timeout(timeout);
+        }
+    }
+
+    #[cfg(test)]
+    fn depth(&self) -> usize {
+        match self {
+            Self::Async(queue) => queue.depth(),
+            Self::Sync(_) => 0,
+        }
+    }
+}
+
+fn spawn_peer_inbox_ack_sender(ctx: PeerCtx) -> PeerInboxAckSender {
     let (sender, receiver) = mpsc::channel();
+    let (done_tx, done) = mpsc::channel();
     let depth = Arc::new(AtomicUsize::new(0));
+    let in_flight = Arc::new(AtomicBool::new(false));
+    let cancel_drain = Arc::new(AtomicBool::new(false));
     let worker_depth = depth.clone();
+    let worker_in_flight = in_flight.clone();
+    let worker_cancel_drain = cancel_drain.clone();
     let worker_ctx = ctx.clone();
-    let handle = thread::Builder::new()
+    let spawn_result = thread::Builder::new()
         .name("renga-mcp-peer-ack".into())
         .spawn(move || {
-            // Once all senders are dropped, recv still drains everything
-            // already queued, preserving receipt order during teardown.
             while let Ok(delivery_id) = receiver.recv() {
                 worker_depth.fetch_sub(1, Ordering::AcqRel);
+                worker_in_flight.store(true, Ordering::Release);
                 acknowledge_peer_inbox(&worker_ctx, delivery_id);
+                worker_in_flight.store(false, Ordering::Release);
+                if worker_cancel_drain.load(Ordering::Acquire) {
+                    let dropped = receiver.try_iter().count();
+                    worker_depth.fetch_sub(dropped, Ordering::AcqRel);
+                    break;
+                }
             }
-        })
-        .expect("spawn peer inbox ack sender");
-    (PeerInboxAckQueue { sender, depth, ctx }, handle)
+            let _ = done_tx.send(());
+        });
+    match spawn_result {
+        Ok(handle) => PeerInboxAckSender::Async(PeerInboxAckQueue {
+            sender,
+            depth,
+            in_flight,
+            cancel_drain,
+            ctx,
+            handle,
+            done,
+        }),
+        Err(error) => {
+            log_stderr(&format!(
+                "failed to spawn peer inbox receipt sender: {error}; using synchronous receipts"
+            ));
+            PeerInboxAckSender::Sync(ctx)
+        }
+    }
 }
 
 fn request_codex_renudge_after_ack(
@@ -3797,6 +3921,79 @@ fn stdio_loop(ctx: &PeerCtx) -> Result<()> {
 
 // ── event bus subscriber (background thread) ──────────────────
 
+fn handle_peer_subscription_event(
+    registration_ctx: &PeerCtx,
+    ack_sender: &PeerInboxAckSender,
+    receipt_cache: &mut PeerReceiptCache,
+    inbox: &InboxSink,
+    client_kind: PeerClientKind,
+    pane_id: usize,
+    event: ipc::Event,
+) -> Option<ipc::Event> {
+    let ipc::Event::PeerInbox {
+        delivery_id,
+        target_pane,
+        from_pane,
+        from_name,
+        from_kind,
+        body,
+        ts_ms,
+    } = event
+    else {
+        return Some(event);
+    };
+    if target_pane != pane_id {
+        return None;
+    }
+    let debug_metadata = registration_ctx.debug_log_path.as_ref().map(|_| {
+        (
+            delivery_id.is_some_and(|id| receipt_cache.contains(id)),
+            body.len(),
+        )
+    });
+    let retained = retain_peer_delivery_once(receipt_cache, delivery_id, || {
+        if client_kind.receive_mode() == ipc::PeerReceiveMode::Pull {
+            queue_pull_message(
+                inbox,
+                QueuedPeerMessage {
+                    from_id: from_pane.to_string(),
+                    from_name: from_name.clone(),
+                    from_kind,
+                    body: body.clone(),
+                    sent_at: ts_ms_to_string(ts_ms),
+                },
+            );
+            true
+        } else {
+            let note = channel_notification(&body, &from_pane.to_string(), from_name.as_deref());
+            deliver_push_frame(registration_ctx, note, delivery_id, "peer_inbox")
+        }
+    });
+    if let Some((receipt_cache_hit, body_len)) = debug_metadata {
+        let inbox_len_after = inbox
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .messages
+            .len();
+        log_peer_inbox_received(
+            registration_ctx,
+            delivery_id,
+            from_pane,
+            body_len,
+            inbox_len_after,
+        );
+        if receipt_cache_hit {
+            log_peer_receipt_cache_hit(registration_ctx, delivery_id);
+        }
+    }
+    if retained {
+        if let Some(delivery_id) = delivery_id {
+            ack_sender.enqueue(delivery_id);
+        }
+    }
+    None
+}
+
 /// Subscribe to renga's event bus and push any [`ipc::Event::PeerInbox`]
 /// whose `target_pane` matches our own pane id as a
 /// `notifications/claude/channel` frame on stdout. The thread is
@@ -3819,8 +4016,7 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
             let mut receipt_cache = PeerReceiptCache::default();
             loop {
                 let attempt_started = Instant::now();
-                let (ack_queue, ack_handle) =
-                    spawn_peer_inbox_ack_sender(registration_ctx.clone());
+                let ack_sender = spawn_peer_inbox_ack_sender(registration_ctx.clone());
                 let subscribed = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let subscribed_on_ready = subscribed.clone();
                 let result = client::subscribe_peer_events_with_ready(
@@ -3853,69 +4049,18 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                         )),
                     }
                 }
-                match event {
-                    ipc::Event::PeerInbox {
-                        delivery_id,
-                        target_pane,
-                        from_pane,
-                        from_name,
-                        from_kind,
-                        body,
-                        ts_ms,
-                    } if target_pane == pane_id => {
-                        let debug_metadata = registration_ctx.debug_log_path.as_ref().map(|_| {
-                            (
-                                delivery_id.is_some_and(|id| receipt_cache.contains(id)),
-                                body.len(),
-                            )
-                        });
-                        let retained = retain_peer_delivery_once(&mut receipt_cache, delivery_id, || {
-                            if client_kind.receive_mode() == ipc::PeerReceiveMode::Pull {
-                                queue_pull_message(&inbox, QueuedPeerMessage {
-                                    from_id: from_pane.to_string(),
-                                    from_name: from_name.clone(),
-                                    from_kind,
-                                    body: body.clone(),
-                                    sent_at: ts_ms_to_string(ts_ms),
-                                });
-                                true
-                            } else {
-                                let note = channel_notification(
-                                    &body,
-                                    &from_pane.to_string(),
-                                    from_name.as_deref(),
-                                );
-                                deliver_push_frame(
-                                    &registration_ctx,
-                                    note,
-                                    delivery_id,
-                                    "peer_inbox",
-                                )
-                            }
-                        });
-                        if let Some((receipt_cache_hit, body_len)) = debug_metadata {
-                            let inbox_len_after = inbox
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .messages
-                                .len();
-                            log_peer_inbox_received(
-                                &registration_ctx,
-                                delivery_id,
-                                from_pane,
-                                body_len,
-                                inbox_len_after,
-                            );
-                            if receipt_cache_hit {
-                                log_peer_receipt_cache_hit(&registration_ctx, delivery_id);
-                            }
-                        }
-                        if retained {
-                            if let Some(delivery_id) = delivery_id {
-                                ack_queue.enqueue(delivery_id);
-                            }
-                        }
-                    }
+                let Some(event) = handle_peer_subscription_event(
+                    &registration_ctx,
+                    &ack_sender,
+                    &mut receipt_cache,
+                    &inbox,
+                    client_kind,
+                    pane_id,
+                    event,
+                ) else {
+                    return true;
+                };
+                if let ipc::Event::EventsDropped { count, .. } = event {
                     // The EventBus bounds each subscriber at 256 events
                     // and drops new events for slow consumers, reporting
                     // the gap via EventsDropped. If this thread couldn't
@@ -3923,7 +4068,6 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                     // lost — surface that as a channel notice so Claude
                     // knows to ask the peer to resend instead of
                     // assuming all is well.
-                    ipc::Event::EventsDropped { count, .. } => {
                         log_stderr(&format!(
                             "event bus dropped {count} event(s) due to slow subscriber"
                         ));
@@ -3947,18 +4091,12 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                                 "events_dropped",
                             );
                         }
-                    }
-                    // PaneStarted / PaneExited / Heartbeat / other
-                    // PeerInbox not addressed to us: intentionally
-                    // ignored for channel-push purposes. Lifecycle
-                    // variants were already buffered above for
-                    // poll_events to surface.
-                    _ => {}
                 }
                     true
                 },
             );
                 let was_subscribed = subscribed.load(std::sync::atomic::Ordering::Acquire);
+                let attempt_elapsed = attempt_started.elapsed();
                 if was_subscribed {
                     if registration_ctx.client_kind.receive_mode() == ipc::PeerReceiveMode::Push {
                         revoke_push_ready(&registration_ctx);
@@ -3966,15 +4104,12 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                         set_client_ready(&registration_ctx, false);
                     }
                 }
-                drop(ack_queue);
-                if ack_handle.join().is_err() {
-                    log_stderr("peer inbox receipt sender panicked while draining");
-                }
+                ack_sender.finish();
                 (consecutive_failures, retry_delay) = subscription_retry_state_after_attempt(
                     consecutive_failures,
                     retry_delay,
                     was_subscribed,
-                    attempt_started.elapsed(),
+                    attempt_elapsed,
                 );
                 if was_subscribed {
                     consecutive_failures = consecutive_failures.saturating_add(1);
@@ -6814,18 +6949,17 @@ Commands:
         // Holding the request sink makes the worker block inside the first
         // IPC attempt while the subscriber-facing queue remains available.
         let request_guard = requests.lock().unwrap();
-        let (queue, handle) = spawn_peer_inbox_ack_sender(ctx);
-        queue.enqueue(71);
+        let sender = spawn_peer_inbox_ack_sender(ctx);
+        sender.enqueue(71);
         let deadline = Instant::now() + Duration::from_secs(1);
-        while queue.depth.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+        while sender.depth() != 0 && Instant::now() < deadline {
             thread::yield_now();
         }
-        assert_eq!(queue.depth.load(Ordering::Acquire), 0);
-        queue.enqueue(72);
-        assert_eq!(queue.depth.load(Ordering::Acquire), 1);
+        assert_eq!(sender.depth(), 0);
+        sender.enqueue(72);
+        assert_eq!(sender.depth(), 1);
         drop(request_guard);
-        drop(queue);
-        handle.join().expect("ack sender drains on disconnect");
+        sender.finish();
 
         let delivery_ids = requests
             .lock()
@@ -6852,6 +6986,98 @@ Commands:
                 .count(),
             2
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn peer_inbox_subscription_path_consumes_next_event_while_ack_ipc_is_blocked() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
+        ctx.request_sink = Some(requests.clone());
+        ctx.request_sink_response = Some(Response::ok_unit());
+        let inbox = ctx.inbox.clone();
+        let request_guard = requests.lock().unwrap();
+        let ack_sender = spawn_peer_inbox_ack_sender(ctx.clone());
+        let (processed_tx, processed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut receipt_cache = PeerReceiptCache::default();
+            for delivery_id in [71, 72] {
+                assert!(handle_peer_subscription_event(
+                    &ctx,
+                    &ack_sender,
+                    &mut receipt_cache,
+                    &inbox,
+                    PeerClientKind::Codex,
+                    1,
+                    ipc::Event::PeerInbox {
+                        delivery_id: Some(delivery_id),
+                        target_pane: 1,
+                        from_pane: 9,
+                        from_name: Some("sender".into()),
+                        from_kind: Some(PeerClientKind::Claude),
+                        body: format!("message-{delivery_id}"),
+                        ts_ms: delivery_id,
+                    },
+                )
+                .is_none());
+            }
+            let _ = processed_tx.send(());
+            let _ = release_rx.recv();
+            ack_sender.finish();
+            inbox
+        });
+
+        let processed_while_ack_blocked = processed_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_ok();
+        drop(request_guard);
+        let _ = release_tx.send(());
+        let inbox = worker.join().expect("subscription event worker");
+
+        assert!(
+            processed_while_ack_blocked,
+            "subscription path blocked on acknowledgement IPC"
+        );
+        assert_eq!(
+            inbox
+                .lock()
+                .unwrap_or_else(|messages| messages.into_inner())
+                .messages
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn peer_inbox_ack_teardown_caps_drain_and_records_dropped_queue_depth() {
+        let path = debug_test_path("ack-drain-cap");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = connected_ctx_with_debug_log(path.clone());
+        ctx.request_sink = Some(requests.clone());
+        ctx.request_sink_response = Some(Response::ok_unit());
+        let request_guard = requests.lock().unwrap();
+        let sender = spawn_peer_inbox_ack_sender(ctx);
+        sender.enqueue(71);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while sender.depth() != 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        sender.enqueue(72);
+        sender.enqueue(73);
+
+        sender.finish_with_timeout(Duration::from_millis(20));
+
+        let records = read_debug_records(&path);
+        let abandoned = records
+            .iter()
+            .find(|record| record.get("action") == Some(&json!("peer_inbox_ack_drain_abandoned")))
+            .expect("drain abandonment trace");
+        assert_eq!(abandoned.get("pending_count"), Some(&json!(3)));
+        assert_eq!(abandoned.get("dropped_count"), Some(&json!(2)));
+        drop(request_guard);
+        wait_for_request_count(&requests, 1);
+        thread::sleep(Duration::from_millis(10));
         let _ = std::fs::remove_file(path);
     }
 

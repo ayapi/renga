@@ -4859,6 +4859,49 @@ fn late_follower_ack_removes_requeued_delivery_before_ready_flush() {
 }
 
 #[test]
+fn codex_reflush_assigns_the_nudge_only_to_the_current_fifo_tail() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (_sub_id, rx) = app.event_bus.subscribe();
+    let sender = app.ws().focused_pane_id;
+    let target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split");
+    for body in ["old-head", "old-tail"] {
+        app.handle_peer_send(sender, &ipc::PaneRef::Id(target), body.into())
+            .unwrap();
+    }
+    app.handle_peer_set_ready(target, PeerClientKind::Codex, true)
+        .unwrap();
+    let delivery_ids = peer_delivery_ids(&rx, 2);
+    app.pending_peer_deliveries
+        .get_mut(&delivery_ids[0])
+        .unwrap()
+        .expires_at = Instant::now();
+    app.flush_pending_peer_deliveries();
+    app.handle_peer_send(sender, &ipc::PaneRef::Id(target), "new-tail".into())
+        .unwrap();
+
+    app.handle_peer_set_ready(target, PeerClientKind::Codex, true)
+        .unwrap();
+
+    let nudged = app
+        .pending_peer_deliveries
+        .values()
+        .filter(|pending| pending.nudge.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(nudged.len(), 1);
+    assert_eq!(nudged[0].message.body, "new-tail");
+    app.shutdown();
+}
+
+#[test]
 fn expired_flush_head_leaves_direct_follower_pending_for_its_own_deadline() {
     let mut app = App::new(40, 80).expect("App::new");
     let (_sub_id, rx) = app.event_bus.subscribe();

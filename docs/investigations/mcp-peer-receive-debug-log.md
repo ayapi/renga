@@ -53,6 +53,10 @@ values do not identify the same delivery. The only shared correlation data is
   thread hands a receipt to its dedicated sender. The sender performs blocking
   IPC outside the subscription thread, preserves order, and drains queued
   receipts when a subscription attempt disconnects before it exits.
+- `peer_inbox_ack_drain_abandoned`: `pending_count` and `dropped_count` when
+  subscription teardown has spent one IPC `RESPONSE_TIMEOUT` draining receipts.
+  The current request may still finish on its detached IPC helper, while the
+  sender discards the reported queued remainder before exiting.
 - `peer_receipt_cache_hit`: `delivery_id` when a repeated event is retained
   idempotently instead of being emitted a second time.
 
@@ -149,7 +153,8 @@ timestamps. A direct caller's four-second deadline is never extended, including
 when it joins an already in-flight queue-origin delivery.
 In mcp-peer, a dedicated FIFO sender performs acknowledgements so the
 subscription thread immediately resumes event consumption. A subscription
-disconnect closes the sender and waits while already queued receipts drain.
+disconnect closes the sender and lets already queued receipts drain for at most
+one IPC `RESPONSE_TIMEOUT`; after that it records and discards the queued tail.
 
 If a queue-origin head expires, App marks the pane unready and restores all
 queue-origin followers to the pre-registration FIFO at once. A follower with a
