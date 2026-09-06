@@ -80,7 +80,9 @@ the frame threshold.
   byte/line counts distinguishes a full reread after a path change from an
   ordinary incremental read.
 - `claude_monitor_last_mtime_changed`: number of panes where the selected
-  transcript's metadata modification time differed from the prior check.
+  transcript's metadata modification time differed from the prior check. A
+  zero value is the per-frame signal that no checked transcript had been
+  appended since its preceding check.
 - `events_drained`: all `AppEvent` values drained in the iteration.
 - `pty_output_events`: the subset of drained events carrying PTY output.
 - `ipc_commands`: processed commands with `command`, resolved `pane_id`,
@@ -113,12 +115,17 @@ sum. For image previews,
 this uses the read-only API exposed by ratatui-image 10.0.6 rather than an
 estimate from elapsed time.
 
+For Claude monitoring, first look for frames with a large
+`claude_monitor_bytes_read`. If `claude_monitor_path_changes` is at least one
+in the same frame, the monitor selected a different transcript and performed
+a full reread; zero path changes means an incremental read. Runs of zero-byte
+records are not abnormal: they only mean no large read occurred in those
+frames, and this log emits only frames that exceed the overall time budget.
+
 When a frame does not draw because `app.dirty` is false, `preview_kind` remains
 `"none"`, `sidebar_visible` remains false, and `preview_area` remains zero.
 Such records have `render_breakdown_ms.draw == 0` and an empty
-`draw_ms_by_component` map. On NTFS, modification-time updates for a transcript
-that remains open may be delayed until a later flush or handle close, so the
-monitor's metadata check may not observe every incremental write immediately.
+`draw_ms_by_component` map.
 
 Parser-lock acquisition in `keyboard_input.rs` (lines 515 and 664),
 `pointer_input.rs` (line 181), and the user-input-only scroll methods in
