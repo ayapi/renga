@@ -167,8 +167,8 @@ impl App {
                 );
                 let _ = reply.send(result);
             }
-            AppCommand::PeerSubscriberGone { pane_id } => {
-                self.handle_peer_subscriber_gone(pane_id);
+            AppCommand::PeerSubscriberGone { pane_id, detail } => {
+                self.handle_peer_subscriber_gone(pane_id, detail);
             }
             AppCommand::SetPaneIdentity {
                 target,

@@ -4527,7 +4527,7 @@ fn subscriber_gone_revokes_pull_and_push_readiness_without_erasing_kind() {
             .expect("peer readiness");
         assert!(app.peer_delivery_ready.contains(&pane_id));
 
-        app.handle_peer_subscriber_gone(pane_id);
+        app.handle_peer_subscriber_gone(pane_id, "event_bus_closed");
 
         assert!(!app.peer_delivery_ready.contains(&pane_id));
         assert_eq!(app.peer_client_kinds.get(&pane_id), Some(&kind));
@@ -5245,7 +5245,7 @@ fn subscriber_disconnect_never_reports_delivered() {
         reply_tx,
     );
     let _ = peer_delivery_id(&rx);
-    app.handle_peer_subscriber_gone(target);
+    app.handle_peer_subscriber_gone(target, "event_bus_closed");
     let error = reply_rx
         .recv_timeout(Duration::from_secs(1))
         .unwrap()
@@ -5405,7 +5405,7 @@ fn assert_one_loss_notice(
 #[test]
 fn subscriber_gone_timeout_reports_each_unconsumed_codex_handover() {
     let (mut app, sender, target, delivery_id, rx) = retain_one_codex_handover();
-    app.handle_peer_subscriber_gone(target);
+    app.handle_peer_subscriber_gone(target, "event_bus_closed");
     assert!(rx
         .try_iter()
         .all(|event| !matches!(event, ipc::Event::PeerMessageLost { .. })));
@@ -5453,7 +5453,7 @@ fn empty_reconcile_after_reregister_reports_each_unconsumed_codex_handover() {
 #[test]
 fn reconnect_reconcile_with_held_message_sends_no_loss_notice() {
     let (mut app, _sender, target, delivery_id, rx) = retain_one_codex_handover();
-    app.handle_peer_subscriber_gone(target);
+    app.handle_peer_subscriber_gone(target, "event_bus_closed");
     app.handle_peer_register_client(target, PeerClientKind::Codex)
         .unwrap();
     app.handle_peer_inbox_reconcile(target, &[delivery_id], &[], 0, 0)
@@ -5469,7 +5469,7 @@ fn reconnect_reconcile_with_held_message_sends_no_loss_notice() {
 #[test]
 fn reconnect_reconcile_with_unreported_consumed_sends_no_loss_notice() {
     let (mut app, _sender, target, delivery_id, rx) = retain_one_codex_handover();
-    app.handle_peer_subscriber_gone(target);
+    app.handle_peer_subscriber_gone(target, "event_bus_closed");
     app.handle_peer_register_client(target, PeerClientKind::Codex)
         .unwrap();
     app.handle_peer_inbox_reconcile(target, &[], &[delivery_id], 0, 0)
@@ -5539,7 +5539,7 @@ fn reconcile_does_not_classify_current_generation_delivery_as_lost() {
 #[test]
 fn reregister_cancels_disconnect_deadline_even_without_reconcile() {
     let (mut app, _sender, target, _delivery_id, rx) = retain_one_codex_handover();
-    app.handle_peer_subscriber_gone(target);
+    app.handle_peer_subscriber_gone(target, "event_bus_closed");
     assert!(app.peer_handover_disconnect_deadlines.contains_key(&target));
     app.handle_peer_register_client(target, PeerClientKind::Codex)
         .unwrap();
@@ -5628,7 +5628,7 @@ fn pane_close_does_not_report_unconfirmed_push_delivery_as_lost() {
 fn consumed_codex_handover_does_not_report_loss() {
     let (mut app, _sender, target, delivery_id, rx) = retain_one_codex_handover();
     app.handle_peer_inbox_consumed(target, delivery_id).unwrap();
-    app.handle_peer_subscriber_gone(target);
+    app.handle_peer_subscriber_gone(target, "event_bus_closed");
     assert!(rx
         .try_iter()
         .all(|event| !matches!(event, ipc::Event::PeerMessageLost { .. })));

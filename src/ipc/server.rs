@@ -99,9 +99,12 @@ impl PeerSubscriptionRegistry {
         on_last();
     }
 
-    fn unregister(&self, pane_id: usize, command_tx: &Sender<AppCommand>) {
+    fn unregister(&self, pane_id: usize, command_tx: &Sender<AppCommand>, detail: &'static str) {
         self.unregister_with(pane_id, || {
-            let _ = enqueue_app_command(command_tx, AppCommand::PeerSubscriberGone { pane_id });
+            let _ = enqueue_app_command(
+                command_tx,
+                AppCommand::PeerSubscriberGone { pane_id, detail },
+            );
         });
     }
 }
@@ -372,7 +375,14 @@ fn begin_subscription<W: Write>(
         peer_subscriptions.register(pane_id);
     }
     if let Err(e) = write_response_line(sink, &Response::Subscribed) {
-        end_subscription(event_bus, sub_id, pane_id, peer_subscriptions, command_tx);
+        end_subscription(
+            event_bus,
+            sub_id,
+            pane_id,
+            peer_subscriptions,
+            command_tx,
+            "subscribed_ack_write_error",
+        );
         return Err(e);
     }
     Ok((sub_id, rx))
@@ -400,13 +410,14 @@ fn stream_events(
     peer_subscriptions: PeerSubscriptionRegistry,
     command_tx: Sender<AppCommand>,
 ) -> Result<()> {
-    stream_events_inner(conn, rx, HEARTBEAT_INTERVAL);
+    let detail = stream_events_inner(conn, rx, HEARTBEAT_INTERVAL);
     end_subscription(
         &event_bus,
         sub_id,
         pane_id,
         &peer_subscriptions,
         &command_tx,
+        detail,
     );
     Ok(())
 }
@@ -417,10 +428,11 @@ fn end_subscription(
     pane_id: Option<usize>,
     peer_subscriptions: &PeerSubscriptionRegistry,
     command_tx: &Sender<AppCommand>,
+    detail: &'static str,
 ) {
     event_bus.unsubscribe(sub_id);
     if let Some(pane_id) = pane_id {
-        peer_subscriptions.unregister(pane_id, command_tx);
+        peer_subscriptions.unregister(pane_id, command_tx, detail);
     }
 }
 
@@ -430,14 +442,14 @@ fn stream_events_inner<W: Write>(
     mut sink: W,
     rx: std::sync::mpsc::Receiver<super::Event>,
     heartbeat_interval: Duration,
-) {
+) -> &'static str {
     loop {
         let event = match rx.recv_timeout(heartbeat_interval) {
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Event::Heartbeat {
                 ts_ms: now_ms_ipc(),
             },
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return "event_bus_closed",
         };
         let mut json = match serde_json::to_string(&event) {
             Ok(s) => s,
@@ -445,7 +457,7 @@ fn stream_events_inner<W: Write>(
         };
         json.push('\n');
         if sink.write_all(json.as_bytes()).is_err() || sink.flush().is_err() {
-            break;
+            return "stream_write_error";
         }
     }
 }
@@ -1200,7 +1212,14 @@ mod tests {
             begin_subscription(&mut writer, &event_bus, Some(7), &registry, &command_tx).unwrap();
 
         assert!(writer.saw_registered);
-        end_subscription(&event_bus, sub_id, Some(7), &registry, &command_tx);
+        end_subscription(
+            &event_bus,
+            sub_id,
+            Some(7),
+            &registry,
+            &command_tx,
+            "test_disconnect",
+        );
     }
 
     #[test]
@@ -1234,7 +1253,10 @@ mod tests {
         .is_err());
         assert!(matches!(
             command_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(AppCommand::PeerSubscriberGone { pane_id: 17 })
+            Ok(AppCommand::PeerSubscriberGone {
+                pane_id: 17,
+                detail: "subscribed_ack_write_error"
+            })
         ));
         let state = registry.state.lock().unwrap_or_else(|p| p.into_inner());
         assert!(!state.counts.contains_key(&17));
@@ -1249,7 +1271,14 @@ mod tests {
         let (sub_id, _rx) =
             begin_subscription(&mut ack, &event_bus, None, &registry, &command_tx).unwrap();
 
-        end_subscription(&event_bus, sub_id, None, &registry, &command_tx);
+        end_subscription(
+            &event_bus,
+            sub_id,
+            None,
+            &registry,
+            &command_tx,
+            "test_disconnect",
+        );
 
         assert!(command_rx.try_recv().is_err());
     }
@@ -1264,11 +1293,21 @@ mod tests {
             begin_subscription(&mut ack, &event_bus, Some(8), &registry, &command_tx).unwrap();
 
         // No PeerSetReady(false) is sent: stream teardown is sufficient.
-        end_subscription(&event_bus, sub_id, Some(8), &registry, &command_tx);
+        end_subscription(
+            &event_bus,
+            sub_id,
+            Some(8),
+            &registry,
+            &command_tx,
+            "test_disconnect",
+        );
 
         assert!(matches!(
             command_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(AppCommand::PeerSubscriberGone { pane_id: 8 })
+            Ok(AppCommand::PeerSubscriberGone {
+                pane_id: 8,
+                detail: "test_disconnect"
+            })
         ));
     }
 
@@ -1279,13 +1318,16 @@ mod tests {
         registry.register(9);
         registry.register(9);
 
-        registry.unregister(9, &command_tx);
+        registry.unregister(9, &command_tx, "test_disconnect");
         assert!(command_rx.try_recv().is_err());
 
-        registry.unregister(9, &command_tx);
+        registry.unregister(9, &command_tx, "test_disconnect");
         assert!(matches!(
             command_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(AppCommand::PeerSubscriberGone { pane_id: 9 })
+            Ok(AppCommand::PeerSubscriberGone {
+                pane_id: 9,
+                detail: "test_disconnect"
+            })
         ));
     }
 
@@ -1304,7 +1346,10 @@ mod tests {
                 inside_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 old_command_tx
-                    .send(AppCommand::PeerSubscriberGone { pane_id: 11 })
+                    .send(AppCommand::PeerSubscriberGone {
+                        pane_id: 11,
+                        detail: "test_disconnect",
+                    })
                     .unwrap();
             });
         });
@@ -1330,7 +1375,10 @@ mod tests {
         old.join().unwrap();
         assert!(matches!(
             command_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(AppCommand::PeerSubscriberGone { pane_id: 11 })
+            Ok(AppCommand::PeerSubscriberGone {
+                pane_id: 11,
+                detail: "test_disconnect"
+            })
         ));
         acked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         new.join().unwrap();
@@ -1366,10 +1414,13 @@ mod tests {
         let registry = PeerSubscriptionRegistry::default();
         let (command_tx, command_rx) = mpsc::channel();
         registry.register(13);
-        registry.unregister(13, &command_tx);
+        registry.unregister(13, &command_tx, "test_disconnect");
         assert!(matches!(
             command_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(AppCommand::PeerSubscriberGone { pane_id: 13 })
+            Ok(AppCommand::PeerSubscriberGone {
+                pane_id: 13,
+                detail: "test_disconnect"
+            })
         ));
 
         let response = dispatch_request_with_registry(

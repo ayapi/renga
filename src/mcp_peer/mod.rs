@@ -62,6 +62,8 @@ const ENV_DEBUG_CODEX_PEER_LOG: &str = "RENGA_DEBUG_CODEX_PEER_LOG";
 const PUSH_READY_DELAY: Duration = Duration::from_millis(1500);
 static PEER_DEBUG_RECORD_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
+static PEER_DEBUG_WRITE_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn log_stderr(msg: &str) {
     eprintln!("[renga-mcp-peer] {msg}");
@@ -1093,8 +1095,23 @@ fn log_client_kind_resolution(
     let pane_id = pane_id_raw
         .as_deref()
         .and_then(|raw| raw.parse::<usize>().ok());
+    let exe_path = std::env::current_exe().ok();
+    let exe_modified_unix_ms = exe_path
+        .as_deref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis());
+    let args: Vec<String> = std::env::args().collect();
     let record = json!({
         "action": "client_kind_resolved",
+        "version": env!("CARGO_PKG_VERSION"),
+        "executable_path": exe_path,
+        "executable_modified_unix_ms": exe_modified_unix_ms,
+        "args_summary": {
+            "count": args.len(),
+            "subcommand": args.get(1),
+        },
         "pane_id": pane_id,
         "renga_peer_client_kind_state": client_kind_env_state,
         "renga_peer_client_kind_raw": client_kind_raw_value,
@@ -1121,16 +1138,27 @@ fn append_peer_debug_record(path: &Path, pane_id: Option<usize>, mut record: Val
     record.insert("process_id".to_string(), json!(std::process::id()));
     record.insert("record_sequence".to_string(), json!(record_sequence));
     record.insert("pane_id".to_string(), json!(pane_id));
+    let failures = PEER_DEBUG_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    record.insert(
+        "trace_write_failures_since_last".to_string(),
+        json!(failures),
+    );
     let Ok(mut line) = serde_json::to_vec(record) else {
         return;
     };
     line.push(b'\n');
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-    {
-        let _ = file.write_all(&line);
+    else {
+        PEER_DEBUG_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    };
+    if file.write_all(&line).is_err() {
+        PEER_DEBUG_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else if failures > 0 {
+        PEER_DEBUG_WRITE_FAILURES.fetch_sub(failures, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -6803,6 +6831,30 @@ Commands:
             std::process::id(),
             PEER_DEBUG_RECORD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn failed_peer_trace_append_is_reported_by_next_record() {
+        PEER_DEBUG_WRITE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+        append_peer_debug_record(
+            &std::env::temp_dir(),
+            Some(1),
+            json!({"action": "will_fail"}),
+        );
+        assert_eq!(
+            PEER_DEBUG_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        let path = debug_test_path("write-failure");
+        append_peer_debug_record(&path, Some(1), json!({"action": "check_messages"}));
+        let records = read_debug_records(&path);
+        assert_eq!(records[0]["trace_write_failures_since_last"], 1);
+        assert_eq!(
+            PEER_DEBUG_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     fn read_debug_records(path: &Path) -> Vec<Value> {

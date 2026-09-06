@@ -30,6 +30,11 @@ pub(crate) use self::app_state::{
 };
 pub use self::app_state::{App, AppCommand, AppEvent};
 #[cfg(test)]
+pub(crate) use self::codex_peer::set_codex_peer_debug_log_path_test_override;
+pub(crate) use self::codex_peer::{
+    append_codex_peer_debug_record, codex_peer_debug_log_path, codex_peer_debug_write_failures,
+};
+#[cfg(test)]
 use self::codex_peer::{
     codex_prompt_allows_peer_nudge_on_screen, format_codex_peer_message, screen_tail_lines,
     PendingCodexPeerMessage,

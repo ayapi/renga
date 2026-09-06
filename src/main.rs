@@ -24,7 +24,7 @@ use std::io;
 use std::panic;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
@@ -33,6 +33,158 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+
+#[cfg(not(test))]
+const PROCESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const PROCESS_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(25);
+
+struct HeartbeatTracker {
+    next_at: Instant,
+    frames_since_last: u64,
+}
+
+impl HeartbeatTracker {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_at: now + PROCESS_HEARTBEAT_INTERVAL,
+            frames_since_last: 0,
+        }
+    }
+
+    fn record_frame(&mut self) {
+        self.frames_since_last = self.frames_since_last.saturating_add(1);
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<u64> {
+        if now < self.next_at {
+            return None;
+        }
+        self.next_at = now + PROCESS_HEARTBEAT_INTERVAL;
+        Some(std::mem::take(&mut self.frames_since_last))
+    }
+}
+
+fn executable_identity() -> (Option<std::path::PathBuf>, Option<u128>) {
+    let path = std::env::current_exe().ok();
+    let modified = path
+        .as_deref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis());
+    (path, modified)
+}
+
+fn log_process_start() {
+    let Some(path) = app::codex_peer_debug_log_path() else {
+        return;
+    };
+    let (executable_path, executable_modified_unix_ms) = executable_identity();
+    let args: Vec<String> = std::env::args().collect();
+    app::append_codex_peer_debug_record(
+        &path,
+        serde_json::json!({
+            "action": "process_start",
+            "version": env!("CARGO_PKG_VERSION"),
+            "executable_path": executable_path,
+            "executable_modified_unix_ms": executable_modified_unix_ms,
+            "args_summary": {
+                "count": args.len(),
+                "has_exec": args.iter().any(|arg| arg == "--exec"),
+                "has_layout": args.iter().any(|arg| arg == "--layout"),
+            },
+        }),
+    );
+}
+
+fn panic_record(
+    message: String,
+    thread_name: Option<String>,
+    location: Option<(&str, u32, u32)>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "action": "panic",
+        "message": message,
+        "thread_name": thread_name,
+        "location": location.map(|(file, line, column)| serde_json::json!({
+            "file": file,
+            "line": line,
+            "column": column,
+        })),
+    })
+}
+
+fn format_panic_record(info: &panic::PanicHookInfo<'_>) -> serde_json::Value {
+    let message = info
+        .payload()
+        .downcast_ref::<&str>()
+        .map(|value| (*value).to_owned())
+        .or_else(|| info.payload().downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned());
+    let thread_name = std::thread::current().name().map(str::to_owned);
+    let location = info
+        .location()
+        .map(|location| (location.file(), location.line(), location.column()));
+    panic_record(message, thread_name, location)
+}
+
+fn classify_exit_error(error: &anyhow::Error) -> &'static str {
+    let text = format!("{error:#}");
+    if text.contains("event_read_error") {
+        "event_read_error"
+    } else if text.contains("draw_error") {
+        "draw_error"
+    } else {
+        "error"
+    }
+}
+
+fn log_process_exit(
+    reason: &str,
+    error: Option<&anyhow::Error>,
+    frames_total: u64,
+    uptime: Duration,
+) {
+    let Some(path) = app::codex_peer_debug_log_path() else {
+        return;
+    };
+    app::append_codex_peer_debug_record(
+        &path,
+        serde_json::json!({
+            "action": "process_exit",
+            "reason": reason,
+            "error": error.map(|error| format!("{error:#}")),
+            "frames_total": frames_total,
+            "uptime_ms": uptime.as_millis(),
+        }),
+    );
+}
+
+fn log_heartbeat_if_due(app: &app::App, tracker: &mut HeartbeatTracker, now: Instant) {
+    let Some(frames_since_last) = tracker.take_due(now) else {
+        return;
+    };
+    let Some(path) = app::codex_peer_debug_log_path() else {
+        return;
+    };
+    let visible_tab = app.workspaces.get(app.active_tab).map(|workspace| {
+        workspace
+            .custom_name
+            .as_deref()
+            .unwrap_or(workspace.name.as_str())
+    });
+    app::append_codex_peer_debug_record(
+        &path,
+        serde_json::json!({
+            "action": "heartbeat",
+            "frames_since_last": frames_since_last,
+            "pane_count": app.workspaces.iter().map(|workspace| workspace.panes.len()).sum::<usize>(),
+            "visible_tab": visible_tab,
+            "trace_write_failures_since_last": app::codex_peer_debug_write_failures(),
+        }),
+    );
+}
 
 fn main() -> Result<()> {
     // Internal sidecar mode (`renga __conpty-color-seed <bg> <fg>`): spawned
@@ -82,9 +234,50 @@ fn main() -> Result<()> {
         }
     }
 
+    run_tui(cli)
+}
+
+fn run_tui(cli: cli::Cli) -> Result<()> {
+    let process_started_at = Instant::now();
+    log_process_start();
+
+    match run_tui_inner(cli) {
+        Ok((result, should_quit, frames_total)) => {
+            let reason = match &result {
+                Err(error) => classify_exit_error(error),
+                Ok(()) if should_quit => "quit_key",
+                Ok(()) => "normal_exit",
+            };
+            log_process_exit(
+                reason,
+                result.as_ref().err(),
+                frames_total,
+                process_started_at.elapsed(),
+            );
+            result
+        }
+        Err(error) => {
+            log_process_exit(
+                classify_exit_error(&error),
+                Some(&error),
+                0,
+                process_started_at.elapsed(),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn run_tui_inner(cli: cli::Cli) -> Result<(Result<()>, bool, u64)> {
     // Install panic hook to restore terminal state on crash
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
+        let panic_record = format_panic_record(info);
+        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            if let Some(path) = app::codex_peer_debug_log_path() {
+                app::append_codex_peer_debug_record(&path, panic_record);
+            }
+        }));
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), crossterm::event::DisableMouseCapture);
         let _ = execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
@@ -248,23 +441,39 @@ fn main() -> Result<()> {
     }
 
     // Main event loop
-    let result = run_event_loop(&mut terminal, &mut app, event_poll_timeout);
+    let mut frames_total = 0;
+    let mut result = run_event_loop(
+        &mut terminal,
+        &mut app,
+        event_poll_timeout,
+        &mut frames_total,
+    );
 
     // Cleanup
     app.shutdown();
-    disable_raw_mode()?;
-    execute!(
+    if let Err(error) = disable_raw_mode() {
+        result = result.and(Err(error.into()));
+    }
+    if let Err(error) = execute!(
         terminal.backend_mut(),
         crossterm::event::DisableMouseCapture
-    )?;
-    execute!(
+    ) {
+        result = result.and(Err(error.into()));
+    }
+    if let Err(error) = execute!(
         terminal.backend_mut(),
         crossterm::event::DisableBracketedPaste
-    )?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    ) {
+        result = result.and(Err(error.into()));
+    }
+    if let Err(error) = execute!(terminal.backend_mut(), LeaveAlternateScreen) {
+        result = result.and(Err(error.into()));
+    }
+    if let Err(error) = terminal.show_cursor() {
+        result = result.and(Err(error.into()));
+    }
 
-    result
+    Ok((result, app.should_quit, frames_total))
 }
 
 /// Handle an IPC subcommand (`renga send …`, `renga list`, etc.).
@@ -388,11 +597,15 @@ fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut app::App,
     event_poll_timeout: Duration,
+    frames_total: &mut u64,
 ) -> Result<()> {
     let mut paste_buffer: Vec<u8> = Vec::new();
+    let mut heartbeat = HeartbeatTracker::new(Instant::now());
     app::frame_diagnostics::configure_from_env();
 
     loop {
+        *frames_total = (*frames_total).saturating_add(1);
+        heartbeat.record_frame();
         let frame_started_at = Instant::now();
         app::frame_diagnostics::begin_frame(frame_started_at);
 
@@ -489,14 +702,16 @@ fn run_event_loop(
             if hide_cursor_during_draw() {
                 let _ = execute!(terminal.backend_mut(), crossterm::cursor::Hide);
             }
-            terminal.draw(|frame| {
-                let render_draw_started_at = app::frame_diagnostics::phase_started();
-                ui::render(app, frame);
-                app::frame_diagnostics::finish_phase(
-                    app::frame_diagnostics::PHASE_RENDER_DRAW,
-                    render_draw_started_at,
-                );
-            })?;
+            terminal
+                .draw(|frame| {
+                    let render_draw_started_at = app::frame_diagnostics::phase_started();
+                    ui::render(app, frame);
+                    app::frame_diagnostics::finish_phase(
+                        app::frame_diagnostics::PHASE_RENDER_DRAW,
+                        render_draw_started_at,
+                    );
+                })
+                .context("draw_error")?;
             // Apply the caret AFTER the draw, while the cursor is still hidden
             // from the pre-draw `Hide`. On conpty, `ui::render` deferred the
             // caret here instead of calling `frame.set_cursor_position`, so
@@ -525,12 +740,13 @@ fn run_event_loop(
             app::frame_diagnostics::finish_frame(|| {
                 app.workspaces[app.active_tab].layout.collect_pane_ids()
             });
+            log_heartbeat_if_due(app, &mut heartbeat, Instant::now());
             break;
         }
 
         // Poll for crossterm events at the configured idle rate.
-        if event::poll(event_poll_timeout)? {
-            match event::read()? {
+        if event::poll(event_poll_timeout).context("event_read_error")? {
+            match event::read().context("event_read_error")? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let consumed = app.handle_key_event(key)?;
                     if !consumed {
@@ -586,6 +802,7 @@ fn run_event_loop(
         app::frame_diagnostics::finish_frame(|| {
             app.workspaces[app.active_tab].layout.collect_pane_ids()
         });
+        log_heartbeat_if_due(app, &mut heartbeat, Instant::now());
     }
 
     Ok(())
@@ -663,8 +880,103 @@ fn is_wsl() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::flush_paste_buffer;
+    use super::{
+        flush_paste_buffer, log_process_exit, log_process_start, panic_record, HeartbeatTracker,
+    };
     use crate::app::App;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn heartbeat_clock_only_emits_after_interval_and_resets_frame_count() {
+        let started = Instant::now();
+        let mut tracker = HeartbeatTracker::new(started);
+        tracker.record_frame();
+        tracker.record_frame();
+        assert_eq!(tracker.take_due(started), None);
+        assert_eq!(
+            tracker.take_due(started + super::PROCESS_HEARTBEAT_INTERVAL),
+            Some(2)
+        );
+        tracker.record_frame();
+        assert_eq!(
+            tracker.take_due(started + super::PROCESS_HEARTBEAT_INTERVAL * 2),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn process_exit_quit_record_contains_reason_frames_and_uptime() {
+        let path = std::env::temp_dir().join(format!(
+            "renga-process-exit-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::app::set_codex_peer_debug_log_path_test_override(Some(Some(
+            path.as_os_str().to_owned(),
+        )));
+        log_process_exit("quit_key", None, 42, Duration::from_millis(1234));
+        crate::app::set_codex_peer_debug_log_path_test_override(Some(None));
+
+        let line = std::fs::read_to_string(&path).expect("process exit trace");
+        let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(record["action"], "process_exit");
+        assert_eq!(record["reason"], "quit_key");
+        assert_eq!(record["frames_total"], 42);
+        assert_eq!(record["uptime_ms"], 1234);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn process_start_production_path_obeys_debug_env_absence() {
+        let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "renga-process-start-env-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let previous = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+        crate::app::set_codex_peer_debug_log_path_test_override(None);
+        std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", &path);
+        log_process_start();
+        let enabled = std::fs::read_to_string(&path).expect("enabled process start trace");
+        assert_eq!(enabled.lines().count(), 1);
+        let record: serde_json::Value = serde_json::from_str(enabled.trim()).unwrap();
+        assert_eq!(record["action"], "process_start");
+        std::fs::remove_file(&path).unwrap();
+
+        std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG");
+        log_process_start();
+        assert!(!path.exists());
+
+        match previous {
+            Some(value) => std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", value),
+            None => std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG"),
+        }
+        crate::app::set_codex_peer_debug_log_path_test_override(Some(None));
+    }
+
+    #[test]
+    fn panic_record_formats_message_thread_and_location() {
+        let record = panic_record(
+            "boom".to_owned(),
+            Some("worker".to_owned()),
+            Some(("src/example.rs", 12, 34)),
+        );
+        assert_eq!(record["action"], "panic");
+        assert_eq!(record["message"], "boom");
+        assert_eq!(record["thread_name"], "worker");
+        assert_eq!(record["location"]["file"], "src/example.rs");
+        assert_eq!(record["location"]["line"], 12);
+        assert_eq!(record["location"]["column"], 34);
+    }
 
     #[test]
     fn flush_paste_buffer_clears_codex_transcript_overlay_hint() {

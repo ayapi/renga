@@ -11,6 +11,12 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Added
 
+- **Trace-only process lifecycle and peer subscription diagnostics.** When
+  `RENGA_DEBUG_CODEX_PEER_LOG` is enabled, renga now records TUI start, exit,
+  panic, 60-second heartbeat, trace-write failures, executable identity for
+  both TUI and mcp-peer processes, and the internal reason a peer subscriber
+  disappeared. Runtime behavior and wire responses are unchanged. (renga-cin)
+
 - **Undelivered peer message visibility.** Pane titles now show a nonzero
   `[msg N]` badge, and `list_panes` / `list_peers` include the additive
   `pending_peer_messages` count. Stale Codex SubmitAt commit attempts now

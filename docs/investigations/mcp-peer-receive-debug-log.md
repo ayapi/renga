@@ -23,6 +23,12 @@ values do not identify the same delivery. The only shared correlation data is
 
 ## Reading receive-side records
 
+`client_kind_resolved` also serves as the mcp-peer process-start identity
+record. It includes the package `version`, executable path and modification
+time, and an argument summary. Every successful mcp-peer record carries
+`trace_write_failures_since_last`; an open or write failure is counted and the
+next successful record reports and clears the count.
+
 ### `check_messages`
 
 - `call_shape`: `empty`, `cursor`, or `ack` according to the supplied arguments.
@@ -131,7 +137,9 @@ change the peer wire format.
 - `peer_delivery_ready_cleared`: `reason` (`set_ready_false`,
   `unconfirmed_delivery_expired`, or `subscriber_gone`) when App revokes
   readiness explicitly, after a failed receipt, or after event subscription
-  disconnect.
+  disconnect. For `subscriber_gone`, `detail` distinguishes subscription ack
+  write failure, stream write failure, event-bus closure, and other internal
+  teardown paths without changing the IPC wire format.
 - `peer_delivery_retry_emitted`: `pane_id` and `delivery_id` when the App retries
   the oldest unacknowledged delivery for a pane.
 - `peer_delivery_retry_blocked_behind_head`: `pane_id`, `delivery_id`, and

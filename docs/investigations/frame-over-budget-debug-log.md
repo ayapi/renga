@@ -16,6 +16,24 @@ roughly 167 records per process, and pane ids 1 through 3. The `mcp_peer`
 subprocess resolves the variable once at startup and its unit tests inject the
 resolved path into `PeerCtx`; they do not start the subprocess.
 
+## Process lifecycle and liveness records
+
+- `process_start`: emitted once for a TUI launch, with `version`,
+  `executable_path`, `executable_modified_unix_ms`, and a non-payload
+  `args_summary`.
+- `heartbeat`: emitted from the end of an existing event-loop iteration about
+  every 60 seconds. It contains `frames_since_last`, total `pane_count`,
+  `visible_tab`, and `trace_write_failures_since_last`; it does not request an
+  extra render.
+- `process_exit`: emitted immediately before `main` returns, with `reason`, an
+  optional propagated `error`, `frames_total`, and `uptime_ms`.
+- `panic`: emitted by the process panic hook before the default hook, with the
+  panic `message`, `thread_name`, and source `location`.
+
+Open or write failures increment an in-process counter. The next successful
+heartbeat reports and clears that count. As with every record in this file,
+none of these records are written when `RENGA_DEBUG_CODEX_PEER_LOG` is unset.
+
 ## Threshold and record names
 
 `FRAME_OVER_BUDGET_MS` is 500 ms. A loop iteration whose elapsed time is

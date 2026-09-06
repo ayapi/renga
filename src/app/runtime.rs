@@ -217,7 +217,9 @@ impl App {
             AppCommand::PeerInboxHeadAcknowledged { pane_id, .. } => {
                 ("peer_inbox_head_acknowledged", Some(*pane_id))
             }
-            AppCommand::PeerSubscriberGone { pane_id } => ("peer_subscriber_gone", Some(*pane_id)),
+            AppCommand::PeerSubscriberGone { pane_id, .. } => {
+                ("peer_subscriber_gone", Some(*pane_id))
+            }
             AppCommand::SetPaneIdentity { target, .. } => ("set_pane_identity", resolve(target)),
             AppCommand::SetSummary { pane_id, .. } => ("set_summary", Some(*pane_id)),
         }

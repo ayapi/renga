@@ -188,7 +188,10 @@ pub enum AppCommand {
     /// The IPC server observed the last pane-associated event stream
     /// terminate. Unlike `PeerSetReady`, this is authoritative server
     /// state and does not need client-kind metadata or a reply.
-    PeerSubscriberGone { pane_id: usize },
+    PeerSubscriberGone {
+        pane_id: usize,
+        detail: &'static str,
+    },
     /// Rename or clear the `name` / `role` of an existing pane. See
     /// [`ipc::Request::SetPaneIdentity`] for the three-state semantics
     /// of each field. Success returns the pane's updated [`PaneInfo`]

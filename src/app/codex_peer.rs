@@ -6,6 +6,8 @@ pub(crate) const CODEX_PEER_NUDGE_COMMIT_TIMEOUT: Duration = Duration::from_secs
 pub(crate) const CODEX_PEER_NUDGE_MAX_RETRIES: u8 = 1;
 static CODEX_PEER_DEBUG_RECORD_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
+static CODEX_PEER_DEBUG_WRITE_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 thread_local! {
@@ -23,6 +25,10 @@ pub(crate) fn set_codex_peer_debug_log_path_test_override(
 
 pub(crate) fn codex_peer_debug_log_path() -> Option<std::ffi::OsString> {
     resolve_codex_peer_debug_log_path(|| std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG"))
+}
+
+pub(crate) fn codex_peer_debug_write_failures() -> u64 {
+    CODEX_PEER_DEBUG_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn resolve_codex_peer_debug_log_path(
@@ -788,7 +794,7 @@ impl CodexPeerDebugObservation {
     }
 }
 
-pub(super) fn append_codex_peer_debug_record(
+pub(crate) fn append_codex_peer_debug_record(
     path: &std::ffi::OsStr,
     mut record: serde_json::Value,
 ) {
@@ -817,12 +823,22 @@ pub(super) fn append_codex_peer_debug_record(
         return;
     };
     line.push(b'\n');
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(std::path::PathBuf::from(path))
+    else {
+        CODEX_PEER_DEBUG_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    };
+    if file.write_all(&line).is_err() {
+        CODEX_PEER_DEBUG_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else if let Some(failures) = record
+        .get("trace_write_failures_since_last")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|failures| *failures > 0)
     {
-        let _ = file.write_all(&line);
+        CODEX_PEER_DEBUG_WRITE_FAILURES.fetch_sub(failures, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -2029,7 +2045,7 @@ impl App {
     /// pane's last identified event stream has ended. Client kind is
     /// intentionally irrelevant: pull and push subscribers share the
     /// same transport-liveness requirement.
-    pub(crate) fn handle_peer_subscriber_gone(&mut self, pane_id: usize) {
+    pub(crate) fn handle_peer_subscriber_gone(&mut self, pane_id: usize, detail: &'static str) {
         self.peer_delivery_ready.remove(&pane_id);
         if self.peer_handovers.contains_key(&pane_id) {
             self.peer_handover_disconnect_deadlines
@@ -2041,6 +2057,7 @@ impl App {
                 "action": "peer_delivery_ready_cleared",
                 "pane_id": pane_id,
                 "reason": "subscriber_gone",
+                "detail": detail,
             })
         });
         let mut failed: Vec<u64> = self
@@ -3009,6 +3026,35 @@ mod debug_logging_tests {
     }
 
     #[test]
+    fn failed_trace_append_is_counted_and_reported_by_next_heartbeat() {
+        let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        CODEX_PEER_DEBUG_WRITE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let invalid_path = std::env::temp_dir();
+        append_codex_peer_debug_record(
+            invalid_path.as_os_str(),
+            serde_json::json!({
+                "action": "will_fail"
+            }),
+        );
+        assert_eq!(codex_peer_debug_write_failures(), 1);
+
+        let path = debug_test_path("write-failure");
+        append_codex_peer_debug_record(
+            path.as_os_str(),
+            serde_json::json!({
+                "action": "heartbeat",
+                "trace_write_failures_since_last": codex_peer_debug_write_failures(),
+            }),
+        );
+        let records = read_debug_records(&path);
+        assert_eq!(records[0]["trace_write_failures_since_last"], 1);
+        assert_eq!(codex_peer_debug_write_failures(), 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn inherited_debug_log_path_is_disabled_by_default() {
         let env_read = std::cell::Cell::new(false);
         let path = resolve_codex_peer_debug_log_path(|| {
@@ -3099,7 +3145,7 @@ mod debug_logging_tests {
         app.flush_pending_peer_deliveries();
         app.handle_peer_set_ready(target_id, PeerClientKind::Claude, true)
             .expect("flush requeued peer message");
-        app.handle_peer_subscriber_gone(target_id);
+        app.handle_peer_subscriber_gone(target_id, "event_bus_closed");
         app.handle_peer_set_ready(target_id, PeerClientKind::Claude, false)
             .expect("clear readiness");
         app.shutdown();
@@ -3146,6 +3192,14 @@ mod debug_logging_tests {
                 "set_ready_false"
             ]
         );
+        let subscriber_gone = records
+            .iter()
+            .find(|record| {
+                record["action"] == "peer_delivery_ready_cleared"
+                    && record["reason"] == "subscriber_gone"
+            })
+            .expect("subscriber gone record");
+        assert_eq!(subscriber_gone["detail"], "event_bus_closed");
         for record in records.iter().filter(|record| {
             matches!(
                 record["action"].as_str(),
