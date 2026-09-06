@@ -116,6 +116,8 @@ returns this timeout error on direct delivery, never an unverified `Delivered`
 result. A queued pre-registration message is retained after its flush times out;
 the pane becomes unready, so later sends remain `Queued` until the event stream
 reconnects and publishes readiness again.
+Retry throttling is transport-internal and does not change observable delivery:
+duplicate `PeerInbox` events remain safe for receivers to discard by `delivery_id`.
 
 **Push-mode body banner (post-1.1)**: for Claude (push) recipients renga
 prepends a `📡 PEER MESSAGE — from {name} (id={id}) — NOT FROM USER` line
@@ -569,6 +571,12 @@ hidden from cross-pane callers).
 | `events_dropped` | `count: u64`, `ts_ms` | Synthesized when a slow subscriber missed events. Per-subscriber. |
 | `heartbeat` | `ts_ms` | Periodic; only purpose is to detect half-closed connections. Buffer cap 256/subscriber. |
 | `peer_inbox` | `delivery_id?: u64`, `target_pane: usize`, `from_pane: usize`, `from_name?`, `from_kind?`, `body`, `ts_ms` | Always intra-tab by construction. Emitted at send time for a ready target, or when its subscriber becomes ready for a queued target. `ts_ms` remains the original send time. Bundled peers retain and deduplicate an additive `delivery_id`, then acknowledge it. Subscribers filter on `target_pane`. |
+
+For retries, the App emits only the oldest unacknowledged delivery for each
+target pane. A later queued-flush delivery's four-second receipt allowance
+starts again when it becomes that pane's oldest delivery, so time spent behind
+an earlier receipt does not make the flush expire. Direct sends still fail with
+`peer_delivery_unconfirmed` within the sender's five-second IPC deadline.
 
 **`heartbeat` audience (Q10)**: emitted into the subscribe-stream
 (`renga events` / `Request::Subscribe`). The MCP-side `poll_events` consumes

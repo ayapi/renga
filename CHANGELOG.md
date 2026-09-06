@@ -113,6 +113,13 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Fixed
 
+- **Bulk peer-inbox flushes no longer create retry storms or expire their tail.**
+  App retries only the oldest unacknowledged delivery per pane and refreshes the
+  next delivery's receipt timers after acknowledgement; mcp-peer sends ordered
+  acknowledgements on a dedicated thread so event consumption stays responsive.
+  This also prevents false `EventsDropped` warnings caused by duplicate receipt
+  traffic. (renga-z01)
+
 - **Claude peer startup now defers readiness publication for 1.5 seconds after
   MCP initialization.** Claude Code v2.1.261 can discard channel notifications
   during the short interval after sending `notifications/initialized` but

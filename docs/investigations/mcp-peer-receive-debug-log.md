@@ -49,6 +49,10 @@ values do not identify the same delivery. The only shared correlation data is
   `inbox_len_after`. The body itself is not recorded.
 - `peer_inbox_ack_sent`: `delivery_id`, `ok`, and `error` after the mcp-peer asks
   the App to confirm storage or push delivery.
+- `peer_inbox_ack_queued`: `delivery_id` and FIFO `depth` when the subscription
+  thread hands a receipt to its dedicated sender. The sender performs blocking
+  IPC outside the subscription thread, preserves order, and drains queued
+  receipts when a subscription attempt disconnects before it exits.
 - `peer_receipt_cache_hit`: `delivery_id` when a repeated event is retained
   idempotently instead of being emitted a second time.
 
@@ -122,3 +126,37 @@ change the peer wire format.
   `unconfirmed_delivery_expired`, or `subscriber_gone`) when App revokes
   readiness explicitly, after a failed receipt, or after event subscription
   disconnect.
+- `peer_delivery_retry_emitted`: `pane_id` and `delivery_id` when the App retries
+  the oldest unacknowledged delivery for a pane.
+- `peer_delivery_retry_blocked_behind_head`: `pane_id`, `delivery_id`, and
+  `head_delivery_id` once when a due retry is held behind an older delivery.
+
+### Bulk-flush receipt serialization (renga-z01)
+
+Before this fix, a ready transition emitted an entire retained queue with the
+same 100 ms retry timestamp, while mcp-peer acknowledged each event through a
+blocking IPC round trip on its subscription thread. The measured round trip was
+about 46 ms: a seven-message flush repeated five ids (one three times), and the
+87th message of a larger flush could pass the four-second receipt timeout.
+Repeated events also consumed the 256-event subscriber capacity and could
+surface a misleading `EventsDropped` warning.
+
+The App now limits retries to one oldest unacknowledged delivery per pane. Later
+deliveries are emitted once during the initial FIFO flush, then cannot retry or
+consume their receipt timeout while an older delivery remains. When the oldest
+receipt arrives, the next queue-origin delivery receives fresh retry and expiry
+timestamps. A direct caller's four-second deadline is never extended, including
+when it joins an already in-flight queue-origin delivery.
+In mcp-peer, a dedicated FIFO sender performs acknowledgements so the
+subscription thread immediately resumes event consumption. A subscription
+disconnect closes the sender and waits while already queued receipts drain.
+
+If a queue-origin head expires, App marks the pane unready and restores all
+queue-origin followers to the pre-registration FIFO at once. A follower with a
+waiting direct-send reply stays in flight instead: its initial event was already
+emitted, so a late acknowledgement can still complete it as `Delivered`. It is
+not re-emitted while the pane is unready and returns
+`peer_delivery_unconfirmed` only when its own unchanged deadline expires.
+Requeued entries retain their original `delivery_id`, so a late receipt removes
+the queued entry before another flush, or confirms the same id after a flush;
+it never turns the already retained body into a second local delivery.

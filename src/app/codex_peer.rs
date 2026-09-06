@@ -72,6 +72,8 @@ pub(crate) struct PendingPeerInboxMessage {
     pub(crate) body: String,
     pub(crate) ts_ms: u64,
     pub(crate) debug_peer_inbox_sequence: Option<u64>,
+    pub(crate) requeued_delivery_id: Option<u64>,
+    pub(crate) requeued_nudge: Option<PendingCodexPeerMessage>,
 }
 
 #[derive(Debug)]
@@ -83,6 +85,7 @@ pub(crate) struct PendingPeerInboxDelivery {
         Vec<oneshot::Sender<std::result::Result<ipc::PeerSendOutcome, ipc::CodedError>>>,
     pub(crate) next_retry_at: Instant,
     pub(crate) expires_at: Instant,
+    pub(crate) retry_blocked_behind_head: bool,
 }
 
 enum PreparedPeerSend {
@@ -1044,6 +1047,8 @@ impl App {
             body: body.clone(),
             ts_ms: ipc::events::now_ms(),
             debug_peer_inbox_sequence: None,
+            requeued_delivery_id: None,
+            requeued_nudge: None,
         };
         if self.peer_delivery_ready.contains(&target_id) {
             Ok(PreparedPeerSend::Confirm {
@@ -1121,6 +1126,9 @@ impl App {
                 && pending.message.body == body
         }) {
             pending.replies.push(reply);
+            // A direct caller joining an earlier queue flush gets its own
+            // four-second App-side deadline. Head promotion must not extend it.
+            pending.expires_at = Instant::now() + PEER_INBOX_ACK_TIMEOUT;
             return;
         }
         match self.prepare_peer_send(from_pane, target, body) {
@@ -1145,8 +1153,13 @@ impl App {
         nudge: Option<PendingCodexPeerMessage>,
         reply: Option<oneshot::Sender<std::result::Result<ipc::PeerSendOutcome, ipc::CodedError>>>,
     ) {
-        let delivery_id = self.next_peer_delivery_id;
-        self.next_peer_delivery_id = self.next_peer_delivery_id.saturating_add(1).max(1);
+        let mut message = message;
+        let delivery_id = message.requeued_delivery_id.take().unwrap_or_else(|| {
+            let delivery_id = self.next_peer_delivery_id;
+            self.next_peer_delivery_id = self.next_peer_delivery_id.saturating_add(1).max(1);
+            delivery_id
+        });
+        let nudge = message.requeued_nudge.take().or(nudge);
         let now = Instant::now();
         self.pending_peer_deliveries.insert(
             delivery_id,
@@ -1157,6 +1170,7 @@ impl App {
                 replies: reply.into_iter().collect(),
                 next_retry_at: now + PEER_INBOX_ACK_RETRY_INTERVAL,
                 expires_at: now + PEER_INBOX_ACK_TIMEOUT,
+                retry_blocked_behind_head: false,
             },
         );
         self.emit_peer_inbox(target_pane, Some(delivery_id), message);
@@ -1228,6 +1242,24 @@ impl App {
         delivery_id: u64,
     ) -> std::result::Result<(), ipc::CodedError> {
         let Some(pending) = self.pending_peer_deliveries.get(&delivery_id) else {
+            let requeued = self.pending_peer_inbox.get_mut(&pane_id).and_then(|queue| {
+                let position = queue
+                    .iter()
+                    .position(|message| message.requeued_delivery_id == Some(delivery_id))?;
+                queue.remove(position)
+            });
+            if self
+                .pending_peer_inbox
+                .get(&pane_id)
+                .is_some_and(VecDeque::is_empty)
+            {
+                self.pending_peer_inbox.remove(&pane_id);
+            }
+            if let Some(mut message) = requeued {
+                let nudge = message.requeued_nudge.take();
+                message.requeued_delivery_id = None;
+                let _ = self.finish_confirmed_peer_delivery(pane_id, message, nudge);
+            }
             return Ok(());
         };
         if pending.target_pane != pane_id {
@@ -1239,6 +1271,13 @@ impl App {
                 ),
             ));
         }
+        let was_head = self
+            .pending_peer_deliveries
+            .iter()
+            .filter(|(_, candidate)| candidate.target_pane == pane_id)
+            .map(|(id, _)| *id)
+            .min()
+            == Some(delivery_id);
         let pending = self.pending_peer_deliveries.remove(&delivery_id).unwrap();
         let result = self.finish_confirmed_peer_delivery(
             pending.target_pane,
@@ -1247,6 +1286,25 @@ impl App {
         );
         for reply in pending.replies {
             let _ = reply.send(result.clone());
+        }
+        if was_head {
+            let next_id = self
+                .pending_peer_deliveries
+                .iter()
+                .filter(|(_, candidate)| candidate.target_pane == pane_id)
+                .map(|(id, _)| *id)
+                .min();
+            if let Some(next_id) = next_id {
+                let now = Instant::now();
+                let next = self.pending_peer_deliveries.get_mut(&next_id).unwrap();
+                // Time spent waiting behind an older delivery does not consume
+                // this delivery's retry or retention-confirmation allowance.
+                next.next_retry_at = now + PEER_INBOX_ACK_RETRY_INTERVAL;
+                if next.replies.is_empty() {
+                    next.expires_at = now + PEER_INBOX_ACK_TIMEOUT;
+                }
+                next.retry_blocked_behind_head = false;
+            }
         }
         Ok(())
     }
@@ -1330,10 +1388,19 @@ impl App {
 
     pub(crate) fn flush_pending_peer_deliveries(&mut self) {
         let now = Instant::now();
+        let heads_by_pane = self.pending_peer_delivery_heads();
         let mut expired: Vec<u64> = self
             .pending_peer_deliveries
             .iter()
-            .filter_map(|(id, pending)| (now >= pending.expires_at).then_some(*id))
+            .filter_map(|(id, pending)| {
+                let is_head = heads_by_pane.get(&pending.target_pane) == Some(id);
+                // Direct sends must still receive the specific unconfirmed
+                // error inside the App IPC deadline. Queue-flush followers,
+                // however, cannot expire merely because an older receipt is
+                // still at the head of this pane's FIFO.
+                (now >= pending.expires_at && (is_head || !pending.replies.is_empty()))
+                    .then_some(*id)
+            })
             .collect();
         expired.sort_unstable();
         for delivery_id in expired {
@@ -1350,11 +1417,43 @@ impl App {
                         "reason": "unconfirmed_delivery_expired",
                     })
                 });
+                let mut message = pending.message;
+                message.requeued_delivery_id = Some(delivery_id);
+                message.requeued_nudge = pending.nudge;
                 self.queue_peer_inbox_until_ready_with_path(
                     pending.target_pane,
-                    pending.message,
+                    message,
                     debug_log_path.as_deref(),
                 );
+                // Once the pane is unready, no later in-flight event can be
+                // confirmed. Restore the whole pane FIFO immediately instead
+                // of making each follower wait through its own timeout.
+                let mut followers = self
+                    .pending_peer_deliveries
+                    .iter()
+                    .filter_map(|(id, candidate)| {
+                        (candidate.target_pane == pending.target_pane).then_some(*id)
+                    })
+                    .collect::<Vec<_>>();
+                followers.sort_unstable();
+                for follower_id in followers {
+                    if self.pending_peer_deliveries[&follower_id]
+                        .replies
+                        .is_empty()
+                    {
+                        let follower = self.pending_peer_deliveries.remove(&follower_id).unwrap();
+                        let mut message = follower.message;
+                        message.requeued_delivery_id = Some(follower_id);
+                        message.requeued_nudge = follower.nudge;
+                        self.queue_peer_inbox_until_ready_with_path(
+                            follower.target_pane,
+                            message,
+                            debug_log_path.as_deref(),
+                        );
+                    }
+                    // A direct caller may still receive the ack for its
+                    // initial emit. Leave it pending until its own deadline.
+                }
             } else {
                 let error = ipc::CodedError::new(
                     ipc::err_code::PEER_DELIVERY_UNCONFIRMED,
@@ -1369,21 +1468,57 @@ impl App {
             }
         }
 
-        let mut retries: Vec<(u64, usize, PendingPeerInboxMessage)> = self
-            .pending_peer_deliveries
-            .iter_mut()
-            .filter_map(|(id, pending)| {
-                if now < pending.next_retry_at {
-                    return None;
+        let heads_by_pane = self.pending_peer_delivery_heads();
+        let debug_log_path = codex_peer_debug_log_path();
+        let mut retries = Vec::new();
+        for (id, pending) in &mut self.pending_peer_deliveries {
+            if now < pending.next_retry_at {
+                continue;
+            }
+            if !self.peer_delivery_ready.contains(&pending.target_pane) {
+                continue;
+            }
+            let head_delivery_id = heads_by_pane[&pending.target_pane];
+            if *id != head_delivery_id {
+                if !pending.retry_blocked_behind_head {
+                    pending.retry_blocked_behind_head = true;
+                    log_peer_delivery_record(debug_log_path.as_deref(), || {
+                        serde_json::json!({
+                            "action": "peer_delivery_retry_blocked_behind_head",
+                            "pane_id": pending.target_pane,
+                            "delivery_id": id,
+                            "head_delivery_id": head_delivery_id,
+                        })
+                    });
                 }
-                pending.next_retry_at = now + PEER_INBOX_ACK_RETRY_INTERVAL;
-                Some((*id, pending.target_pane, pending.message.clone()))
-            })
-            .collect();
+                continue;
+            }
+            pending.retry_blocked_behind_head = false;
+            pending.next_retry_at = now + PEER_INBOX_ACK_RETRY_INTERVAL;
+            log_peer_delivery_record(debug_log_path.as_deref(), || {
+                serde_json::json!({
+                    "action": "peer_delivery_retry_emitted",
+                    "pane_id": pending.target_pane,
+                    "delivery_id": id,
+                })
+            });
+            retries.push((*id, pending.target_pane, pending.message.clone()));
+        }
         retries.sort_unstable_by_key(|(delivery_id, _, _)| *delivery_id);
         for (delivery_id, target_pane, message) in retries {
             self.emit_peer_inbox(target_pane, Some(delivery_id), message);
         }
+    }
+
+    fn pending_peer_delivery_heads(&self) -> HashMap<usize, u64> {
+        let mut heads = HashMap::new();
+        for (delivery_id, pending) in &self.pending_peer_deliveries {
+            heads
+                .entry(pending.target_pane)
+                .and_modify(|head: &mut u64| *head = (*head).min(*delivery_id))
+                .or_insert(*delivery_id);
+        }
+        heads
     }
 
     /// Return the original outcome when an identical (target, from, body)
@@ -1528,7 +1663,10 @@ impl App {
                 continue;
             };
             if pending.replies.is_empty() {
-                self.queue_peer_inbox_until_ready(pane_id, pending.message);
+                let mut message = pending.message;
+                message.requeued_delivery_id = Some(delivery_id);
+                message.requeued_nudge = pending.nudge;
+                self.queue_peer_inbox_until_ready(pane_id, message);
             } else {
                 let error = ipc::CodedError::new(
                     ipc::err_code::PEER_DELIVERY_UNCONFIRMED,

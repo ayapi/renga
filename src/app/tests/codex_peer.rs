@@ -4690,6 +4690,312 @@ fn peer_delivery_id(rx: &std::sync::mpsc::Receiver<ipc::Event>) -> u64 {
     }
 }
 
+fn peer_delivery_ids(rx: &std::sync::mpsc::Receiver<ipc::Event>, count: usize) -> Vec<u64> {
+    (0..count).map(|_| peer_delivery_id(rx)).collect()
+}
+
+#[test]
+fn bulk_flush_retries_only_the_oldest_unacknowledged_delivery() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (_sub_id, rx) = app.event_bus.subscribe();
+    let sender = app.ws().focused_pane_id;
+    let target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split");
+    for index in 0..8 {
+        assert_eq!(
+            app.handle_peer_send(sender, &ipc::PaneRef::Id(target), format!("queued-{index}"),)
+                .unwrap(),
+            ipc::PeerSendOutcome::Queued
+        );
+    }
+    app.handle_peer_set_ready(target, PeerClientKind::Claude, true)
+        .unwrap();
+    let delivery_ids = peer_delivery_ids(&rx, 8);
+    for pending in app.pending_peer_deliveries.values_mut() {
+        pending.next_retry_at = Instant::now();
+    }
+
+    app.flush_pending_peer_deliveries();
+
+    assert_eq!(peer_delivery_id(&rx), delivery_ids[0]);
+    assert!(rx
+        .try_iter()
+        .all(|event| !matches!(event, ipc::Event::PeerInbox { .. })));
+
+    app.handle_peer_inbox_ack(target, delivery_ids[0]).unwrap();
+    app.pending_peer_deliveries
+        .get_mut(&delivery_ids[1])
+        .unwrap()
+        .next_retry_at = Instant::now();
+    app.flush_pending_peer_deliveries();
+    assert_eq!(peer_delivery_id(&rx), delivery_ids[1]);
+    app.shutdown();
+}
+
+#[test]
+fn bulk_flush_followers_do_not_expire_while_waiting_for_the_head() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (_sub_id, rx) = app.event_bus.subscribe();
+    let sender = app.ws().focused_pane_id;
+    let target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split");
+    for index in 0..3 {
+        app.handle_peer_send(sender, &ipc::PaneRef::Id(target), format!("queued-{index}"))
+            .unwrap();
+    }
+    app.handle_peer_set_ready(target, PeerClientKind::Claude, true)
+        .unwrap();
+    let delivery_ids = peer_delivery_ids(&rx, 3);
+    for delivery_id in &delivery_ids[1..] {
+        app.pending_peer_deliveries
+            .get_mut(delivery_id)
+            .unwrap()
+            .expires_at = Instant::now();
+    }
+
+    app.flush_pending_peer_deliveries();
+
+    assert_eq!(app.pending_peer_deliveries.len(), 3);
+    assert!(app.peer_delivery_ready.contains(&target));
+    app.handle_peer_inbox_ack(target, delivery_ids[0]).unwrap();
+    assert!(app.pending_peer_deliveries[&delivery_ids[1]].expires_at > Instant::now());
+    app.shutdown();
+}
+
+#[test]
+fn expired_bulk_flush_head_restores_the_whole_pane_fifo() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender = app.ws().focused_pane_id;
+    let target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split");
+    for index in 0..3 {
+        app.handle_peer_send(sender, &ipc::PaneRef::Id(target), format!("queued-{index}"))
+            .unwrap();
+    }
+    app.handle_peer_set_ready(target, PeerClientKind::Claude, true)
+        .unwrap();
+    let head = *app.pending_peer_deliveries.keys().min().unwrap();
+    app.pending_peer_deliveries
+        .get_mut(&head)
+        .unwrap()
+        .expires_at = Instant::now();
+
+    app.flush_pending_peer_deliveries();
+
+    assert!(app.pending_peer_deliveries.is_empty());
+    assert_eq!(
+        app.pending_peer_inbox[&target]
+            .iter()
+            .map(|message| message.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["queued-0", "queued-1", "queued-2"]
+    );
+    assert!(!app.peer_delivery_ready.contains(&target));
+    app.shutdown();
+}
+
+#[test]
+fn late_follower_ack_removes_requeued_delivery_before_ready_flush() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (_sub_id, rx) = app.event_bus.subscribe();
+    let sender = app.ws().focused_pane_id;
+    let target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split");
+    for body in ["head", "late-acked-follower"] {
+        app.handle_peer_send(sender, &ipc::PaneRef::Id(target), body.into())
+            .unwrap();
+    }
+    app.handle_peer_set_ready(target, PeerClientKind::Claude, true)
+        .unwrap();
+    let delivery_ids = peer_delivery_ids(&rx, 2);
+    app.pending_peer_deliveries
+        .get_mut(&delivery_ids[0])
+        .unwrap()
+        .expires_at = Instant::now();
+    app.flush_pending_peer_deliveries();
+
+    app.handle_peer_inbox_ack(target, delivery_ids[1]).unwrap();
+    assert_eq!(app.pending_peer_inbox[&target].len(), 1);
+    app.handle_peer_set_ready(target, PeerClientKind::Claude, true)
+        .unwrap();
+
+    assert_eq!(peer_delivery_id(&rx), delivery_ids[0]);
+    assert!(rx
+        .try_iter()
+        .all(|event| !matches!(event, ipc::Event::PeerInbox { .. })));
+    app.shutdown();
+}
+
+#[test]
+fn expired_flush_head_leaves_direct_follower_pending_for_its_own_deadline() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (_sub_id, rx) = app.event_bus.subscribe();
+    let sender = app.ws().focused_pane_id;
+    let target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split");
+    for body in ["head", "direct-follower"] {
+        app.handle_peer_send(sender, &ipc::PaneRef::Id(target), body.into())
+            .unwrap();
+    }
+    app.handle_peer_set_ready(target, PeerClientKind::Claude, true)
+        .unwrap();
+    let delivery_ids = peer_delivery_ids(&rx, 2);
+    let (reply_tx, reply_rx) = oneshot::channel();
+    app.begin_peer_send(
+        sender,
+        &ipc::PaneRef::Id(target),
+        "direct-follower".into(),
+        reply_tx,
+    );
+    app.pending_peer_deliveries
+        .get_mut(&delivery_ids[0])
+        .unwrap()
+        .expires_at = Instant::now();
+
+    app.flush_pending_peer_deliveries();
+
+    assert!(app.pending_peer_deliveries.contains_key(&delivery_ids[1]));
+    assert!(reply_rx.recv_timeout(Duration::from_millis(10)).is_err());
+    assert!(!app.peer_delivery_ready.contains(&target));
+    app.pending_peer_deliveries
+        .get_mut(&delivery_ids[1])
+        .unwrap()
+        .next_retry_at = Instant::now();
+    app.flush_pending_peer_deliveries();
+    assert!(rx
+        .try_iter()
+        .all(|event| !matches!(event, ipc::Event::PeerInbox { .. })));
+    app.handle_peer_inbox_ack(target, delivery_ids[1]).unwrap();
+    assert_eq!(
+        reply_rx.recv().unwrap().unwrap(),
+        ipc::PeerSendOutcome::Delivered
+    );
+    app.shutdown();
+}
+
+#[test]
+fn direct_send_joining_a_flush_follower_keeps_its_original_deadline() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (_sub_id, rx) = app.event_bus.subscribe();
+    let sender = app.ws().focused_pane_id;
+    let target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split");
+    for body in ["head", "joined"] {
+        app.handle_peer_send(sender, &ipc::PaneRef::Id(target), body.into())
+            .unwrap();
+    }
+    app.handle_peer_set_ready(target, PeerClientKind::Claude, true)
+        .unwrap();
+    let delivery_ids = peer_delivery_ids(&rx, 2);
+    let (reply_tx, reply_rx) = oneshot::channel();
+    app.begin_peer_send(sender, &ipc::PaneRef::Id(target), "joined".into(), reply_tx);
+    let direct_deadline = app.pending_peer_deliveries[&delivery_ids[1]].expires_at;
+
+    app.handle_peer_inbox_ack(target, delivery_ids[0]).unwrap();
+
+    assert_eq!(
+        app.pending_peer_deliveries[&delivery_ids[1]].expires_at,
+        direct_deadline
+    );
+    app.pending_peer_deliveries
+        .get_mut(&delivery_ids[1])
+        .unwrap()
+        .expires_at = Instant::now();
+    app.flush_pending_peer_deliveries();
+    assert_eq!(
+        reply_rx.recv().unwrap().unwrap_err().code,
+        Some(ipc::err_code::PEER_DELIVERY_UNCONFIRMED)
+    );
+    app.shutdown();
+}
+
+#[test]
+fn bulk_flush_of_128_deliveries_does_not_expire_followers_as_acks_progress() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (_sub_id, rx) = app.event_bus.subscribe();
+    let sender = app.ws().focused_pane_id;
+    let target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split");
+    for index in 0..128 {
+        app.handle_peer_send(sender, &ipc::PaneRef::Id(target), format!("queued-{index}"))
+            .unwrap();
+    }
+    app.handle_peer_set_ready(target, PeerClientKind::Claude, true)
+        .unwrap();
+    let delivery_ids = peer_delivery_ids(&rx, 128);
+    for delivery_id in &delivery_ids[1..] {
+        app.pending_peer_deliveries
+            .get_mut(delivery_id)
+            .unwrap()
+            .expires_at = Instant::now();
+    }
+
+    for delivery_id in delivery_ids {
+        app.handle_peer_inbox_ack(target, delivery_id).unwrap();
+        app.flush_pending_peer_deliveries();
+    }
+
+    assert!(app.pending_peer_deliveries.is_empty());
+    assert!(app.peer_delivery_ready.contains(&target));
+    app.shutdown();
+}
+
 #[test]
 fn production_send_waits_for_mcp_receipt_before_codex_nudge_and_reply() {
     let (mut app, sender, target, rx) = app_with_ready_peer(PeerClientKind::Codex);
