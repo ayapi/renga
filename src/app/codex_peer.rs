@@ -2341,6 +2341,13 @@ mod debug_logging_tests {
             Some(PeerClientKind::Claude),
         )
         .expect("merge duplicate re-nudge");
+        assert_eq!(
+            app.pending_codex_peer_messages
+                .get(&codex_id)
+                .map(|queue| queue.len()),
+            Some(1),
+            "a duplicate re-nudge must merge into the pending one"
+        );
         app.pending_codex_peer_messages.remove(&codex_id);
         app.handle_peer_inbox_head_acknowledged(
             codex_id,
@@ -2350,6 +2357,12 @@ mod debug_logging_tests {
             Some(PeerClientKind::Claude),
         )
         .expect("skip empty inbox");
+        assert!(
+            app.pending_codex_peer_messages
+                .get(&codex_id)
+                .is_none_or(|queue| queue.is_empty()),
+            "remaining=0 must not enqueue a re-nudge"
+        );
         app.shutdown();
         set_codex_peer_debug_log_path_test_override(Some(None));
 

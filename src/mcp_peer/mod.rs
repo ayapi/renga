@@ -5894,6 +5894,46 @@ Commands:
     }
 
     #[test]
+    fn unreachable_app_records_rejected_renudge_and_keeps_ack_response() {
+        // No request_sink here, so the real client::send_request runs against
+        // the dummy endpoint and fails at connect. That is the field shape of
+        // a vanished socket or a wedged App, and it must be recorded as a
+        // rejection rather than a delivery.
+        let path = debug_test_path("renudge-unreachable");
+        let ctx = connected_ctx_with_debug_log(path.clone());
+        enqueue_test_message(&ctx, "first".to_string());
+        enqueue_test_message(&ctx, "second".to_string());
+        let first = handle_check_messages_inner(&json!(1), &json!({}), &ctx).response;
+        let message_id = first
+            .pointer("/result/structuredContent/delivery/message_id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let token = first
+            .pointer("/result/structuredContent/delivery/ack_token")
+            .and_then(Value::as_str)
+            .unwrap();
+        let expected = acknowledged_check_messages_response(&json!(2), message_id, 1);
+
+        let actual = handle_check_messages(
+            &json!(2),
+            &json!({"ack": {"message_id": message_id, "token": token}}),
+            &ctx,
+        );
+
+        assert_eq!(
+            actual, expected,
+            "a failed re-nudge must not alter ack bytes"
+        );
+        let records = read_debug_records(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("renudge_after_ack"),
+            Some(&json!("rejected"))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn check_messages_debug_log_records_rejected_ack_and_null_response() {
         let path = debug_test_path("rejected-ack");
         let ctx = connected_ctx_with_debug_log(path.clone());
