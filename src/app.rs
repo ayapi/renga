@@ -32,7 +32,7 @@ pub use self::app_state::{App, AppCommand, AppEvent};
 #[cfg(test)]
 pub(crate) use self::codex_peer::set_codex_peer_debug_log_path_test_override;
 pub(crate) use self::codex_peer::{
-    append_codex_peer_debug_record, codex_peer_debug_log_path, codex_peer_debug_write_failures,
+    append_codex_peer_debug_record, codex_peer_debug_log_path, take_codex_peer_debug_write_failures,
 };
 #[cfg(test)]
 use self::codex_peer::{

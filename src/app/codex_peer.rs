@@ -27,8 +27,8 @@ pub(crate) fn codex_peer_debug_log_path() -> Option<std::ffi::OsString> {
     resolve_codex_peer_debug_log_path(|| std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG"))
 }
 
-pub(crate) fn codex_peer_debug_write_failures() -> u64 {
-    CODEX_PEER_DEBUG_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+pub(crate) fn take_codex_peer_debug_write_failures() -> u64 {
+    CODEX_PEER_DEBUG_WRITE_FAILURES.swap(0, std::sync::atomic::Ordering::AcqRel)
 }
 
 fn resolve_codex_peer_debug_log_path(
@@ -820,9 +820,19 @@ pub(crate) fn append_codex_peer_debug_record(
             serde_json::json!(record_sequence),
         );
     }
-    let Ok(mut line) = serde_json::to_vec(&record) else {
-        CODEX_PEER_DEBUG_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return;
+    let reported_failures = record
+        .get("trace_write_failures_since_last")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    // serde_json::Value has no fallible serialization cases. Keep this branch
+    // non-panicking and restore any failures reserved for this record anyway.
+    let mut line = match serde_json::to_vec(&record) {
+        Ok(line) => line,
+        Err(_) => {
+            CODEX_PEER_DEBUG_WRITE_FAILURES
+                .fetch_add(reported_failures, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
     };
     line.push(b'\n');
     let Ok(mut file) = std::fs::OpenOptions::new()
@@ -830,20 +840,20 @@ pub(crate) fn append_codex_peer_debug_record(
         .append(true)
         .open(std::path::PathBuf::from(path))
     else {
-        CODEX_PEER_DEBUG_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        CODEX_PEER_DEBUG_WRITE_FAILURES.fetch_add(
+            reported_failures.saturating_add(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         return;
     };
-    if file.write_all(&line).is_err() {
-        CODEX_PEER_DEBUG_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else if let Some(failures) = record
-        .get("trace_write_failures_since_last")
-        .and_then(serde_json::Value::as_u64)
-        .filter(|failures| *failures > 0)
-    {
-        let _ = CODEX_PEER_DEBUG_WRITE_FAILURES.fetch_update(
+    record_codex_peer_write_result(reported_failures, file.write_all(&line));
+}
+
+fn record_codex_peer_write_result(reported_failures: u64, result: std::io::Result<()>) {
+    if result.is_err() {
+        CODEX_PEER_DEBUG_WRITE_FAILURES.fetch_add(
+            reported_failures.saturating_add(1),
             std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |current| Some(current.saturating_sub(failures)),
         );
     }
 }
@@ -3044,19 +3054,57 @@ mod debug_logging_tests {
                 "action": "will_fail"
             }),
         );
-        assert_eq!(codex_peer_debug_write_failures(), 1);
+        assert_eq!(
+            CODEX_PEER_DEBUG_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let failures = take_codex_peer_debug_write_failures();
+        assert_eq!(failures, 1);
+        assert_eq!(
+            CODEX_PEER_DEBUG_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
 
         let path = debug_test_path("write-failure");
         append_codex_peer_debug_record(
             path.as_os_str(),
             serde_json::json!({
                 "action": "heartbeat",
-                "trace_write_failures_since_last": codex_peer_debug_write_failures(),
+                "trace_write_failures_since_last": failures,
             }),
         );
         let records = read_debug_records(&path);
         assert_eq!(records[0]["trace_write_failures_since_last"], 1);
+        assert_eq!(
+            CODEX_PEER_DEBUG_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_trace_write_all_is_counted() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        CODEX_PEER_DEBUG_WRITE_FAILURES.store(2, std::sync::atomic::Ordering::Relaxed);
+        let reported = take_codex_peer_debug_write_failures();
+        let result = std::io::Write::write_all(&mut FailingWriter, b"record");
+        record_codex_peer_write_result(reported, result);
+        assert_eq!(take_codex_peer_debug_write_failures(), 3);
     }
 
     #[test]

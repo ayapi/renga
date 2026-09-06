@@ -27,12 +27,15 @@ resolved path into `PeerCtx`; they do not start the subprocess.
   extra render.
 - `process_exit`: emitted after App shutdown and before terminal cleanup, with
   `reason`, an optional event-loop `error`, `frames_total`, and `uptime_ms`.
+  Uptime starts immediately before `process_start` and event-loop entry.
 - `panic`: emitted by the process panic hook before the default hook, with the
   panic `message`, `thread_name`, and source `location`.
 
-Serialization, open, or write failures increment an in-process counter. The
-next successful heartbeat reports and clears that count. As with every record in this file,
-none of these records are written when `RENGA_DEBUG_CODEX_PEER_LOG` is unset.
+Open or write failures increment an in-process counter. The next successful
+heartbeat reports and clears that count. A permanently unwritable destination
+cannot report its own failure count; this field diagnoses temporary failures
+after writing recovers. As with every record in this file, none of these
+records are written when `RENGA_DEBUG_CODEX_PEER_LOG` is unset.
 All App-side records include `component: "tui"`. Setup failures before the
 event loop and panics before the terminal-restoration hook is installed cannot
 be recorded by these lifecycle entries. Terminal-cleanup failures happen after

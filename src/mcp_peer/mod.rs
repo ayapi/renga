@@ -1139,14 +1139,19 @@ fn append_peer_debug_record(path: &Path, pane_id: Option<usize>, mut record: Val
     record.insert("process_id".to_string(), json!(std::process::id()));
     record.insert("record_sequence".to_string(), json!(record_sequence));
     record.insert("pane_id".to_string(), json!(pane_id));
-    let failures = PEER_DEBUG_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    let failures = take_peer_debug_write_failures();
     record.insert(
         "trace_write_failures_since_last".to_string(),
         json!(failures),
     );
-    let Ok(mut line) = serde_json::to_vec(record) else {
-        PEER_DEBUG_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return;
+    // serde_json::Value has no fallible serialization cases. Keep the
+    // defensive branch non-panicking and return the reserved count.
+    let mut line = match serde_json::to_vec(record) {
+        Ok(line) => line,
+        Err(_) => {
+            PEER_DEBUG_WRITE_FAILURES.fetch_add(failures, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
     };
     line.push(b'\n');
     let Ok(mut file) = std::fs::OpenOptions::new()
@@ -1154,16 +1159,24 @@ fn append_peer_debug_record(path: &Path, pane_id: Option<usize>, mut record: Val
         .append(true)
         .open(path)
     else {
-        PEER_DEBUG_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        PEER_DEBUG_WRITE_FAILURES.fetch_add(
+            failures.saturating_add(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         return;
     };
-    if file.write_all(&line).is_err() {
-        PEER_DEBUG_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else if failures > 0 {
-        let _ = PEER_DEBUG_WRITE_FAILURES.fetch_update(
+    record_peer_write_result(failures, file.write_all(&line));
+}
+
+fn take_peer_debug_write_failures() -> u64 {
+    PEER_DEBUG_WRITE_FAILURES.swap(0, std::sync::atomic::Ordering::AcqRel)
+}
+
+fn record_peer_write_result(reported_failures: u64, result: std::io::Result<()>) {
+    if result.is_err() {
+        PEER_DEBUG_WRITE_FAILURES.fetch_add(
+            reported_failures.saturating_add(1),
             std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |current| Some(current.saturating_sub(failures)),
         );
     }
 }
@@ -6841,6 +6854,9 @@ Commands:
 
     #[test]
     fn failed_peer_trace_append_is_reported_by_next_record() {
+        let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         PEER_DEBUG_WRITE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
         append_peer_debug_record(
             &std::env::temp_dir(),
@@ -6857,7 +6873,49 @@ Commands:
         let records = read_debug_records(&path);
         assert_eq!(records[0]["trace_write_failures_since_last"], 1);
         assert_eq!(records[0]["component"], "mcp_peer");
+        assert_eq!(
+            PEER_DEBUG_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_peer_trace_write_all_is_counted() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        PEER_DEBUG_WRITE_FAILURES.store(2, std::sync::atomic::Ordering::Relaxed);
+        let reported = take_peer_debug_write_failures();
+        let result = FailingWriter.write_all(b"record");
+        record_peer_write_result(reported, result);
+        assert_eq!(
+            PEER_DEBUG_WRITE_FAILURES.swap(0, std::sync::atomic::Ordering::AcqRel),
+            3
+        );
+    }
+
+    #[test]
+    fn concurrent_peer_trace_failure_takes_report_each_failure_once() {
+        let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        PEER_DEBUG_WRITE_FAILURES.store(5, std::sync::atomic::Ordering::Relaxed);
+        let first = thread::spawn(take_peer_debug_write_failures);
+        let second = thread::spawn(take_peer_debug_write_failures);
+        let reported = first.join().unwrap() + second.join().unwrap();
+        assert_eq!(reported, 5);
+        assert_eq!(take_peer_debug_write_failures(), 0);
     }
 
     fn read_debug_records(path: &Path) -> Vec<Value> {

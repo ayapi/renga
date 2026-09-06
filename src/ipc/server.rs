@@ -1161,14 +1161,38 @@ mod tests {
         // been observed not firing inside a tight 150 ms budget).
         let handle = thread::spawn(move || {
             let mut sink = Cursor::new(Vec::<u8>::new());
-            stream_events_inner(&mut sink, rx, Duration::from_millis(50));
-            sink.into_inner()
+            let reason = stream_events_inner(&mut sink, rx, Duration::from_millis(50));
+            (sink.into_inner(), reason)
         });
         thread::sleep(Duration::from_millis(600));
         drop(tx);
-        let bytes = handle.join().unwrap();
+        let (bytes, reason) = handle.join().unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("\"heartbeat\""), "no heartbeat in {text:?}");
+        assert_eq!(reason, "event_bus_closed");
+    }
+
+    #[test]
+    fn stream_events_reports_stream_write_error() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(Event::Heartbeat { ts_ms: 1 }).unwrap();
+        assert_eq!(
+            stream_events_inner(FailingWriter, rx, Duration::from_secs(1)),
+            "stream_write_error"
+        );
     }
 
     #[test]

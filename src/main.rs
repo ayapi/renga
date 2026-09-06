@@ -24,7 +24,7 @@ use std::io;
 use std::panic;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
@@ -34,10 +34,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-#[cfg(not(test))]
 const PROCESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
-#[cfg(test)]
-const PROCESS_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(25);
 
 struct HeartbeatTracker {
     next_at: Instant,
@@ -129,14 +126,46 @@ fn format_panic_record(info: &panic::PanicHookInfo<'_>) -> serde_json::Value {
     panic_record(message, thread_name, location)
 }
 
-fn classify_exit_error(error: &anyhow::Error) -> &'static str {
-    let text = format!("{error:#}");
-    if text.contains("event_read_error") {
-        "event_read_error"
-    } else if text.contains("draw_error") {
-        "draw_error"
-    } else {
-        "error"
+fn write_panic_record(record: serde_json::Value) {
+    let Some(path) = app::codex_peer_debug_log_path() else {
+        return;
+    };
+    // The writer deliberately contains no panicking operations. A panic hook
+    // cannot recover from a second panic, so catch_unwind is not a safeguard.
+    app::append_codex_peer_debug_record(&path, record);
+}
+
+fn write_panic_record_then(record: serde_json::Value, after_trace: impl FnOnce()) {
+    write_panic_record(record);
+    after_trace();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventLoopFailureKind {
+    EventRead,
+    Draw,
+    Other,
+}
+
+struct EventLoopFailure {
+    kind: EventLoopFailureKind,
+    error: anyhow::Error,
+}
+
+impl EventLoopFailure {
+    fn new(kind: EventLoopFailureKind, error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind,
+            error: error.into(),
+        }
+    }
+}
+
+fn classify_exit_error(error: &EventLoopFailure) -> &'static str {
+    match error.kind {
+        EventLoopFailureKind::EventRead => "event_read_error",
+        EventLoopFailureKind::Draw => "draw_error",
+        EventLoopFailureKind::Other => "error",
     }
 }
 
@@ -181,7 +210,7 @@ fn log_heartbeat_if_due(app: &app::App, tracker: &mut HeartbeatTracker, now: Ins
             "frames_since_last": frames_since_last,
             "pane_count": app.workspaces.iter().map(|workspace| workspace.panes.len()).sum::<usize>(),
             "visible_tab": visible_tab,
-            "trace_write_failures_since_last": app::codex_peer_debug_write_failures(),
+            "trace_write_failures_since_last": app::take_codex_peer_debug_write_failures(),
         }),
     );
 }
@@ -238,24 +267,16 @@ fn main() -> Result<()> {
 }
 
 fn run_tui(cli: cli::Cli) -> Result<()> {
-    run_tui_inner(cli)
-}
-
-fn run_tui_inner(cli: cli::Cli) -> Result<()> {
     // Install panic hook to restore terminal state on crash
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
-        let panic_record = format_panic_record(info);
-        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            if let Some(path) = app::codex_peer_debug_log_path() {
-                app::append_codex_peer_debug_record(&path, panic_record);
-            }
-        }));
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), crossterm::event::DisableMouseCapture);
-        let _ = execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        default_hook(info);
+        write_panic_record_then(format_panic_record(info), || {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), crossterm::event::DisableMouseCapture);
+            let _ = execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            default_hook(info);
+        });
     }));
 
     // Capture the host terminal's OSC 10/11 default colors BEFORE raw mode
@@ -428,12 +449,11 @@ fn run_tui_inner(cli: cli::Cli) -> Result<()> {
     app.shutdown();
     let reason = match &result {
         Err(error) => classify_exit_error(error),
-        Ok(()) if app.should_quit => "quit_key",
-        Ok(()) => "normal_exit",
+        Ok(()) => "quit_key",
     };
     log_process_exit(
         reason,
-        result.as_ref().err(),
+        result.as_ref().err().map(|failure| &failure.error),
         frames_total,
         process_started_at.elapsed(),
     );
@@ -450,7 +470,7 @@ fn run_tui_inner(cli: cli::Cli) -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    result
+    result.map_err(|failure| failure.error)
 }
 
 /// Handle an IPC subcommand (`renga send …`, `renga list`, etc.).
@@ -575,7 +595,7 @@ fn run_event_loop(
     app: &mut app::App,
     event_poll_timeout: Duration,
     frames_total: &mut u64,
-) -> Result<()> {
+) -> std::result::Result<(), EventLoopFailure> {
     let mut paste_buffer: Vec<u8> = Vec::new();
     let mut heartbeat = HeartbeatTracker::new(Instant::now());
     app::frame_diagnostics::configure_from_env();
@@ -688,7 +708,7 @@ fn run_event_loop(
                         render_draw_started_at,
                     );
                 })
-                .context("draw_error")?;
+                .map_err(|error| EventLoopFailure::new(EventLoopFailureKind::Draw, error))?;
             // Apply the caret AFTER the draw, while the cursor is still hidden
             // from the pre-draw `Hide`. On conpty, `ui::render` deferred the
             // caret here instead of calling `frame.set_cursor_position`, so
@@ -722,24 +742,43 @@ fn run_event_loop(
         }
 
         // Poll for crossterm events at the configured idle rate.
-        if event::poll(event_poll_timeout).context("event_read_error")? {
-            match event::read().context("event_read_error")? {
+        if event::poll(event_poll_timeout)
+            .map_err(|error| EventLoopFailure::new(EventLoopFailureKind::EventRead, error))?
+        {
+            match event::read()
+                .map_err(|error| EventLoopFailure::new(EventLoopFailureKind::EventRead, error))?
+            {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    let consumed = app.handle_key_event(key)?;
+                    let consumed = app.handle_key_event(key).map_err(|error| {
+                        EventLoopFailure::new(EventLoopFailureKind::Other, error)
+                    })?;
                     if !consumed {
                         // Collect rapid key events as potential paste
                         if let Some(bytes) = crate::app::key_event_to_bytes_pub(&key) {
                             paste_buffer.extend_from_slice(&bytes);
                             // Drain all immediately available key events (paste burst)
-                            while event::poll(Duration::from_millis(1))
-                                .context("event_read_error")?
-                            {
-                                if let Event::Key(k) = event::read().context("event_read_error")? {
+                            while event::poll(Duration::from_millis(1)).map_err(|error| {
+                                EventLoopFailure::new(EventLoopFailureKind::EventRead, error)
+                            })? {
+                                if let Event::Key(k) = event::read().map_err(|error| {
+                                    EventLoopFailure::new(EventLoopFailureKind::EventRead, error)
+                                })? {
                                     if k.kind == KeyEventKind::Press {
-                                        if app.handle_key_event(k)? {
+                                        if app.handle_key_event(k).map_err(|error| {
+                                            EventLoopFailure::new(
+                                                EventLoopFailureKind::Other,
+                                                error,
+                                            )
+                                        })? {
                                             // Shortcut consumed — flush buffer first
                                             if !paste_buffer.is_empty() {
-                                                flush_paste_buffer(app, &mut paste_buffer)?;
+                                                flush_paste_buffer(app, &mut paste_buffer)
+                                                    .map_err(|error| {
+                                                        EventLoopFailure::new(
+                                                            EventLoopFailureKind::Other,
+                                                            error,
+                                                        )
+                                                    })?;
                                             }
                                             break;
                                         }
@@ -751,14 +790,18 @@ fn run_event_loop(
                                     break;
                                 }
                             }
-                            flush_paste_buffer(app, &mut paste_buffer)?;
+                            flush_paste_buffer(app, &mut paste_buffer).map_err(|error| {
+                                EventLoopFailure::new(EventLoopFailureKind::Other, error)
+                            })?;
                         }
                     }
                     app.dirty = true;
                 }
                 Event::Key(_) => {}
                 Event::Paste(text) => {
-                    let routed_to_overlay = app.handle_paste(&text)?;
+                    let routed_to_overlay = app.handle_paste(&text).map_err(|error| {
+                        EventLoopFailure::new(EventLoopFailureKind::Other, error)
+                    })?;
                     if !routed_to_overlay {
                         app.paste_cooldown = 5;
                     }
@@ -860,10 +903,45 @@ fn is_wsl() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        flush_paste_buffer, log_process_exit, log_process_start, panic_record, HeartbeatTracker,
+        classify_exit_error, flush_paste_buffer, log_heartbeat_if_due, log_process_exit,
+        log_process_start, panic_record, write_panic_record_then, EventLoopFailure,
+        EventLoopFailureKind, HeartbeatTracker,
     };
     use crate::app::App;
     use std::time::{Duration, Instant};
+
+    struct EnvVarRestore {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn set(value: &std::ffi::OsStr) -> Self {
+            let previous = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+            std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", value);
+            Self { previous }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", value),
+                None => std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG"),
+            }
+            crate::app::set_codex_peer_debug_log_path_test_override(Some(None));
+        }
+    }
+
+    fn lifecycle_test_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "renga-{label}-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn heartbeat_clock_only_emits_after_interval_and_resets_frame_count() {
@@ -885,19 +963,13 @@ mod tests {
 
     #[test]
     fn process_exit_quit_record_contains_reason_frames_and_uptime() {
-        let path = std::env::temp_dir().join(format!(
-            "renga-process-exit-{}-{}.jsonl",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        crate::app::set_codex_peer_debug_log_path_test_override(Some(Some(
-            path.as_os_str().to_owned(),
-        )));
+        let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let path = lifecycle_test_path("process-exit");
+        let _env = EnvVarRestore::set(path.as_os_str());
+        crate::app::set_codex_peer_debug_log_path_test_override(None);
         log_process_exit("quit_key", None, 42, Duration::from_millis(1234));
-        crate::app::set_codex_peer_debug_log_path_test_override(Some(None));
 
         let line = std::fs::read_to_string(&path).expect("process exit trace");
         let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
@@ -906,7 +978,10 @@ mod tests {
         assert_eq!(record["reason"], "quit_key");
         assert_eq!(record["frames_total"], 42);
         assert_eq!(record["uptime_ms"], 1234);
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG");
+        log_process_exit("quit_key", None, 99, Duration::from_millis(9999));
+        assert!(!path.exists());
     }
 
     #[test]
@@ -914,17 +989,9 @@ mod tests {
         let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let path = std::env::temp_dir().join(format!(
-            "renga-process-start-env-{}-{}.jsonl",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let previous = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+        let path = lifecycle_test_path("process-start-env");
+        let _env = EnvVarRestore::set(path.as_os_str());
         crate::app::set_codex_peer_debug_log_path_test_override(None);
-        std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", &path);
         log_process_start();
         let enabled = std::fs::read_to_string(&path).expect("enabled process start trace");
         assert_eq!(enabled.lines().count(), 1);
@@ -936,12 +1003,80 @@ mod tests {
         std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG");
         log_process_start();
         assert!(!path.exists());
+    }
 
-        match previous {
-            Some(value) => std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", value),
-            None => std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG"),
-        }
+    #[test]
+    fn heartbeat_production_path_records_state_and_obeys_env_absence() {
+        let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let path = lifecycle_test_path("heartbeat-env");
+        let _env = EnvVarRestore::set(path.as_os_str());
+        let mut app = App::new(40, 80).expect("App::new");
+        let expected_tab = app.workspaces[app.active_tab].name.clone();
+        crate::app::set_codex_peer_debug_log_path_test_override(None);
+        let started = Instant::now();
+        let mut tracker = HeartbeatTracker::new(started);
+        tracker.record_frame();
+        tracker.record_frame();
+        log_heartbeat_if_due(
+            &app,
+            &mut tracker,
+            started + super::PROCESS_HEARTBEAT_INTERVAL,
+        );
+
+        let line = std::fs::read_to_string(&path).expect("heartbeat trace");
+        assert_eq!(line.lines().count(), 1);
+        let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(record["action"], "heartbeat");
+        assert_eq!(record["frames_since_last"], 2);
+        assert_eq!(record["pane_count"], 1);
+        assert_eq!(record["visible_tab"], expected_tab);
+        assert_eq!(record["trace_write_failures_since_last"], 0);
+        std::fs::remove_file(&path).unwrap();
+
+        std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG");
+        let mut disabled = HeartbeatTracker::new(started);
+        disabled.record_frame();
+        log_heartbeat_if_due(
+            &app,
+            &mut disabled,
+            started + super::PROCESS_HEARTBEAT_INTERVAL,
+        );
+        assert!(!path.exists());
         crate::app::set_codex_peer_debug_log_path_test_override(Some(None));
+        app.shutdown();
+    }
+
+    #[test]
+    fn panic_trace_failure_still_reaches_default_hook_stage() {
+        let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::app::set_codex_peer_debug_log_path_test_override(Some(Some(
+            std::env::temp_dir().as_os_str().to_owned(),
+        )));
+        let reached = std::cell::Cell::new(false);
+        write_panic_record_then(
+            panic_record("boom".to_owned(), Some("worker".to_owned()), None),
+            || reached.set(true),
+        );
+        crate::app::set_codex_peer_debug_log_path_test_override(Some(None));
+        assert!(reached.get());
+        let _ = crate::app::take_codex_peer_debug_write_failures();
+    }
+
+    #[test]
+    fn exit_error_classification_uses_internal_kind_without_rewriting_error() {
+        for (kind, expected) in [
+            (EventLoopFailureKind::EventRead, "event_read_error"),
+            (EventLoopFailureKind::Draw, "draw_error"),
+            (EventLoopFailureKind::Other, "error"),
+        ] {
+            let failure = EventLoopFailure::new(kind, anyhow::anyhow!("original text"));
+            assert_eq!(classify_exit_error(&failure), expected);
+            assert_eq!(failure.error.to_string(), "original text");
+        }
     }
 
     #[test]
