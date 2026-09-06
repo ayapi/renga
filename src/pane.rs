@@ -1237,10 +1237,13 @@ fn pty_reader_thread(
     // so the buffer cannot grow without bound.
     const TAIL_CAP: usize = 256;
     let mut tail: Vec<u8> = Vec::with_capacity(TAIL_CAP * 2);
+    let mut osc7_stream = Osc7Stream::new();
     let mut control_tail: Vec<u8> = Vec::with_capacity(64);
     let mut osc52_tail: Vec<u8> = Vec::with_capacity(4096);
     #[cfg(test)]
-    let mut osc7_capture_tail: Vec<u8> = Vec::with_capacity(TAIL_CAP * 2);
+    let mut prompt_capture_tail: Vec<u8> = Vec::with_capacity(TAIL_CAP * 2);
+    #[cfg(test)]
+    let mut osc7_capture_stream = Osc7Stream::new();
 
     let mut buf = [0u8; 4096];
     loop {
@@ -1269,7 +1272,7 @@ fn pty_reader_thread(
                 // Release ordering pairs with the Acquire load in
                 // `Pane::try_flush_startup` so the queued startup command
                 // is published to the main thread atomically.
-                if let Some(path) = extract_osc7(data) {
+                if let Some(path) = osc7_stream.push(data) {
                     prompt_seen.store(true, Ordering::Release);
                     // Drop the rolling tail once the latch is set so we
                     // do not retain memory for the rest of the session.
@@ -1314,17 +1317,19 @@ fn pty_reader_thread(
 
                 #[cfg(test)]
                 if let Some(capture) = raw_read_capture.as_ref() {
-                    osc7_capture_tail.extend_from_slice(data);
-                    if osc7_capture_tail.len() > TAIL_CAP * 2 {
-                        let drop = osc7_capture_tail.len() - TAIL_CAP;
-                        osc7_capture_tail.drain(..drop);
+                    prompt_capture_tail.extend_from_slice(data);
+                    if prompt_capture_tail.len() > TAIL_CAP * 2 {
+                        let drop = prompt_capture_tail.len() - TAIL_CAP;
+                        prompt_capture_tail.drain(..drop);
                     }
-                    let osc7_in_rolling = extract_osc7(&osc7_capture_tail).is_some();
-                    let prompt_ready = is_prompt_ready(&osc7_capture_tail);
+                    let osc7_in_rolling = osc7_capture_stream.push(data).is_some();
+                    let prompt_ready = is_prompt_ready(&prompt_capture_tail);
                     let latched_this_read =
                         !prompt_seen_before && prompt_seen.load(Ordering::Acquire);
                     let latch_path = if latched_this_read && osc7_in_chunk {
                         Some("osc7-single-read")
+                    } else if latched_this_read && osc7_in_rolling {
+                        Some("osc7-rolling")
                     } else if latched_this_read && prompt_ready {
                         Some("prompt-tail")
                     } else {
@@ -1340,7 +1345,7 @@ fn pty_reader_thread(
                     capture.reads.push(TestRawRead {
                         elapsed,
                         data: data.to_vec(),
-                        tail: osc7_capture_tail.clone(),
+                        tail: prompt_capture_tail.clone(),
                         prompt_ready,
                         osc7_in_chunk,
                         osc7_in_rolling,
@@ -1558,6 +1563,31 @@ fn extract_osc7(data: &[u8]) -> Option<PathBuf> {
     None
 }
 
+struct Osc7Stream {
+    tail: Vec<u8>,
+}
+
+impl Osc7Stream {
+    const CAP: usize = 4096;
+
+    fn new() -> Self {
+        Self {
+            tail: Vec::with_capacity(Self::CAP),
+        }
+    }
+
+    fn push(&mut self, data: &[u8]) -> Option<PathBuf> {
+        self.tail.extend_from_slice(data);
+        if self.tail.len() > Self::CAP * 2 {
+            let drop = self.tail.len() - Self::CAP;
+            self.tail.drain(..drop);
+        }
+        let path = extract_osc7(&self.tail)?;
+        self.tail.clear();
+        Some(path)
+    }
+}
+
 /// Extract window title from OSC 0 or OSC 2: \x1b]0;TITLE\x07 or \x1b]2;TITLE\x07
 fn extract_osc_title(data: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(data).ok()?;
@@ -1576,15 +1606,16 @@ fn extract_osc_title(data: &[u8]) -> Option<String> {
 
 /// Returns `true` if `buf` looks like the recently-emitted bytes end with
 /// a shell prompt (`$`, `>`, `%`, or `#`), optionally followed by trailing
-/// whitespace and CSI/ANSI escape sequences such as color resets.
+/// whitespace and terminal escape sequences such as color resets and
+/// window-title notifications.
 ///
-/// This is intentionally conservative: it strips only ANSI CSI sequences
-/// (`ESC [ ... <final-byte>`) and trailing ASCII whitespace. False
+/// This is intentionally conservative: it strips ANSI CSI sequences,
+/// OSC strings, simple two-byte ESC sequences, and trailing ASCII whitespace. False
 /// negatives (e.g. exotic prompt styles) only delay startup-command flush
 /// by one PTY read cycle. False positives risk firing the startup command
 /// against a still-initializing shell.
 pub fn is_prompt_ready(buf: &[u8]) -> bool {
-    let stripped = strip_csi_escapes(buf);
+    let stripped = strip_terminal_escapes(buf);
     let trimmed = trim_ascii_whitespace_end(&stripped);
     let Some(&last) = trimmed.last() else {
         return false;
@@ -1610,18 +1641,47 @@ pub fn is_prompt_ready(buf: &[u8]) -> bool {
     true
 }
 
-fn strip_csi_escapes(buf: &[u8]) -> Vec<u8> {
+fn strip_terminal_escapes(buf: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(buf.len());
     let mut i = 0;
     while i < buf.len() {
-        if buf[i] == 0x1b && i + 1 < buf.len() && buf[i + 1] == b'[' {
-            i += 2;
-            while i < buf.len() {
-                let c = buf[i];
-                i += 1;
-                if (0x40..=0x7E).contains(&c) {
-                    break;
+        if buf[i] == 0x1b {
+            match buf.get(i + 1).copied() {
+                Some(b'[') => {
+                    i += 2;
+                    while i < buf.len() {
+                        let c = buf[i];
+                        i += 1;
+                        if (0x40..=0x7e).contains(&c) {
+                            break;
+                        }
+                    }
                 }
+                Some(b']') => {
+                    i += 2;
+                    while i < buf.len() {
+                        if buf[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if buf[i] == 0x1b && buf.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                Some(0x20..=0x2f) => {
+                    i += 2;
+                    while matches!(buf.get(i), Some(0x20..=0x2f)) {
+                        i += 1;
+                    }
+                    if matches!(buf.get(i), Some(0x30..=0x7e)) {
+                        i += 1;
+                    }
+                }
+                Some(_) => i += 2,
+                None => i += 1,
             }
         } else {
             out.push(buf[i]);
@@ -1869,6 +1929,19 @@ mod tests {
         assert_eq!(local, Some(PathBuf::from("/workspace/project")));
         assert_eq!(hosted, local);
         assert_eq!(extract_osc7(b"\x1b]7;file://host\x07"), None);
+    }
+
+    #[test]
+    fn osc7_stream_detects_sequence_split_across_reads() {
+        let mut stream = Osc7Stream::new();
+        assert_eq!(
+            stream.push(b"\x1b]7;file://AYAPI-PX13/c/Users/color/Dev"),
+            None
+        );
+        assert_eq!(
+            stream.push(b"elop/renga-cdr\x07"),
+            Some(PathBuf::from(r"C:\Users\color\Develop\renga-cdr"))
+        );
     }
 
     #[test]
@@ -2756,6 +2829,24 @@ mod tests {
     fn prompt_ready_strips_trailing_ansi_color() {
         // Common: prompt char then color reset
         assert!(is_prompt_ready(b"user@host:~$ \x1b[0m"));
+    }
+
+    #[test]
+    fn prompt_ready_strips_captured_git_bash_osc_title() {
+        // Real ConPTY bytes captured from Git Bash without renga's setup
+        // injection. The prompt marker precedes an OSC 0 window title.
+        let captured = concat!(
+            "(base) \x1b[32m\r\ncolor@AYAPI-PX13 \x1b[35mMINGW64 ",
+            "\x1b[33m~/Develop/renga-cdr \x1b[36m(renga-cdr)\x1b[m\r\n",
+            "$ \x1b]0;MINGW64:/c/Users/color/Develop/renga-cdr\x07",
+        );
+        assert!(is_prompt_ready(captured.as_bytes()));
+    }
+
+    #[test]
+    fn prompt_ready_strips_osc_st_and_simple_escapes() {
+        assert!(is_prompt_ready(b"user@host:~$ \x1b]0;title\x1b\\"));
+        assert!(is_prompt_ready(b"user@host:~$ \x1b=\x1b>\x1b(B\x1b7\x1b8"));
     }
 
     #[test]
