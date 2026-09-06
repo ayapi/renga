@@ -343,6 +343,9 @@ pub struct App {
     /// subscription is active, at which point these are emitted in
     /// original send order.
     pub(crate) pending_peer_inbox: HashMap<usize, VecDeque<PendingPeerInboxMessage>>,
+    /// Per-pane sequence for App-side pending peer inbox diagnostics. Kept
+    /// separate from Codex nudge delivery sequences.
+    pub(crate) peer_inbox_debug_sequences: HashMap<usize, u64>,
     /// Peer events awaiting an explicit receipt from the target MCP
     /// process. These are retried with the same id until confirmed or
     /// failed before the IPC caller's reply timeout.

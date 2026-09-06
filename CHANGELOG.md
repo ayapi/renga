@@ -14,8 +14,8 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 - **Trace-only peer push lifecycle records under
   `RENGA_DEBUG_CODEX_PEER_LOG`.** The App ready queue and mcp-peer push buffer
   now record queueing, initialization, subscription, flush, emission, cap drop,
-  readiness publication, and readiness revocation timing without changing
-  delivery behavior or the wire format. (renga-7j8)
+  emission failures, readiness publication, and all three readiness revocation
+  paths without changing delivery behavior or the wire format. (renga-7j8)
 
 - **Codex pull inboxes now request one best-effort follow-up nudge after an
   acknowledgement leaves another message queued.** The additive

@@ -71,7 +71,7 @@ pub(crate) struct PendingPeerInboxMessage {
     pub(crate) from_kind: Option<PeerClientKind>,
     pub(crate) body: String,
     pub(crate) ts_ms: u64,
-    pub(crate) debug_delivery_sequence: Option<u64>,
+    pub(crate) debug_peer_inbox_sequence: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -815,11 +815,14 @@ fn peer_client_kind_label(kind: PeerClientKind) -> &'static str {
     }
 }
 
-fn log_peer_delivery_record(record: serde_json::Value) {
-    let Some(path) = codex_peer_debug_log_path() else {
+fn log_peer_delivery_record(
+    path: Option<&std::ffi::OsStr>,
+    build_record: impl FnOnce() -> serde_json::Value,
+) {
+    let Some(path) = path else {
         return;
     };
-    append_codex_peer_debug_record(&path, record);
+    append_codex_peer_debug_record(path, build_record());
 }
 
 fn log_codex_peer_decision(path: &std::ffi::OsStr, decision: CodexPeerDecision<'_>) {
@@ -1034,13 +1037,13 @@ impl App {
         } else {
             None
         };
-        let mut message = PendingPeerInboxMessage {
+        let message = PendingPeerInboxMessage {
             from_pane,
             from_name,
             from_kind,
             body: body.clone(),
             ts_ms: ipc::events::now_ms(),
-            debug_delivery_sequence: None,
+            debug_peer_inbox_sequence: None,
         };
         if self.peer_delivery_ready.contains(&target_id) {
             Ok(PreparedPeerSend::Confirm {
@@ -1063,29 +1066,38 @@ impl App {
                     format!("peer inbox queue for pane {target_id} is full"),
                 ));
             }
-            message.debug_delivery_sequence = codex_peer_debug_log_path().map(|_| {
-                let sequence = self
-                    .codex_peer_delivery_sequences
-                    .entry(target_id)
-                    .or_insert(0);
-                *sequence = sequence.saturating_add(1);
-                *sequence
-            });
-            let queue = self.pending_peer_inbox.entry(target_id).or_default();
-            queue.push_back(message);
-            let delivery_sequence = queue
-                .back()
-                .and_then(|message| message.debug_delivery_sequence);
-            log_peer_delivery_record(serde_json::json!({
-                "action": "peer_inbox_queued_until_ready",
-                "pane_id": target_id,
-                "delivery_sequence": delivery_sequence,
-                "queue_len_after": queue.len(),
-            }));
+            self.queue_peer_inbox_until_ready(target_id, message);
             let outcome = ipc::PeerSendOutcome::Queued;
             self.record_peer_send(target_id, from_pane, &body, outcome);
             Ok(PreparedPeerSend::Immediate(outcome))
         }
+    }
+
+    fn queue_peer_inbox_until_ready(
+        &mut self,
+        pane_id: usize,
+        mut message: PendingPeerInboxMessage,
+    ) {
+        let debug_log_path = codex_peer_debug_log_path();
+        message.debug_peer_inbox_sequence = debug_log_path.as_ref().map(|_| {
+            let sequence = self.peer_inbox_debug_sequences.entry(pane_id).or_insert(0);
+            *sequence = sequence.saturating_add(1);
+            *sequence
+        });
+        let queue = self.pending_peer_inbox.entry(pane_id).or_default();
+        queue.push_back(message);
+        let peer_inbox_sequence = queue
+            .back()
+            .and_then(|message| message.debug_peer_inbox_sequence);
+        let queue_len_after = queue.len();
+        log_peer_delivery_record(debug_log_path.as_deref(), || {
+            serde_json::json!({
+                "action": "peer_inbox_queued_until_ready",
+                "pane_id": pane_id,
+                "peer_inbox_sequence": peer_inbox_sequence,
+                "queue_len_after": queue_len_after,
+            })
+        });
     }
 
     pub(crate) fn begin_peer_send(
@@ -1325,15 +1337,15 @@ impl App {
             };
             if pending.replies.is_empty() {
                 self.peer_delivery_ready.remove(&pending.target_pane);
-                log_peer_delivery_record(serde_json::json!({
-                    "action": "peer_delivery_ready_cleared",
-                    "pane_id": pending.target_pane,
-                    "reason": "unconfirmed_delivery_expired",
-                }));
-                self.pending_peer_inbox
-                    .entry(pending.target_pane)
-                    .or_default()
-                    .push_back(pending.message);
+                let debug_log_path = codex_peer_debug_log_path();
+                log_peer_delivery_record(debug_log_path.as_deref(), || {
+                    serde_json::json!({
+                        "action": "peer_delivery_ready_cleared",
+                        "pane_id": pending.target_pane,
+                        "reason": "unconfirmed_delivery_expired",
+                    })
+                });
+                self.queue_peer_inbox_until_ready(pending.target_pane, pending.message);
             } else {
                 let error = ipc::CodedError::new(
                     ipc::err_code::PEER_DELIVERY_UNCONFIRMED,
@@ -1434,6 +1446,14 @@ impl App {
             })?;
         if !ready {
             self.peer_delivery_ready.remove(&pane_id);
+            let debug_log_path = codex_peer_debug_log_path();
+            log_peer_delivery_record(debug_log_path.as_deref(), || {
+                serde_json::json!({
+                    "action": "peer_delivery_ready_cleared",
+                    "pane_id": pane_id,
+                    "reason": "set_ready_false",
+                })
+            });
             return Ok(());
         }
         // Readiness and kind travel atomically so a failed earlier metadata
@@ -1442,19 +1462,23 @@ impl App {
         log_codex_peer_kind_update(pane_id, old_kind, kind, "set_ready");
         self.peer_delivery_ready.insert(pane_id);
         let messages = self.pending_peer_inbox.remove(&pane_id);
-        let delivery_sequences: Vec<u64> = messages
+        let peer_inbox_sequences: Vec<u64> = messages
             .as_ref()
             .into_iter()
             .flat_map(|messages| messages.iter())
-            .filter_map(|message| message.debug_delivery_sequence)
+            .filter_map(|message| message.debug_peer_inbox_sequence)
             .collect();
-        log_peer_delivery_record(serde_json::json!({
-            "action": "peer_set_ready_flush",
-            "pane_id": pane_id,
-            "client_kind": peer_client_kind_label(kind),
-            "flushed_count": messages.as_ref().map_or(0, VecDeque::len),
-            "delivery_sequences": delivery_sequences,
-        }));
+        let flushed_count = messages.as_ref().map_or(0, VecDeque::len);
+        let debug_log_path = codex_peer_debug_log_path();
+        log_peer_delivery_record(debug_log_path.as_deref(), || {
+            serde_json::json!({
+                "action": "peer_set_ready_flush",
+                "pane_id": pane_id,
+                "client_kind": peer_client_kind_label(kind),
+                "flushed_count": flushed_count,
+                "peer_inbox_sequences": peer_inbox_sequences,
+            })
+        });
         if let Some(messages) = messages {
             let count = messages.len();
             let is_codex = self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex);
@@ -1476,11 +1500,14 @@ impl App {
     /// same transport-liveness requirement.
     pub(crate) fn handle_peer_subscriber_gone(&mut self, pane_id: usize) {
         self.peer_delivery_ready.remove(&pane_id);
-        log_peer_delivery_record(serde_json::json!({
-            "action": "peer_delivery_ready_cleared",
-            "pane_id": pane_id,
-            "reason": "subscriber_gone",
-        }));
+        let debug_log_path = codex_peer_debug_log_path();
+        log_peer_delivery_record(debug_log_path.as_deref(), || {
+            serde_json::json!({
+                "action": "peer_delivery_ready_cleared",
+                "pane_id": pane_id,
+                "reason": "subscriber_gone",
+            })
+        });
         let mut failed: Vec<u64> = self
             .pending_peer_deliveries
             .iter()
@@ -1492,10 +1519,7 @@ impl App {
                 continue;
             };
             if pending.replies.is_empty() {
-                self.pending_peer_inbox
-                    .entry(pane_id)
-                    .or_default()
-                    .push_back(pending.message);
+                self.queue_peer_inbox_until_ready(pane_id, pending.message);
             } else {
                 let error = ipc::CodedError::new(
                     ipc::err_code::PEER_DELIVERY_UNCONFIRMED,
@@ -2500,24 +2524,42 @@ mod debug_logging_tests {
             }
         }
         app.flush_pending_peer_deliveries();
+        app.handle_peer_set_ready(target_id, PeerClientKind::Claude, true)
+            .expect("flush requeued peer message");
         app.handle_peer_subscriber_gone(target_id);
+        app.handle_peer_set_ready(target_id, PeerClientKind::Claude, false)
+            .expect("clear readiness");
         app.shutdown();
         set_codex_peer_debug_log_path_test_override(Some(None));
 
         let records = read_debug_records(&path);
-        let queue = records
+        let queue_records: Vec<_> = records
             .iter()
-            .find(|record| record["action"] == "peer_inbox_queued_until_ready")
-            .expect("queue record");
-        let flush = records
+            .filter(|record| record["action"] == "peer_inbox_queued_until_ready")
+            .collect();
+        let flush_records: Vec<_> = records
             .iter()
-            .find(|record| record["action"] == "peer_set_ready_flush")
-            .expect("flush record");
-        assert_eq!(queue["pane_id"], target_id);
-        assert_eq!(queue["queue_len_after"], 1);
-        assert_eq!(flush["client_kind"], "claude");
-        assert_eq!(flush["flushed_count"], 1);
-        assert_eq!(flush["delivery_sequences"][0], queue["delivery_sequence"]);
+            .filter(|record| record["action"] == "peer_set_ready_flush")
+            .collect();
+        assert_eq!(queue_records.len(), 3);
+        assert_eq!(flush_records.len(), 2);
+        for (index, record) in queue_records.iter().enumerate() {
+            assert_eq!(record["pane_id"], target_id);
+            assert_eq!(record["queue_len_after"], 1);
+            assert_eq!(record["peer_inbox_sequence"], index + 1);
+        }
+        for record in &flush_records {
+            assert_eq!(record["client_kind"], "claude");
+            assert_eq!(record["flushed_count"], 1);
+        }
+        assert_eq!(
+            flush_records[0]["peer_inbox_sequences"][0],
+            queue_records[0]["peer_inbox_sequence"]
+        );
+        assert_eq!(
+            flush_records[1]["peer_inbox_sequences"][0],
+            queue_records[1]["peer_inbox_sequence"]
+        );
         let clear_reasons: Vec<_> = records
             .iter()
             .filter(|record| record["action"] == "peer_delivery_ready_cleared")
@@ -2525,7 +2567,11 @@ mod debug_logging_tests {
             .collect();
         assert_eq!(
             clear_reasons,
-            ["unconfirmed_delivery_expired", "subscriber_gone"]
+            [
+                "unconfirmed_delivery_expired",
+                "subscriber_gone",
+                "set_ready_false"
+            ]
         );
         for record in records.iter().filter(|record| {
             matches!(
@@ -2546,12 +2592,70 @@ mod debug_logging_tests {
 
     #[test]
     fn peer_delivery_debug_log_disabled_writes_nothing() {
+        let _env_guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let path = debug_test_path("delivery-disabled");
+        let previous = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+        std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", &path);
+        set_codex_peer_debug_log_path_test_override(Some(Some(path.as_os_str().to_owned())));
+        let mut enabled = App::new(40, 80).expect("App::new");
+        let enabled_sender = enabled.workspaces[enabled.active_tab].focused_pane_id;
+        let enabled_target = enabled
+            .handle_split(
+                &PaneRef::Focused,
+                ipc::Direction::Vertical,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("split");
+        enabled
+            .prepare_peer_send(
+                enabled_sender,
+                &PaneRef::Id(enabled_target),
+                "enabled".into(),
+            )
+            .expect("queue peer message");
+        enabled
+            .handle_peer_set_ready(enabled_target, PeerClientKind::Claude, true)
+            .expect("flush peer message");
+        enabled.shutdown();
+        assert!(
+            path.exists(),
+            "enabled production paths must write the file"
+        );
+        std::fs::remove_file(&path).expect("remove enabled debug JSONL");
+
         set_codex_peer_debug_log_path_test_override(Some(None));
-        log_peer_delivery_record(serde_json::json!({
-            "action": "peer_inbox_queued_until_ready",
-            "pane_id": 1,
-        }));
+        let mut disabled = App::new(40, 80).expect("App::new");
+        let disabled_sender = disabled.workspaces[disabled.active_tab].focused_pane_id;
+        let disabled_target = disabled
+            .handle_split(
+                &PaneRef::Focused,
+                ipc::Direction::Vertical,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("split");
+        disabled
+            .prepare_peer_send(
+                disabled_sender,
+                &PaneRef::Id(disabled_target),
+                "disabled".into(),
+            )
+            .expect("queue peer message");
+        disabled
+            .handle_peer_set_ready(disabled_target, PeerClientKind::Claude, true)
+            .expect("flush peer message");
+        disabled.shutdown();
+        match previous {
+            Some(value) => std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", value),
+            None => std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG"),
+        }
         assert!(!path.exists());
     }
 

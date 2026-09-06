@@ -74,6 +74,7 @@ impl App {
             peer_client_kinds: HashMap::new(),
             peer_delivery_ready: HashSet::new(),
             pending_peer_inbox: HashMap::new(),
+            peer_inbox_debug_sequences: HashMap::new(),
             pending_peer_deliveries: HashMap::new(),
             next_peer_delivery_id: 1,
             pending_codex_peer_messages: HashMap::new(),

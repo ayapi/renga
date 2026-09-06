@@ -51,6 +51,7 @@ impl App {
                 self.peer_client_kinds.remove(pid);
                 self.peer_delivery_ready.remove(pid);
                 self.pending_peer_inbox.remove(pid);
+                self.peer_inbox_debug_sequences.remove(pid);
                 self.pending_codex_peer_messages.remove(pid);
                 self.codex_peer_delivery_sequences.remove(pid);
                 self.codex_peer_debug_observations.remove(pid);
@@ -307,6 +308,7 @@ impl App {
         self.peer_client_kinds.remove(&pane_id);
         self.peer_delivery_ready.remove(&pane_id);
         self.pending_peer_inbox.remove(&pane_id);
+        self.peer_inbox_debug_sequences.remove(&pane_id);
         self.pending_codex_peer_messages.remove(&pane_id);
         self.codex_peer_delivery_sequences.remove(&pane_id);
         self.codex_peer_debug_observations.remove(&pane_id);
