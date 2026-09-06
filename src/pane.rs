@@ -1611,7 +1611,7 @@ fn extract_osc_title(data: &[u8]) -> Option<String> {
 /// window-title notifications.
 ///
 /// This is intentionally conservative: it strips ANSI CSI sequences,
-/// OSC strings, simple two-byte ESC sequences, and trailing ASCII whitespace. False
+/// OSC strings, simple ESC sequences, and trailing ASCII whitespace. False
 /// negatives (e.g. exotic prompt styles) only delay startup-command flush
 /// by one PTY read cycle. False positives risk firing the startup command
 /// against a still-initializing shell.
@@ -1865,12 +1865,15 @@ mod tests {
             ("dash", git.join(r"usr\bin\dash.exe"), false),
         ];
 
-        for (case, shell, skip_setup) in cases {
-            assert!(
-                shell.exists(),
-                "test shell does not exist: {}",
-                shell.display()
+        if !cfg!(windows) || cases.iter().any(|(_, shell, _)| !shell.exists()) {
+            eprintln!(
+                "skipping: capture requires Git for Windows at {}",
+                git.display()
             );
+            return;
+        }
+
+        for (case, shell, skip_setup) in cases {
             for run in 1..=3 {
                 let (tx, _rx) = std::sync::mpsc::channel();
                 let mut pane = Pane::new_real_with_raw_capture(
