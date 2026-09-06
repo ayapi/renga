@@ -864,8 +864,11 @@ impl MonitorWorker {
         resumed_from_cache: bool,
         elapsed: Duration,
     ) {
+        let Some(trace_path) = self.trace_path.as_deref() else {
+            return;
+        };
         write_worker_record(
-            self.trace_path.as_deref(),
+            Some(trace_path),
             serde_json::json!({
                 "action": "claude_monitor_worker",
                 "pane_id": pane_id,
@@ -1482,6 +1485,56 @@ mod tests {
     }
 
     #[test]
+    fn update_and_state_stay_responsive_while_worker_is_reading() {
+        let path = temp_transcript("responsive-during-read");
+        std::fs::write(
+            &path,
+            "{\"type\":\"assistant\",\"requestId\":\"reading\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n",
+        )
+        .expect("write transcript");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let monitor = ClaudeMonitor::new_with_filesystem(Arc::new(BlockingReadFilesystem {
+            path: path.clone(),
+            entered: entered_tx,
+            release: Arc::clone(&release),
+        }));
+        monitor.start_with_trace(None);
+        monitor.update(51, Path::new("project"));
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker entered read");
+
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let state_monitor = monitor.clone();
+        let state_tx = completed_tx.clone();
+        let state_thread = thread::spawn(move || {
+            let _ = state_monitor.state(51);
+            let _ = state_tx.send("state");
+        });
+        let update_monitor = monitor.clone();
+        let update_thread = thread::spawn(move || {
+            update_monitor.update(52, Path::new("second-project"));
+            let _ = completed_tx.send("update");
+        });
+
+        let first = completed_rx.recv_timeout(Duration::from_millis(200));
+        let second = completed_rx.recv_timeout(Duration::from_millis(200));
+        release.store(true, Ordering::Release);
+        state_thread.join().expect("state thread");
+        update_thread.join().expect("update thread");
+        let mut completed = [
+            first.expect("first caller stayed responsive"),
+            second.expect("second caller stayed responsive"),
+        ];
+        completed.sort_unstable();
+        assert_eq!(completed, ["state", "update"]);
+
+        monitor.shutdown();
+        std::fs::remove_file(path).expect("remove transcript");
+    }
+
+    #[test]
     fn remove_prevents_a_late_worker_result_from_recreating_the_pane() {
         let path = temp_transcript("late-result");
         std::fs::write(
@@ -1521,6 +1574,48 @@ mod tests {
         std::fs::remove_file(path).expect("remove transcript");
     }
 
+    #[test]
+    fn drain_requests_removes_the_worker_pane_but_keeps_shared_cache() {
+        let shared = Arc::new(Mutex::new(SharedState::default()));
+        let requests = Arc::new(Mutex::new(WorkerRequests::default()));
+        requests.lock().expect("requests").removals.insert(73);
+        let mut worker = MonitorWorker::new(
+            shared,
+            Arc::clone(&requests),
+            Arc::new(WorkerMetrics::default()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Arc::new(RealMonitorFilesystem),
+        );
+        worker
+            .panes
+            .insert(73, WorkerPane::new(PathBuf::from("project")));
+        worker.queued.insert(73);
+        worker.work_queue.push_back(73);
+        let cached_path = PathBuf::from("project/cached.jsonl");
+        worker
+            .projects
+            .entry(PathBuf::from("project"))
+            .or_default()
+            .transcripts
+            .insert(
+                cached_path.clone(),
+                CachedTranscript {
+                    monitor: TranscriptMonitor::new(),
+                    last_used: 1,
+                },
+            );
+
+        worker.drain_requests();
+
+        assert!(!worker.panes.contains_key(&73));
+        assert!(!worker.queued.contains(&73));
+        assert!(!worker.work_queue.contains(&73));
+        assert!(worker.projects[Path::new("project")]
+            .transcripts
+            .contains_key(&cached_path));
+    }
+
     struct SwitchingFilesystem {
         selected: Arc<Mutex<Option<PathBuf>>>,
     }
@@ -1546,6 +1641,123 @@ mod tests {
         ) -> Option<(Vec<String>, u64, usize)> {
             read_transcript_batch(path, read_from, max_bytes)
         }
+    }
+
+    #[test]
+    fn shutdown_stops_the_shared_worker_and_discards_later_updates() {
+        let transcript = temp_transcript("shutdown");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"requestId\":\"shutdown\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n",
+        )
+        .expect("write transcript");
+        let monitor = ClaudeMonitor::new_with_filesystem(Arc::new(SwitchingFilesystem {
+            selected: Arc::new(Mutex::new(Some(transcript.clone()))),
+        }));
+        monitor.start_with_trace(None);
+        monitor.update(1, Path::new("project"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while monitor.core.metrics.lines_parsed.load(Ordering::Acquire) == 0
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let clone = monitor.clone();
+        clone.shutdown();
+
+        assert!(!monitor.core.worker_alive.load(Ordering::Acquire));
+        assert!(monitor.core.worker.lock().expect("worker slot").is_none());
+        monitor.update(99, Path::new("ignored-after-shutdown"));
+        assert!(!monitor
+            .core
+            .shared
+            .lock()
+            .expect("published state")
+            .panes
+            .contains_key(&99));
+        std::fs::remove_file(transcript).expect("remove transcript");
+    }
+
+    struct PanickingFilesystem {
+        entered: mpsc::Sender<()>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl MonitorFilesystem for PanickingFilesystem {
+        fn path_exists(&self, _path: &Path) -> bool {
+            false
+        }
+
+        fn find_jsonl_path(&self, _cwd: &Path) -> Option<PathBuf> {
+            let _ = self.entered.send(());
+            while !self.release.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            panic!("intentional monitor worker panic")
+        }
+
+        fn metadata(&self, _path: &Path) -> Option<TranscriptMetadata> {
+            None
+        }
+
+        fn read_batch(
+            &self,
+            _path: &Path,
+            _read_from: u64,
+            _max_bytes: usize,
+        ) -> Option<(Vec<String>, u64, usize)> {
+            None
+        }
+    }
+
+    #[test]
+    fn worker_panic_clears_state_and_writes_one_stopped_record() {
+        let trace_path = temp_transcript("worker-panic-trace");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let monitor = ClaudeMonitor::new_with_filesystem(Arc::new(PanickingFilesystem {
+            entered: entered_tx,
+            release: Arc::clone(&release),
+        }));
+        monitor.start_with_trace(Some(trace_path.as_os_str().to_owned()));
+        monitor.update(88, Path::new("panic-project"));
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker entered filesystem");
+        monitor
+            .core
+            .shared
+            .lock()
+            .expect("published state")
+            .panes
+            .get_mut(&88)
+            .expect("pane view")
+            .state
+            .input_tokens = 99;
+        release.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while monitor.core.worker_alive.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(!monitor.core.worker_alive.load(Ordering::Acquire));
+        assert_eq!(monitor.state(88), ClaudeState::default());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !trace_path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let contents = std::fs::read_to_string(&trace_path).expect("panic trace");
+        assert_eq!(
+            contents
+                .lines()
+                .filter(|line| line.contains("claude_monitor_worker_stopped"))
+                .count(),
+            1
+        );
+        assert!(contents.contains("\"reason\":\"panic\""));
+        monitor.shutdown();
+        std::fs::remove_file(trace_path).expect("remove panic trace");
     }
 
     struct TraceEnvRestore(Option<OsString>);
@@ -1703,6 +1915,16 @@ mod tests {
         let mut golden = TranscriptMonitor::new();
         apply_to_end(&path_a, &mut golden, usize::MAX);
         assert_eq!(shared.lock().expect("shared").panes[&1].state, golden.state);
+
+        let replacement = "{\"type\":\"assistant\",\"requestId\":\"replacement\",\"message\":{\"model\":\"claude-haiku-4-5\",\"content\":[],\"usage\":{\"input_tokens\":9},\"stop_reason\":\"end_turn\"}}\n";
+        std::fs::write(&path_a, replacement).expect("truncate A");
+        while worker.process_pane(1) {}
+        let mut truncated_golden = TranscriptMonitor::new();
+        apply_to_end(&path_a, &mut truncated_golden, usize::MAX);
+        assert_eq!(
+            shared.lock().expect("shared").panes[&1].state,
+            truncated_golden.state
+        );
         std::fs::remove_file(path_a).expect("remove A");
         std::fs::remove_file(path_b).expect("remove B");
     }
