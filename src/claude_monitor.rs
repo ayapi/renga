@@ -1554,6 +1554,46 @@ mod tests {
     }
 
     #[test]
+    fn worker_run_emits_coalesced_wakes_after_the_interval() {
+        let path = temp_transcript("coalesced-run-loop");
+        let metrics = Arc::new(WorkerMetrics::default());
+        let elapsed_ms = Arc::new(AtomicU64::new(0));
+        let worker = worker_with_clock(
+            Some(path.as_os_str().to_owned()),
+            Arc::clone(&metrics),
+            Arc::clone(&elapsed_ms),
+        );
+        let stop = Arc::clone(&worker.stop);
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        metrics.coalesced_wakes.store(3, Ordering::Release);
+        elapsed_ms.store(60_000, Ordering::Release);
+        let handle = thread::spawn(move || worker.run(wake_rx));
+
+        wake_tx.send(()).expect("wake worker");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut emitted_before_shutdown = false;
+        while Instant::now() < deadline {
+            let contents = std::fs::read_to_string(&path).unwrap_or_default();
+            if contents.contains("claude_monitor_wake_coalesced") {
+                emitted_before_shutdown = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        stop.store(true, Ordering::Release);
+        wake_tx.send(()).expect("wake worker for shutdown");
+        handle.join().expect("join worker");
+        assert!(emitted_before_shutdown);
+        let contents = std::fs::read_to_string(&path).expect("run-loop trace");
+        let record: serde_json::Value =
+            serde_json::from_str(contents.trim()).expect("trace record");
+        assert_eq!(record["coalesced_wakes"], 3);
+        assert_eq!(record["interval_ms"], 60_000);
+        std::fs::remove_file(path).expect("remove run-loop trace");
+    }
+
+    #[test]
     fn shutdown_flushes_coalesced_wakes_before_the_interval() {
         let path = temp_transcript("coalesced-shutdown-flush");
         let metrics = Arc::new(WorkerMetrics::default());
