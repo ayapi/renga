@@ -863,6 +863,7 @@ fn log_codex_peer_kind_update(
     old_kind: Option<PeerClientKind>,
     new_kind: PeerClientKind,
     update_path: &'static str,
+    pane_title_seen: Option<(bool, bool)>,
 ) {
     let Some(path) = codex_peer_debug_log_path() else {
         return;
@@ -871,6 +872,17 @@ fn log_codex_peer_kind_update(
         PeerClientKind::Claude => "claude",
         PeerClientKind::Codex => "codex",
     };
+    let pane_title_codex_seen = pane_title_seen.map(|(codex_seen, _)| codex_seen);
+    let pane_title_claude_seen = pane_title_seen.map(|(_, claude_seen)| claude_seen);
+    let kind_title_mismatch = pane_title_seen.and_then(|(codex_seen, claude_seen)| {
+        if !codex_seen && !claude_seen {
+            return None;
+        }
+        Some(match new_kind {
+            PeerClientKind::Claude => codex_seen,
+            PeerClientKind::Codex => claude_seen && !codex_seen,
+        })
+    });
     append_codex_peer_debug_record(
         &path,
         serde_json::json!({
@@ -883,6 +895,9 @@ fn log_codex_peer_kind_update(
                 ipc::PeerReceiveMode::Push => "push",
                 ipc::PeerReceiveMode::Pull => "pull",
             },
+            "pane_title_codex_seen": pane_title_codex_seen,
+            "pane_title_claude_seen": pane_title_claude_seen,
+            "kind_title_mismatch": kind_title_mismatch,
         }),
     );
 }
@@ -1978,18 +1993,25 @@ impl App {
         pane_id: usize,
         kind: PeerClientKind,
     ) -> std::result::Result<(), ipc::CodedError> {
-        self.resolve_pane_across_workspaces(&PaneRef::Id(pane_id))
+        let (workspace_index, resolved_pane_id) = self
+            .resolve_pane_across_workspaces(&PaneRef::Id(pane_id))
             .ok_or_else(|| {
                 ipc::CodedError::new(
                     ipc::err_code::PANE_NOT_FOUND,
                     format!("pane {pane_id} not found for peer registration"),
                 )
             })?;
+        let pane_title_seen = self.workspaces.get(workspace_index).and_then(|workspace| {
+            workspace
+                .panes
+                .get(&resolved_pane_id)
+                .map(|pane| (pane.codex_ever_seen(), pane.claude_ever_seen()))
+        });
         self.peer_handover_disconnect_deadlines.remove(&pane_id);
         let generation = self.peer_handover_generations.entry(pane_id).or_default();
         *generation = generation.saturating_add(1);
         let old_kind = self.peer_client_kinds.insert(pane_id, kind);
-        log_codex_peer_kind_update(pane_id, old_kind, kind, "register");
+        log_codex_peer_kind_update(pane_id, old_kind, kind, "register", pane_title_seen);
         Ok(())
     }
 
@@ -1999,13 +2021,20 @@ impl App {
         kind: PeerClientKind,
         ready: bool,
     ) -> std::result::Result<(), ipc::CodedError> {
-        self.resolve_pane_across_workspaces(&PaneRef::Id(pane_id))
+        let (workspace_index, resolved_pane_id) = self
+            .resolve_pane_across_workspaces(&PaneRef::Id(pane_id))
             .ok_or_else(|| {
                 ipc::CodedError::new(
                     ipc::err_code::PANE_NOT_FOUND,
                     format!("pane {pane_id} not found for peer readiness"),
                 )
             })?;
+        let pane_title_seen = self.workspaces.get(workspace_index).and_then(|workspace| {
+            workspace
+                .panes
+                .get(&resolved_pane_id)
+                .map(|pane| (pane.codex_ever_seen(), pane.claude_ever_seen()))
+        });
         if !ready {
             self.peer_delivery_ready.remove(&pane_id);
             let debug_log_path = codex_peer_debug_log_path();
@@ -2022,7 +2051,7 @@ impl App {
         // Readiness and kind travel atomically so a failed earlier metadata
         // registration cannot suppress Codex nudge setup.
         let old_kind = self.peer_client_kinds.insert(pane_id, kind);
-        log_codex_peer_kind_update(pane_id, old_kind, kind, "set_ready");
+        log_codex_peer_kind_update(pane_id, old_kind, kind, "set_ready", pane_title_seen);
         self.peer_delivery_ready.insert(pane_id);
         let messages = self.pending_peer_inbox.remove(&pane_id);
         let peer_inbox_sequences: Vec<u64> = messages
@@ -3152,15 +3181,91 @@ mod debug_logging_tests {
             Some(PeerClientKind::Claude),
             PeerClientKind::Codex,
             "test",
+            Some((false, true)),
         );
+        log_codex_peer_kind_update(
+            18,
+            Some(PeerClientKind::Codex),
+            PeerClientKind::Claude,
+            "test",
+            Some((true, false)),
+        );
+        log_codex_peer_kind_update(
+            19,
+            Some(PeerClientKind::Claude),
+            PeerClientKind::Codex,
+            "test",
+            Some((true, true)),
+        );
+        log_codex_peer_kind_update(
+            20,
+            None,
+            PeerClientKind::Claude,
+            "test",
+            Some((false, false)),
+        );
+        log_codex_peer_kind_update(21, None, PeerClientKind::Claude, "test", None);
         set_codex_peer_debug_log_path_test_override(Some(None));
 
         let contents = std::fs::read_to_string(&path).expect("debug JSONL");
         let lines: Vec<_> = contents.lines().collect();
-        assert_eq!(lines.len(), 1);
-        let record: serde_json::Value = serde_json::from_str(lines[0]).expect("one JSON object");
-        assert_eq!(record["action"], "client_kind_updated");
-        assert_eq!(record["pane_id"], 17);
+        assert_eq!(lines.len(), 5);
+        let records: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("one JSON object"))
+            .collect();
+        assert_eq!(records[0]["action"], "client_kind_updated");
+        assert_eq!(records[0]["pane_id"], 17);
+        assert_eq!(records[0]["pane_title_codex_seen"], false);
+        assert_eq!(records[0]["pane_title_claude_seen"], true);
+        assert_eq!(records[0]["kind_title_mismatch"], true);
+        assert_eq!(records[1]["pane_title_codex_seen"], true);
+        assert_eq!(records[1]["pane_title_claude_seen"], false);
+        assert_eq!(records[1]["kind_title_mismatch"], true);
+        assert_eq!(records[2]["kind_title_mismatch"], false);
+        assert_eq!(records[3]["pane_title_codex_seen"], false);
+        assert_eq!(records[3]["pane_title_claude_seen"], false);
+        assert_eq!(records[3]["kind_title_mismatch"], serde_json::Value::Null);
+        assert_eq!(records[4]["pane_title_codex_seen"], serde_json::Value::Null);
+        assert_eq!(
+            records[4]["pane_title_claude_seen"],
+            serde_json::Value::Null
+        );
+        assert_eq!(records[4]["kind_title_mismatch"], serde_json::Value::Null);
+        std::fs::remove_file(path).expect("remove debug JSONL");
+    }
+
+    #[test]
+    fn kind_update_call_site_captures_pane_title_latches() {
+        let path = debug_test_path("kind-update-pane-title");
+        set_codex_peer_debug_log_path_test_override(Some(Some(path.as_os_str().to_owned())));
+        let mut app = App::new(40, 80).expect("App::new");
+        let pane_id = app.workspaces[app.active_tab].focused_pane_id;
+        app.workspaces[app.active_tab].panes[&pane_id]
+            .codex_seen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        app.handle_peer_register_client(pane_id, PeerClientKind::Claude)
+            .expect("register peer kind");
+        app.handle_peer_set_ready(pane_id, PeerClientKind::Codex, true)
+            .expect("set peer ready");
+        set_codex_peer_debug_log_path_test_override(Some(None));
+
+        let contents = std::fs::read_to_string(&path).expect("debug JSONL");
+        let records: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one JSON object"))
+            .filter(|record| record["action"] == "client_kind_updated")
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["kind_update_path"], "register");
+        assert_eq!(records[0]["pane_title_codex_seen"], true);
+        assert_eq!(records[0]["pane_title_claude_seen"], false);
+        assert_eq!(records[0]["kind_title_mismatch"], true);
+        assert_eq!(records[1]["kind_update_path"], "set_ready");
+        assert_eq!(records[1]["pane_title_codex_seen"], true);
+        assert_eq!(records[1]["pane_title_claude_seen"], false);
+        assert_eq!(records[1]["kind_title_mismatch"], false);
         std::fs::remove_file(path).expect("remove debug JSONL");
     }
 
@@ -3457,7 +3562,13 @@ mod debug_logging_tests {
         set_codex_peer_debug_log_path_test_override(None);
         let _env_restore = EnvVarRestore::set("RENGA_DEBUG_CODEX_PEER_LOG", path.as_os_str());
         let resolved = codex_peer_debug_log_path();
-        log_codex_peer_kind_update(23, None, PeerClientKind::Codex, "production_wiring_test");
+        log_codex_peer_kind_update(
+            23,
+            None,
+            PeerClientKind::Codex,
+            "production_wiring_test",
+            None,
+        );
         set_codex_peer_debug_log_path_test_override(Some(None));
 
         assert_eq!(resolved.as_deref(), Some(path.as_os_str()));
@@ -3467,6 +3578,9 @@ mod debug_logging_tests {
         let record: serde_json::Value = serde_json::from_str(lines[0]).expect("one JSON object");
         assert_eq!(record["action"], "client_kind_updated");
         assert_eq!(record["pane_id"], 23);
+        assert_eq!(record["pane_title_codex_seen"], serde_json::Value::Null);
+        assert_eq!(record["pane_title_claude_seen"], serde_json::Value::Null);
+        assert_eq!(record["kind_title_mismatch"], serde_json::Value::Null);
         std::fs::remove_file(path).expect("remove debug JSONL");
     }
 

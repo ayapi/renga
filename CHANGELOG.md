@@ -20,6 +20,13 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Added
 
+- **Trace-only peer-kind attribution.** `client_kind_resolved` records now
+  include the raw renga socket and owning TUI process id, while TUI-side
+  `client_kind_updated` records include sticky Codex/Claude title evidence and
+  a three-state kind/title mismatch classification. Shared trace files can now
+  identify a misregistration without changing registration, readiness,
+  delivery, or peer-list behavior. (renga-jvn)
+
 - **Trace-only draw component attribution.** Slow-frame diagnostics now split
   `ui::render` time across panes, Claude transcript monitoring, file tree,
   preview, tabs, status bar, the macOS tip, and overlays, and record monitor

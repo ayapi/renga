@@ -40,6 +40,21 @@ absent variable from a value whose endpoint shape could not be parsed. In a
 machine-wide shared trace, correlate `tui_pid` with the TUI records'
 `process_id` before comparing pane ids.
 
+The TUI-side `client_kind_updated` record catalogs every kind write from
+`kind_update_path` (`register` or `set_ready`). Along with the old/new kind and
+receive mode, it records sticky OSC-title evidence as
+`pane_title_codex_seen` and `pane_title_claude_seen`. Both are `null` if the
+pane cannot be found. `kind_title_mismatch` is `null` until either title has
+been seen, `true` when a Claude update conflicts with a seen Codex title or a
+Codex update conflicts with a Claude-only title, and `false` otherwise.
+
+A misregistration is directly identified by a `client_kind_updated` record
+whose `kind_title_mismatch` is `true`. An earlier
+`client_kind_resolved` record with `renga_peer_client_kind_state: "absent"`
+also identifies the faulty mcp-peer when its `tui_pid` and `pane_id` correlate
+with a later `client_kind_updated` record whose `pane_title_codex_seen` is
+`true`.
+
 ### `check_messages`
 
 - `call_shape`: `empty`, `cursor`, or `ack` according to the supplied arguments.
