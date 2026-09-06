@@ -176,6 +176,7 @@ struct CodexPeerScreenSnapshot {
     ready_for_nudge: bool,
     can_queue_message: bool,
     hide_cursor: bool,
+    native_queue_status_label: Option<&'static str>,
     native_queue_busy: bool,
     busy_queue_available: bool,
     can_submit_injected_message: bool,
@@ -199,6 +200,7 @@ pub(crate) struct CodexPeerDebugObservation {
     ready_for_nudge: Option<bool>,
     can_queue_message: Option<bool>,
     hide_cursor: Option<bool>,
+    native_queue_status_label: Option<&'static str>,
     native_queue_busy: Option<bool>,
     busy_queue_available: Option<bool>,
     can_submit_injected_message: Option<bool>,
@@ -519,6 +521,25 @@ fn raw_screen_rows(screen: &vt100::Screen, start: u16, end: u16) -> String {
         .join("\n")
 }
 
+fn codex_native_queue_status_label(status: &str) -> Option<&'static str> {
+    const LABELS: [(&str, &str); 2] = [
+        ("working", "Working"),
+        (
+            "waitingforbackgroundterminal",
+            "Waiting for background terminal",
+        ),
+    ];
+
+    status.lines().find_map(|line| {
+        let status_text = line.trim_start_matches(|ch: char| !ch.is_alphanumeric());
+        LABELS.iter().find_map(|(normalized, label)| {
+            let body = status_text.strip_prefix(normalized)?.strip_prefix('(')?;
+            let (elapsed, _) = body.split_once("•esctointerrupt)")?;
+            (!elapsed.is_empty()).then_some(*label)
+        })
+    })
+}
+
 fn analyze_codex_peer_screen(
     screen: &vt100::Screen,
     capture_debug: bool,
@@ -571,10 +592,8 @@ fn analyze_codex_peer_screen(
     // Positive detection controls whether renga may inject and press Tab, so
     // anchor the busy signal above the composer and the queue action below it.
     // Transcript mentions and unknown future UI safely remain pending.
-    let native_queue_busy = status.lines().any(|line| {
-        let status_text = line.trim_start_matches(|ch: char| !ch.is_alphanumeric());
-        status_text.starts_with("working(") && status_text.contains("esctointerrupt")
-    });
+    let native_queue_status_label = codex_native_queue_status_label(&status);
+    let native_queue_busy = native_queue_status_label.is_some();
     // A partial or unfamiliar interrupt status is not enough evidence to use
     // Codex's native queue, but it is enough to reject the idle path. This
     // keeps wrapped or renamed status text from causing an Enter mid-turn.
@@ -601,6 +620,7 @@ fn analyze_codex_peer_screen(
         ready_for_nudge,
         can_queue_message,
         hide_cursor: screen.hide_cursor(),
+        native_queue_status_label,
         native_queue_busy,
         busy_queue_available,
         can_submit_injected_message,
@@ -648,6 +668,7 @@ impl CodexPeerDebugObservation {
             ready_for_nudge: screen.map(|state| state.ready_for_nudge),
             can_queue_message: screen.map(|state| state.can_queue_message),
             hide_cursor: screen.map(|state| state.hide_cursor),
+            native_queue_status_label: screen.and_then(|state| state.native_queue_status_label),
             native_queue_busy: screen.map(|state| state.native_queue_busy),
             busy_queue_available: screen.map(|state| state.busy_queue_available),
             can_submit_injected_message: screen.map(|state| state.can_submit_injected_message),
@@ -761,6 +782,8 @@ fn log_codex_peer_decision(path: &std::ffi::OsStr, decision: CodexPeerDecision<'
             "ready_for_nudge": screen.map(|state| state.ready_for_nudge),
             "can_queue_message": screen.map(|state| state.can_queue_message),
             "hide_cursor": screen.map(|state| state.hide_cursor),
+            "native_queue_status_label": screen
+                .and_then(|state| state.native_queue_status_label),
             "native_queue_busy": screen.map(|state| state.native_queue_busy),
             "busy_queue_available": screen.map(|state| state.busy_queue_available),
             "can_submit_injected_message": screen.map(|state| state.can_submit_injected_message),
@@ -2470,6 +2493,7 @@ mod debug_logging_tests {
         let record: serde_json::Value = serde_json::from_str(lines[0]).expect("one JSON object");
         assert_eq!(record["action"], "continued_composer_match");
         assert_eq!(record["screen_composer"], "peernudge");
+        assert_eq!(record["native_queue_status_label"], "Working");
         std::fs::remove_file(path).expect("remove debug JSONL");
     }
 

@@ -2622,6 +2622,77 @@ fn busy_codex_uses_structured_status_row() {
 }
 
 #[test]
+fn waiting_for_background_terminal_field_status_uses_native_queue() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    let status = "• Waiting for background terminal (8m 55s • esc to interrupt) · 1 background terminal running · /ps to view · /st…";
+    let command = "└ python .repro/seal_gameocr_c5rl_causal_trace.py";
+    let empty_screen = format!(
+        "\x1b[?25h\x1b[2J\x1b[H{status}\x1b[2;1H{command}\x1b[4;1H\u{203a} \x1b[2mAsk Codex to do anything\x1b[22m\x1b[6;1H  gpt-5.6-sol medium \u{b7} ~\\Develop\\gameocr\x1b[4;3H"
+    );
+    seed_pane_screen(&mut app, codex_id, empty_screen.as_bytes());
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "field background wait".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::QueueAt { .. })
+    ));
+    assert!(
+        !app.ws()
+            .panes
+            .get(&codex_id)
+            .expect("pane")
+            .test_input()
+            .is_empty(),
+        "the measured busy status must allow the draft write"
+    );
+
+    let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: None,
+        from_kind: None,
+    });
+    let chars = expected.chars().collect::<Vec<_>>();
+    let mut queued_screen = format!("\x1b[?25h\x1b[2J\x1b[H{status}\x1b[2;1H{command}");
+    for (index, chunk) in chars.chunks(60).enumerate() {
+        let row = 4 + index;
+        let text = chunk.iter().collect::<String>();
+        let prefix = if index == 0 { "\u{203a} " } else { "  " };
+        queued_screen.push_str(&format!("\x1b[{row};1H{prefix}{text}"));
+    }
+    let footer_row = 5 + chars.chunks(60).len();
+    let cursor_row = 3 + chars.chunks(60).len();
+    let cursor_col = chars.chunks(60).last().map_or(3, |chunk| chunk.len() + 3);
+    queued_screen.push_str(&format!(
+        "\x1b[{footer_row};1H  tab to queue message                40% context left\x1b[{cursor_row};{cursor_col}H"
+    ));
+    seed_pane_screen(&mut app, codex_id, queued_screen.as_bytes());
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    make_codex_native_queue_ready(&mut app, codex_id);
+
+    app.flush_pending_codex_peer_messages();
+
+    assert_eq!(
+        app.ws().panes.get(&codex_id).expect("pane").test_input(),
+        b"\t",
+        "Codex's queue hint must gate the Tab commit"
+    );
+    app.shutdown();
+}
+
+#[test]
 fn nearby_transcript_interrupt_phrase_uses_neither_automatic_path() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     seed_pane_screen(
@@ -2691,7 +2762,7 @@ fn unfamiliar_interrupt_status_blocks_both_queue_and_idle_paths() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Thinking (48s \xE2\x80\xA2 esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Reticulating (12s \xE2\x80\xA2 esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
     );
     app.ws_mut()
         .panes

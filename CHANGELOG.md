@@ -107,6 +107,13 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Fixed
 
+- **Codex peer nudges now use the native Tab queue while Codex is waiting for
+  a background terminal.** The anchored `Waiting for background terminal
+  (<elapsed> • esc to interrupt)` status is recognized alongside `Working`,
+  while the Tab press still requires Codex's own `tab to queue message` footer.
+  This prevents long-running background commands from delaying peer requests
+  until the turn ends. (renga-r2a)
+
 - **`send_message` now reports focused Codex confirmation waits accurately.**
   The additive `pending_user_confirmation` outcome renders as
   `Pending user confirmation for <target>.` instead of claiming delivery.

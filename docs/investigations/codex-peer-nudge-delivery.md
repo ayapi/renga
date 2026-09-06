@@ -344,3 +344,40 @@ debug JSONL では mcp-peer の `check_messages` record の `renudge_after_ack` 
   - `CODEX_PEER_NUDGE_COMMIT_TIMEOUT = 5s`
   - `CODEX_PEER_DRAFT_STALL_TIMEOUT = 1500ms`
   - `CODEX_PEER_NUDGE_MAX_RETRIES = 1`
+
+---
+
+## 9. 追補: background terminal 待機中の native queue（2026-09-06）
+
+gameocr のフィールド trace で、非フォーカス・composer 空の Codex が次の表示のまま
+25分20秒 peer nudge を受け取れない事例を捕捉した。
+
+```text
+• Waiting for background terminal (8m 55s • esc to interrupt) · 1 background terminal running · /ps to view · /st…
+└ python .repro/seal_gameocr_c5rl_causal_trace.py
+```
+
+従来の画面解析は、prompt の上にある status 行が `Working (` で始まる場合だけ
+`native_queue_busy` と認識していた。このため上記では `can_queue_message=false`、
+一方で `esc to interrupt` により idle の Enter 経路も拒否され、turn 終了まで
+`AwaitFocus` に留まった。
+
+Codex CLI v0.153.4 の実機で同じ状態を作り、composer 空では footer が
+`gpt-5.6-sol medium · <cwd>`、文字を入れると
+`tab to queue message                98% context left` に変わることを確認した。
+したがって Codex 自身がこの状態でも native queue を提供している。
+
+認識する status label は現在次の2つ。
+
+- `Working`
+- `Waiting for background terminal`
+
+どちらも prompt 上の status 行に `<label> (<elapsed> • esc to interrupt)` の形で
+現れる必要がある。実際に Tab を押す条件は従来どおり composer 下の
+`tab to queue message` footer で二重に確認する。transcript 内の同じ文言、途中で
+折り返された status、未知の label は自動経路に使わない。`Thinking` は今回の
+実測では queue footer を確認できなかったため、引き続き未知として扱う。
+
+debug trace には `native_queue_status_label` を追加した。認識済みなら上記 label、
+未知または該当 status がなければ `null` を記録する。環境変数
+`RENGA_DEBUG_CODEX_PEER_LOG` が未設定なら、従来どおり trace は出力しない。
