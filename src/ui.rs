@@ -218,6 +218,7 @@ const OVERLAY_MAX_INNER_HEIGHT: u16 = 10;
 const OVERLAY_TARGET_WIDTH_PCT: u16 = 60;
 const OVERLAY_MAX_WIDTH: u16 = 100;
 const OVERLAY_MIN_WIDTH: u16 = 42;
+const CODEX_PEER_NOTIFICATION_HINT: &str = "Alt/Ctrl+Enter send · Esc ignore · arrows pass";
 
 fn render_codex_peer_notification(app: &mut App, frame: &mut Frame, area: Rect) {
     let Some(notification) = app.visible_codex_peer_notification() else {
@@ -282,7 +283,7 @@ fn render_codex_peer_notification(app: &mut App, frame: &mut Frame, area: Rect) 
         )),
     ];
     let hint = Line::from(Span::styled(
-        " Alt/Ctrl+Enter send · Esc ignore · arrows pass ",
+        CODEX_PEER_NOTIFICATION_HINT,
         Style::default().fg(TEXT_DIM),
     ));
     let block = Block::default()
@@ -2038,7 +2039,13 @@ fn pane_title_with_pending(base: &str, pending: u32, max_width: usize) -> String
 
 #[cfg(test)]
 mod pane_title_pending_tests {
-    use super::pane_title_with_pending;
+    use super::{pane_title_with_pending, CODEX_PEER_NOTIFICATION_HINT};
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn codex_peer_notification_hint_fits_narrow_supported_box() {
+        assert!(UnicodeWidthStr::width(CODEX_PEER_NOTIFICATION_HINT) <= 46);
+    }
 
     #[test]
     fn omits_zero_pending_badge() {

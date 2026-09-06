@@ -233,8 +233,11 @@ the same notification remains visible; renga navigation chords such as
 `Alt+Left` and `Alt+PageUp`, plus copy mode, still consume the keys normally.
 Every other key explicitly requeues the message before continuing because
 typing or another action indicates that the user wants the notice out of the
-way. `Alt+Q` remains the earlier global quit shortcut. The mouse path does not
-inspect, dismiss, or requeue Codex peer notifications, so it is unchanged.
+way. `Alt+Q` remains the earlier global quit shortcut. The mouse and pane-
+navigation paths have no notification-specific key handling, but a focus
+change to another pane returns a visible notice to that pane's queue. This is
+pre-existing behavior, is unchanged by this issue, and does not lose the
+message.
 
 Esc / Ctrl+C / commit キー以外の**任意のキー**（矢印キーを含む）が `requeue_codex_peer_notification()` を通り、ダイアログが閉じてキーはそのまま PTY へ落ちる。ユーザー報告でも「左矢印を押したらダイアログが消えて nudge が入った」現象が発生している。
 
