@@ -1516,18 +1516,25 @@ fn push_base64_quartet(out: &mut Vec<u8>, q: [u8; 4]) -> Option<()> {
 
 /// Extract path from OSC 7 escape sequence: \x1b]7;file://HOST/PATH(\x07|\x1b\\)
 fn extract_osc7(data: &[u8]) -> Option<PathBuf> {
-    let s = std::str::from_utf8(data).ok()?;
+    const MARKER: &[u8] = b"\x1b]7;";
+    let mut search_from = 0;
+    while let Some(relative_start) = find_subslice(&data[search_from..], MARKER) {
+        let start = search_from + relative_start + MARKER.len();
+        let rest = &data[start..];
+        let Some((end, after_terminator)) = find_osc_terminator(rest, 0) else {
+            return None;
+        };
+        if let Ok(uri) = std::str::from_utf8(&rest[..end]) {
+            if let Some(path) = parse_osc7_uri(uri) {
+                return Some(path);
+            }
+        }
+        search_from = start + after_terminator;
+    }
+    None
+}
 
-    // Look for OSC 7 pattern
-    let marker = "\x1b]7;";
-    let start = s.find(marker)?;
-    let rest = &s[start + marker.len()..];
-
-    // Find the terminator: BEL (\x07) or ST (\x1b\\)
-    let end = rest.find('\x07').or_else(|| rest.find("\x1b\\"));
-
-    let uri = &rest[..end?];
-
+fn parse_osc7_uri(uri: &str) -> Option<PathBuf> {
     // Parse file:// URI → extract path
     // Formats: file://hostname/path, file:///path, file:///c/Users/...
     if let Some(path_str) = uri.strip_prefix("file://") {
@@ -1579,14 +1586,42 @@ impl Osc7Stream {
 
     fn push(&mut self, data: &[u8]) -> Option<PathBuf> {
         self.tail.extend_from_slice(data);
-        if self.tail.len() > Self::CAP * 2 {
-            let drop = self.tail.len() - Self::CAP;
-            self.tail.drain(..drop);
+        if let Some(path) = extract_osc7(&self.tail) {
+            // Preserve the existing first-sequence-wins behavior.
+            self.tail.clear();
+            return Some(path);
         }
-        let path = extract_osc7(&self.tail)?;
-        self.tail.clear();
-        Some(path)
+
+        const MARKER: &[u8] = b"\x1b]7;";
+        if let Some(start) = find_unterminated_osc7(&self.tail) {
+            if self.tail.len() - start <= Self::CAP {
+                self.tail.drain(..start);
+                return None;
+            }
+        }
+
+        // Retain only enough bytes to complete a marker split across reads.
+        // An unterminated sequence beyond CAP is treated as garbage.
+        let keep = self.tail.len().min(MARKER.len() - 1);
+        let drop = self.tail.len() - keep;
+        self.tail.drain(..drop);
+        None
     }
+}
+
+fn find_unterminated_osc7(data: &[u8]) -> Option<usize> {
+    const MARKER: &[u8] = b"\x1b]7;";
+    let mut search_from = 0;
+    while let Some(relative_start) = find_subslice(&data[search_from..], MARKER) {
+        let marker_start = search_from + relative_start;
+        let contents_start = marker_start + MARKER.len();
+        let rest = &data[contents_start..];
+        let Some((_end, after_terminator)) = find_osc_terminator(rest, 0) else {
+            return Some(marker_start);
+        };
+        search_from = contents_start + after_terminator;
+    }
+    None
 }
 
 /// Extract window title from OSC 0 or OSC 2: \x1b]0;TITLE\x07 or \x1b]2;TITLE\x07
@@ -1849,6 +1884,14 @@ mod tests {
         out
     }
 
+    fn captured_osc7_path() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\Users\color\Develop\renga-cdr")
+        } else {
+            PathBuf::from("/c/Users/color/Develop/renga-cdr")
+        }
+    }
+
     // Deterministic real-ConPTY startup capture for issue renga-cdr. Invoke with:
     // cargo test --bin renga real_pane_captures_prompt_latch_paths -- --ignored --nocapture
     #[test]
@@ -1944,7 +1987,84 @@ mod tests {
         );
         assert_eq!(
             stream.push(b"elop/renga-cdr\x07"),
-            Some(PathBuf::from(r"C:\Users\color\Develop\renga-cdr"))
+            Some(captured_osc7_path())
+        );
+    }
+
+    #[test]
+    fn osc7_stream_ignores_unrelated_multibyte_output() {
+        let mut stream = Osc7Stream::new();
+        let output = "日".repeat(6000).into_bytes();
+        for chunk in output.chunks(4096) {
+            assert_eq!(stream.push(chunk), None);
+        }
+        assert_eq!(
+            stream.push(b"\x1b]7;file://AYAPI-PX13/c/Users/color/Develop/renga-cdr\x07"),
+            Some(captured_osc7_path())
+        );
+    }
+
+    #[test]
+    fn osc7_stream_ignores_unrelated_invalid_utf8() {
+        let mut stream = Osc7Stream::new();
+        let mut output = vec![b'x'; 3000];
+        output[1500] = 0xff;
+        assert_eq!(stream.push(&output), None);
+        assert_eq!(
+            stream.push(b"\x1b]7;file://AYAPI-PX13/c/Users/color/Develop/renga-cdr\x07"),
+            Some(captured_osc7_path())
+        );
+    }
+
+    #[test]
+    fn osc7_stream_detects_control_sequence_alone() {
+        let mut stream = Osc7Stream::new();
+        assert_eq!(
+            stream.push(b"\x1b]7;file://AYAPI-PX13/c/Users/color/Develop/renga-cdr\x07"),
+            Some(captured_osc7_path())
+        );
+    }
+
+    #[test]
+    fn osc7_stream_detects_marker_split_at_every_position() {
+        let sequence = b"\x1b]7;file://AYAPI-PX13/c/Users/color/Develop/renga-cdr\x07";
+        for split in 1..=4 {
+            let mut stream = Osc7Stream::new();
+            assert_eq!(stream.push(&sequence[..split]), None, "split={split}");
+            assert_eq!(
+                stream.push(&sequence[split..]),
+                Some(captured_osc7_path()),
+                "split={split}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc7_stream_detects_split_st_terminator() {
+        let mut stream = Osc7Stream::new();
+        assert_eq!(
+            stream.push(b"\x1b]7;file://AYAPI-PX13/c/Users/color/Develop/renga-cdr\x1b"),
+            None
+        );
+        assert_eq!(stream.push(b"\\"), Some(captured_osc7_path()));
+    }
+
+    #[test]
+    fn osc7_stream_keeps_first_sequence_when_chunk_contains_two() {
+        let mut stream = Osc7Stream::new();
+        assert_eq!(
+            stream.push(
+                concat!(
+                    "\x1b]7;file://host/c/Users/color/first\x07",
+                    "\x1b]7;file://host/c/Users/color/second\x07",
+                )
+                .as_bytes()
+            ),
+            Some(if cfg!(windows) {
+                PathBuf::from(r"C:\Users\color\first")
+            } else {
+                PathBuf::from("/c/Users/color/first")
+            })
         );
     }
 
