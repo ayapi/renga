@@ -199,7 +199,7 @@ struct WorkerMetrics {
     lines_parsed: AtomicUsize,
     path_changes: AtomicUsize,
     mtime_changes: AtomicUsize,
-    dropped_wakes: AtomicU64,
+    coalesced_wakes: AtomicU64,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -261,6 +261,7 @@ impl MonitorFilesystem for RealMonitorFilesystem {
 const CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 const WORKER_YIELD: Duration = Duration::from_millis(10);
+const COALESCED_WAKE_TRACE_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_BYTES_PER_TICK: usize = 4 * 1024 * 1024;
 const MAX_TRANSCRIPTS_PER_PROJECT: usize = 8;
 const MAX_TRANSCRIPTS_TOTAL: usize = 64;
@@ -426,7 +427,7 @@ impl ClaudeMonitor {
             Err(TrySendError::Full(())) => {
                 self.core
                     .metrics
-                    .dropped_wakes
+                    .coalesced_wakes
                     .fetch_add(1, Ordering::Relaxed);
             }
             Err(TrySendError::Disconnected(())) => {
@@ -573,6 +574,9 @@ struct MonitorWorker {
     queued: HashSet<usize>,
     generation: u64,
     filesystem: Arc<dyn MonitorFilesystem>,
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    coalesced_wakes: u64,
+    last_coalesced_wake_trace: Instant,
 }
 
 impl MonitorWorker {
@@ -584,6 +588,27 @@ impl MonitorWorker {
         trace_path: Option<OsString>,
         filesystem: Arc<dyn MonitorFilesystem>,
     ) -> Self {
+        Self::new_with_clock(
+            shared,
+            requests,
+            metrics,
+            stop,
+            trace_path,
+            filesystem,
+            Arc::new(Instant::now),
+        )
+    }
+
+    fn new_with_clock(
+        shared: Arc<Mutex<SharedState>>,
+        requests: Arc<Mutex<WorkerRequests>>,
+        metrics: Arc<WorkerMetrics>,
+        stop: Arc<AtomicBool>,
+        trace_path: Option<OsString>,
+        filesystem: Arc<dyn MonitorFilesystem>,
+        clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Self {
+        let started_at = clock();
         Self {
             shared,
             requests,
@@ -596,6 +621,9 @@ impl MonitorWorker {
             queued: HashSet::new(),
             generation: 0,
             filesystem,
+            clock,
+            coalesced_wakes: 0,
+            last_coalesced_wake_trace: started_at,
         }
     }
 
@@ -613,7 +641,7 @@ impl MonitorWorker {
             if self.stop.load(Ordering::Acquire) {
                 break;
             }
-            self.trace_dropped_wakes();
+            self.trace_coalesced_wakes(false);
             self.drain_requests();
             if let Some(pane_id) = self.work_queue.pop_front() {
                 self.queued.remove(&pane_id);
@@ -622,23 +650,34 @@ impl MonitorWorker {
                 }
             }
         }
+        self.trace_coalesced_wakes(true);
     }
 
-    fn trace_dropped_wakes(&self) {
-        let count = self.metrics.dropped_wakes.swap(0, Ordering::AcqRel);
-        if count == 0 {
+    fn trace_coalesced_wakes(&mut self, flush: bool) {
+        let count = self.metrics.coalesced_wakes.swap(0, Ordering::AcqRel);
+        self.coalesced_wakes = self.coalesced_wakes.saturating_add(count);
+        if self.coalesced_wakes == 0 {
+            return;
+        }
+        let now = (self.clock)();
+        let elapsed = now.saturating_duration_since(self.last_coalesced_wake_trace);
+        if !flush && elapsed < COALESCED_WAKE_TRACE_INTERVAL {
             return;
         }
         let Some(trace_path) = self.trace_path.as_deref() else {
             return;
         };
+        let coalesced_wakes = self.coalesced_wakes;
         write_worker_record(
             Some(trace_path),
             serde_json::json!({
-                "action": "claude_monitor_request_dropped",
-                "count": count,
+                "action": "claude_monitor_wake_coalesced",
+                "coalesced_wakes": coalesced_wakes,
+                "interval_ms": elapsed.as_millis() as u64,
             }),
         );
+        self.coalesced_wakes = 0;
+        self.last_coalesced_wake_trace = now;
     }
 
     fn drain_requests(&mut self) {
@@ -1419,7 +1458,7 @@ mod tests {
     }
 
     #[test]
-    fn full_wake_channel_is_nonblocking_and_traced() {
+    fn three_full_wakes_are_coalesced_into_one_shutdown_record() {
         let path = temp_transcript("full-channel-trace");
         let accesses = Arc::new(Mutex::new(Vec::new()));
         let (entered_tx, entered_rx) = mpsc::channel();
@@ -1437,21 +1476,121 @@ mod tests {
         monitor.queue_update_for_test(2, Path::new("queued"));
         let started = Instant::now();
         monitor.queue_update_for_test(3, Path::new("coalesced"));
+        monitor.queue_update_for_test(4, Path::new("also-coalesced"));
+        monitor.queue_update_for_test(5, Path::new("still-coalesced"));
         assert!(started.elapsed() < Duration::from_millis(50));
         release.store(true, Ordering::Release);
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut contents = String::new();
-        while Instant::now() < deadline {
-            contents = std::fs::read_to_string(&path).unwrap_or_default();
-            if contents.contains("claude_monitor_request_dropped") {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(contents.contains("claude_monitor_request_dropped"));
         monitor.shutdown();
+
+        let contents = std::fs::read_to_string(&path).expect("channel trace");
+        let records = contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record["action"] == "claude_monitor_wake_coalesced")
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["coalesced_wakes"], 3);
+        assert!(records[0]["interval_ms"].is_u64());
         std::fs::remove_file(path).expect("remove channel trace");
+    }
+
+    fn worker_with_clock(
+        trace_path: Option<OsString>,
+        metrics: Arc<WorkerMetrics>,
+        elapsed_ms: Arc<AtomicU64>,
+    ) -> MonitorWorker {
+        let started_at = Instant::now();
+        MonitorWorker::new_with_clock(
+            Arc::new(Mutex::new(SharedState::default())),
+            Arc::new(Mutex::new(WorkerRequests::default())),
+            metrics,
+            Arc::new(AtomicBool::new(false)),
+            trace_path,
+            Arc::new(RealMonitorFilesystem),
+            Arc::new(move || {
+                started_at + Duration::from_millis(elapsed_ms.load(Ordering::Acquire))
+            }),
+        )
+    }
+
+    #[test]
+    fn coalesced_wake_trace_waits_a_full_interval_between_records() {
+        let path = temp_transcript("coalesced-rate-limit");
+        let metrics = Arc::new(WorkerMetrics::default());
+        let elapsed_ms = Arc::new(AtomicU64::new(0));
+        let mut worker = worker_with_clock(
+            Some(path.as_os_str().to_owned()),
+            Arc::clone(&metrics),
+            Arc::clone(&elapsed_ms),
+        );
+
+        metrics.coalesced_wakes.store(3, Ordering::Release);
+        elapsed_ms.store(60_000, Ordering::Release);
+        worker.trace_coalesced_wakes(false);
+        metrics.coalesced_wakes.store(2, Ordering::Release);
+        elapsed_ms.store(119_999, Ordering::Release);
+        worker.trace_coalesced_wakes(false);
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("first trace")
+                .lines()
+                .count(),
+            1
+        );
+
+        elapsed_ms.store(120_000, Ordering::Release);
+        worker.trace_coalesced_wakes(false);
+        let records = std::fs::read_to_string(&path).expect("rate-limited trace");
+        let records = records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace record"))
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["coalesced_wakes"], 3);
+        assert_eq!(records[0]["interval_ms"], 60_000);
+        assert_eq!(records[1]["coalesced_wakes"], 2);
+        assert_eq!(records[1]["interval_ms"], 60_000);
+        std::fs::remove_file(path).expect("remove rate-limit trace");
+    }
+
+    #[test]
+    fn shutdown_flushes_coalesced_wakes_before_the_interval() {
+        let path = temp_transcript("coalesced-shutdown-flush");
+        let metrics = Arc::new(WorkerMetrics::default());
+        let elapsed_ms = Arc::new(AtomicU64::new(250));
+        let mut worker = worker_with_clock(
+            Some(path.as_os_str().to_owned()),
+            Arc::clone(&metrics),
+            elapsed_ms,
+        );
+
+        metrics.coalesced_wakes.store(4, Ordering::Release);
+        worker.trace_coalesced_wakes(false);
+        assert!(!path.exists());
+        worker.trace_coalesced_wakes(true);
+
+        let record = std::fs::read_to_string(&path).expect("shutdown trace");
+        let record: serde_json::Value = serde_json::from_str(record.trim()).expect("trace record");
+        assert_eq!(record["action"], "claude_monitor_wake_coalesced");
+        assert_eq!(record["coalesced_wakes"], 4);
+        assert_eq!(record["interval_ms"], 0);
+        std::fs::remove_file(path).expect("remove shutdown trace");
+    }
+
+    #[test]
+    fn disabled_trace_still_accumulates_coalesced_wakes_without_writing() {
+        let trap_path = temp_transcript("disabled-coalesced-trace");
+        let metrics = Arc::new(WorkerMetrics::default());
+        let mut worker =
+            worker_with_clock(None, Arc::clone(&metrics), Arc::new(AtomicU64::new(60_000)));
+
+        metrics.coalesced_wakes.store(5, Ordering::Release);
+        worker.trace_coalesced_wakes(false);
+        assert_eq!(metrics.coalesced_wakes.load(Ordering::Acquire), 0);
+        assert_eq!(worker.coalesced_wakes, 5);
+        worker.trace_coalesced_wakes(true);
+        assert_eq!(worker.coalesced_wakes, 5);
+        assert!(!trap_path.exists());
     }
 
     struct BlockingReadFilesystem {

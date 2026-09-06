@@ -9,6 +9,14 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ## [Unreleased]
 
+### Changed
+
+- **Claude monitor wake coalescing traces now describe normal worker behavior.**
+  The worker emits `claude_monitor_wake_coalesced` at most once per 60 seconds
+  with the accumulated count and elapsed interval, then flushes any pending
+  count at shutdown. Coalesced requests remain queued for the next worker tick;
+  none are lost. (renga-010)
+
 ### Fixed
 
 - **Pending Codex peer notices now stay visible during composer navigation.**

@@ -142,10 +142,13 @@ that change can take about 5.5 seconds to appear. Initial files larger than
 
 When tracing is enabled, worker batches also emit `claude_monitor_worker` with
 `pane_id`, `path`, `bytes_read`, `lines_parsed`, `resumed_from_cache`, and
-`elapsed_ms`. A full non-blocking wake queue emits
-`claude_monitor_request_dropped` from the worker; the latest coalesced cwd is
-retained. A worker panic or shutdown join timeout emits
-`claude_monitor_worker_stopped` once, and render continues with default state.
+`elapsed_ms`. When the non-blocking wake queue is already full, requests remain
+coalesced for processing on the next worker tick and nothing is lost. The
+worker reports this as `claude_monitor_wake_coalesced`, at most once per 60
+seconds with the accumulated `coalesced_wakes` count and `interval_ms`, and
+flushes a pending count at shutdown. A worker panic or shutdown join timeout
+emits `claude_monitor_worker_stopped` once, and render continues with default
+state.
 
 When a frame does not draw because `app.dirty` is false, `preview_kind` remains
 `"none"`, `sidebar_visible` remains false, and `preview_area` remains zero.
