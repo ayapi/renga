@@ -20,6 +20,27 @@ struct CachedMouseProtocol {
     seen_at: Instant,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct TestRawRead {
+    elapsed: Duration,
+    data: Vec<u8>,
+    tail: Vec<u8>,
+    prompt_ready: bool,
+    osc7_in_chunk: bool,
+    osc7_in_rolling: bool,
+    osc7_split: bool,
+    latch_path: Option<&'static str>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestRawReadCapture {
+    spawned_at: Instant,
+    reads: Vec<TestRawRead>,
+    latch: Option<(Duration, &'static str)>,
+}
+
 /// A terminal pane wrapping a PTY and vt100 parser.
 pub struct Pane {
     pub id: usize,
@@ -27,6 +48,8 @@ pub struct Pane {
     writer: Box<dyn Write + Send>,
     #[cfg(test)]
     test_input: Vec<u8>,
+    #[cfg(test)]
+    raw_read_capture: Option<Arc<Mutex<TestRawReadCapture>>>,
     pub parser: Arc<Mutex<vt100::Parser>>,
     child: Option<Box<dyn Child + Send + Sync>>,
     _reader_handle: Option<thread::JoinHandle<()>>,
@@ -151,7 +174,44 @@ impl Pane {
         event_tx: Sender<AppEvent>,
         probe: &[u8],
     ) -> Result<Self> {
-        Self::new_real_with_cwd_and_probe(id, rows, cols, event_tx, None, Some(probe))
+        Self::new_real_with_cwd_and_probe(
+            id,
+            rows,
+            cols,
+            event_tx,
+            None,
+            Some(probe),
+            None,
+            false,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_real_with_raw_capture(
+        id: usize,
+        rows: u16,
+        cols: u16,
+        event_tx: Sender<AppEvent>,
+        shell: PathBuf,
+        skip_setup: bool,
+    ) -> Result<Self> {
+        let capture = Arc::new(Mutex::new(TestRawReadCapture {
+            spawned_at: Instant::now(),
+            reads: Vec::new(),
+            latch: None,
+        }));
+        Self::new_real_with_cwd_and_probe(
+            id,
+            rows,
+            cols,
+            event_tx,
+            None,
+            None,
+            Some(shell),
+            skip_setup,
+            Some(capture),
+        )
     }
 
     #[cfg(test)]
@@ -164,6 +224,7 @@ impl Pane {
             master: None,
             writer: Box::new(std::io::sink()),
             test_input: Vec::new(),
+            raw_read_capture: None,
             parser: Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10000))),
             child: None,
             _reader_handle: None,
@@ -196,7 +257,16 @@ impl Pane {
         event_tx: Sender<AppEvent>,
         cwd: Option<PathBuf>,
     ) -> Result<Self> {
-        Self::new_real_with_cwd_and_probe(id, rows, cols, event_tx, cwd, None)
+        #[cfg(test)]
+        {
+            Self::new_real_with_cwd_and_probe(
+                id, rows, cols, event_tx, cwd, None, None, false, None,
+            )
+        }
+        #[cfg(not(test))]
+        {
+            Self::new_real_with_cwd_and_probe(id, rows, cols, event_tx, cwd, None)
+        }
     }
 
     fn new_real_with_cwd_and_probe(
@@ -206,6 +276,9 @@ impl Pane {
         event_tx: Sender<AppEvent>,
         cwd: Option<PathBuf>,
         setup_probe: Option<&[u8]>,
+        #[cfg(test)] shell_for_test: Option<PathBuf>,
+        #[cfg(test)] skip_setup: bool,
+        #[cfg(test)] raw_read_capture: Option<Arc<Mutex<TestRawReadCapture>>>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
 
@@ -218,6 +291,9 @@ impl Pane {
 
         let pair = pty_system.openpty(pty_size).context("Failed to open PTY")?;
 
+        #[cfg(test)]
+        let shell = shell_for_test.unwrap_or_else(detect_shell);
+        #[cfg(not(test))]
         let shell = detect_shell();
         let mut cmd = CommandBuilder::new(&shell);
 
@@ -292,6 +368,8 @@ impl Pane {
         let alternate_scroll_mode = Arc::new(AtomicBool::new(false));
         let alternate_scroll_mode_clone = Arc::clone(&alternate_scroll_mode);
         let codex_transcript_overlay_hint = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let raw_read_capture_clone = raw_read_capture.clone();
         let reader_handle = thread::spawn(move || {
             pty_reader_thread(
                 reader,
@@ -305,6 +383,8 @@ impl Pane {
                 alternate_scroll_mode_clone,
                 id,
                 event_tx,
+                #[cfg(test)]
+                raw_read_capture_clone,
             );
         });
 
@@ -314,6 +394,8 @@ impl Pane {
             writer,
             #[cfg(test)]
             test_input: Vec::new(),
+            #[cfg(test)]
+            raw_read_capture,
             parser,
             child: Some(child),
             _reader_handle: Some(reader_handle),
@@ -340,7 +422,9 @@ impl Pane {
 
         // Inject OSC 7 hook after shell starts
         // Leading space prevents it from appearing in bash history
-        if shell_name.contains("bash") {
+        #[cfg(not(test))]
+        let skip_setup = false;
+        if !skip_setup && shell_name.contains("bash") {
             let mut setup = concat!(
                 " __renga_osc7() { printf '\\033]7;file://%s%s\\007' \"$HOSTNAME\" \"$PWD\"; };",
                 " PROMPT_COMMAND=\"__renga_osc7;${PROMPT_COMMAND}\";",
@@ -1146,6 +1230,7 @@ fn pty_reader_thread(
     alternate_scroll_mode: Arc<AtomicBool>,
     pane_id: usize,
     event_tx: Sender<AppEvent>,
+    #[cfg(test)] raw_read_capture: Option<Arc<Mutex<TestRawReadCapture>>>,
 ) {
     // Rolling tail of the most recent bytes read from the PTY. Used to
     // detect a shell prompt that may straddle two reader chunks. Capped
@@ -1154,6 +1239,8 @@ fn pty_reader_thread(
     let mut tail: Vec<u8> = Vec::with_capacity(TAIL_CAP * 2);
     let mut control_tail: Vec<u8> = Vec::with_capacity(64);
     let mut osc52_tail: Vec<u8> = Vec::with_capacity(4096);
+    #[cfg(test)]
+    let mut osc7_capture_tail: Vec<u8> = Vec::with_capacity(TAIL_CAP * 2);
 
     let mut buf = [0u8; 4096];
     loop {
@@ -1164,6 +1251,11 @@ fn pty_reader_thread(
             }
             Ok(n) => {
                 let data = &buf[..n];
+
+                #[cfg(test)]
+                let osc7_in_chunk = extract_osc7(data).is_some();
+                #[cfg(test)]
+                let prompt_seen_before = prompt_seen.load(Ordering::Acquire);
 
                 // Track scrollback lines (count newlines)
                 let newlines = data.iter().filter(|&&b| b == b'\n').count();
@@ -1218,6 +1310,43 @@ fn pty_reader_thread(
                         // Tail no longer needed once the flag latches on.
                         tail = Vec::new();
                     }
+                }
+
+                #[cfg(test)]
+                if let Some(capture) = raw_read_capture.as_ref() {
+                    osc7_capture_tail.extend_from_slice(data);
+                    if osc7_capture_tail.len() > TAIL_CAP * 2 {
+                        let drop = osc7_capture_tail.len() - TAIL_CAP;
+                        osc7_capture_tail.drain(..drop);
+                    }
+                    let osc7_in_rolling = extract_osc7(&osc7_capture_tail).is_some();
+                    let prompt_ready = is_prompt_ready(&osc7_capture_tail);
+                    let latched_this_read =
+                        !prompt_seen_before && prompt_seen.load(Ordering::Acquire);
+                    let latch_path = if latched_this_read && osc7_in_chunk {
+                        Some("osc7-single-read")
+                    } else if latched_this_read && prompt_ready {
+                        Some("prompt-tail")
+                    } else {
+                        None
+                    };
+                    let mut capture = capture.lock().unwrap_or_else(|e| e.into_inner());
+                    let elapsed = capture.spawned_at.elapsed();
+                    if capture.latch.is_none() {
+                        if let Some(path) = latch_path {
+                            capture.latch = Some((elapsed, path));
+                        }
+                    }
+                    capture.reads.push(TestRawRead {
+                        elapsed,
+                        data: data.to_vec(),
+                        tail: osc7_capture_tail.clone(),
+                        prompt_ready,
+                        osc7_in_chunk,
+                        osc7_in_rolling,
+                        osc7_split: osc7_in_rolling && !osc7_in_chunk,
+                        latch_path,
+                    });
                 }
 
                 control_tail.extend_from_slice(data);
@@ -1641,6 +1770,95 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         false
+    }
+
+    fn escaped_bytes(bytes: &[u8]) -> String {
+        let mut out = String::new();
+        for &byte in bytes {
+            match byte {
+                0x1b => out.push_str("esc"),
+                0x07 => out.push_str("bel"),
+                b'\r' => out.push_str("\\r"),
+                b'\n' => out.push_str("\\n"),
+                b'\t' => out.push_str("\\t"),
+                0x20..=0x7e => out.push(byte as char),
+                _ => out.push_str(&format!("\\x{byte:02x}")),
+            }
+        }
+        out
+    }
+
+    // Deterministic real-ConPTY startup capture for issue renga-cdr. Invoke with:
+    // cargo test --bin renga real_pane_captures_prompt_latch_paths -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_pane_captures_prompt_latch_paths() {
+        let _guard = REAL_PANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let git = PathBuf::from(r"C:\Program Files\Git");
+        let cases = [
+            ("bash-setup", git.join(r"bin\bash.exe"), false),
+            ("bash-no-setup", git.join(r"bin\bash.exe"), true),
+            ("sh", git.join(r"usr\bin\sh.exe"), false),
+            ("dash", git.join(r"usr\bin\dash.exe"), false),
+        ];
+
+        for (case, shell, skip_setup) in cases {
+            assert!(
+                shell.exists(),
+                "test shell does not exist: {}",
+                shell.display()
+            );
+            for run in 1..=3 {
+                let (tx, _rx) = std::sync::mpsc::channel();
+                let mut pane = Pane::new_real_with_raw_capture(
+                    9950 + run,
+                    24,
+                    80,
+                    tx,
+                    shell.clone(),
+                    skip_setup,
+                )
+                .expect("spawn captured real pane");
+                let capture = pane
+                    .raw_read_capture
+                    .as_ref()
+                    .expect("capture installed")
+                    .clone();
+                wait_for(
+                    || pane.prompt_seen.load(Ordering::Acquire),
+                    Duration::from_secs(5),
+                );
+                std::thread::sleep(Duration::from_millis(100));
+                let capture = capture.lock().unwrap_or_else(|e| e.into_inner());
+                eprintln!(
+                    "CAPTURE case={case} run={run} shell={} latched={} latch={:?}",
+                    shell.display(),
+                    pane.prompt_seen.load(Ordering::Acquire),
+                    capture.latch
+                );
+                for (index, read) in capture.reads.iter().enumerate() {
+                    let first_len = read.data.len().min(64);
+                    let last_start = read.data.len().saturating_sub(64);
+                    eprintln!(
+                        "READ case={case} run={run} index={index} elapsed_ms={} len={} first={} last={} tail={} prompt_ready={} osc7_chunk={} osc7_rolling={} osc7_split={} latch_path={:?}",
+                        read.elapsed.as_millis(),
+                        read.data.len(),
+                        escaped_bytes(&read.data[..first_len]),
+                        escaped_bytes(&read.data[last_start..]),
+                        escaped_bytes(&read.tail),
+                        read.prompt_ready,
+                        read.osc7_in_chunk,
+                        read.osc7_in_rolling,
+                        read.osc7_split,
+                        read.latch_path,
+                    );
+                }
+                drop(capture);
+                pane.kill();
+            }
+        }
     }
 
     #[test]
