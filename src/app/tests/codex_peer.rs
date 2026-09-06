@@ -1270,18 +1270,19 @@ fn focused_codex_notification_navigation_stays_visible_and_reaches_pty() {
 
     let cases = [
         (KeyCode::Up, KeyModifiers::NONE, b"\x1b[A".as_slice()),
-        (KeyCode::Down, KeyModifiers::ALT, b"\x1b[B".as_slice()),
+        (KeyCode::Down, KeyModifiers::NONE, b"\x1b[B".as_slice()),
         (KeyCode::Left, KeyModifiers::NONE, b"\x1b[D".as_slice()),
-        (KeyCode::Right, KeyModifiers::CONTROL, b"\x1b[C".as_slice()),
+        (KeyCode::Right, KeyModifiers::NONE, b"\x1b[C".as_slice()),
         (KeyCode::Home, KeyModifiers::SHIFT, b"\x1b[H".as_slice()),
         (KeyCode::End, KeyModifiers::NONE, b"\x1b[F".as_slice()),
-        (KeyCode::PageUp, KeyModifiers::ALT, b"\x1b[5~".as_slice()),
+        (KeyCode::PageUp, KeyModifiers::NONE, b"\x1b[5~".as_slice()),
         (
             KeyCode::PageDown,
             KeyModifiers::CONTROL,
             b"\x1b[6~".as_slice(),
         ),
         (KeyCode::Left, KeyModifiers::SHIFT, b"\x1b[D".as_slice()),
+        (KeyCode::Left, KeyModifiers::CONTROL, b"\x1b[D".as_slice()),
     ];
 
     for (code, modifiers, expected_bytes) in cases {
@@ -1314,6 +1315,151 @@ fn focused_codex_notification_navigation_stays_visible_and_reaches_pty() {
             expected_bytes
         );
     }
+    app.shutdown();
+}
+
+#[test]
+fn focused_codex_notification_alt_left_switches_tabs_without_reaching_pty() {
+    let mut app = App::new(40, 80).expect("App::new");
+    app.new_tab().expect("second tab");
+    let notification_tab = app.active_tab;
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(codex_id);
+    app.handle_focus(&ipc::PaneRef::Id(codex_id))
+        .expect("focus Codex");
+    seed_codex_draft(&mut app, codex_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "hello focused codex".to_string(),
+    )
+    .expect("peer send");
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+
+    let consumed = app
+        .handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT))
+        .expect("switch tabs");
+
+    assert!(consumed);
+    assert_eq!(app.active_tab, notification_tab - 1);
+    assert!(app.codex_peer_notification.is_some());
+    assert!(app.workspaces[notification_tab]
+        .panes
+        .get(&codex_id)
+        .expect("Codex pane")
+        .test_input()
+        .is_empty());
+    app.shutdown();
+}
+
+#[test]
+fn focused_codex_notification_alt_page_up_uses_scrollback_handler() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    app.handle_focus(&ipc::PaneRef::Id(codex_id))
+        .expect("focus Codex");
+    seed_codex_draft(&mut app, codex_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "hello focused codex".to_string(),
+    )
+    .expect("peer send");
+    let expected_notification = app
+        .visible_codex_peer_notification()
+        .expect("visible notification")
+        .clone();
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+
+    let consumed = app
+        .handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT))
+        .expect("scroll pane");
+
+    assert!(consumed);
+    assert_eq!(
+        app.visible_codex_peer_notification(),
+        Some(&expected_notification)
+    );
+    assert!(app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
+    app.shutdown();
+}
+
+#[test]
+fn focused_codex_notification_copy_mode_consumes_left() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    app.handle_focus(&ipc::PaneRef::Id(codex_id))
+        .expect("focus Codex");
+    seed_codex_draft(&mut app, codex_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "hello focused codex".to_string(),
+    )
+    .expect("peer send");
+    let expected_notification = app
+        .visible_codex_peer_notification()
+        .expect("visible notification")
+        .clone();
+    app.ws_mut().last_pane_rects = vec![(codex_id, Rect::new(0, 0, 40, 12))];
+    app.copy_mode = Some(CopyModeState {
+        pane_id: codex_id,
+        cursor_row: 2,
+        cursor_col: 3,
+        anchor: None,
+    });
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+
+    let consumed = app
+        .handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+        .expect("move copy cursor");
+
+    assert!(consumed);
+    assert_eq!(
+        app.copy_mode
+            .as_ref()
+            .map(|copy_mode| (copy_mode.cursor_row, copy_mode.cursor_col)),
+        Some((2, 2))
+    );
+    assert_eq!(
+        app.visible_codex_peer_notification(),
+        Some(&expected_notification)
+    );
+    assert!(app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
     app.shutdown();
 }
 

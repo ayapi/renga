@@ -59,9 +59,9 @@ impl App {
                 | KeyCode::End
                 | KeyCode::PageUp
                 | KeyCode::PageDown => {
-                    // Cursor navigation belongs to the Codex composer. Keep the
-                    // notice visible while the key follows the normal PTY path.
-                    return Ok(false);
+                    // Navigation does not dismiss the notice. Continue so later
+                    // renga handlers can consume their own chords and modes;
+                    // unclaimed keys follow the normal PTY path.
                 }
                 _ => {
                     // The user started typing or acting, so get the notice out

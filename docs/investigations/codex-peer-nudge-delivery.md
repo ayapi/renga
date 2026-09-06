@@ -227,12 +227,14 @@ if self.codex_peer_notification_is_visible() {
 **Resolution (renga-z7k):** the notification now has an explicit keyboard
 policy. `Esc` and `Ctrl+C` dismiss it, while the existing overlay commit keys
 accept it. `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`, and
-`PageDown` pass through to the PTY with any modifiers and leave the same
-notification visible. Every other key explicitly requeues the message before
-following the normal PTY path because typing or another action indicates that
-the user wants the notice out of the way. `Alt+Q` remains the earlier global
-quit shortcut. The mouse path does not inspect, dismiss, or requeue Codex peer
-notifications, so it is unchanged.
+`PageDown` skip requeue and continue through the normal handler chain. Plain,
+Shift, and otherwise unclaimed navigation keys therefore reach the PTY while
+the same notification remains visible; renga navigation chords such as
+`Alt+Left` and `Alt+PageUp`, plus copy mode, still consume the keys normally.
+Every other key explicitly requeues the message before continuing because
+typing or another action indicates that the user wants the notice out of the
+way. `Alt+Q` remains the earlier global quit shortcut. The mouse path does not
+inspect, dismiss, or requeue Codex peer notifications, so it is unchanged.
 
 Esc / Ctrl+C / commit キー以外の**任意のキー**（矢印キーを含む）が `requeue_codex_peer_notification()` を通り、ダイアログが閉じてキーはそのまま PTY へ落ちる。ユーザー報告でも「左矢印を押したらダイアログが消えて nudge が入った」現象が発生している。
 

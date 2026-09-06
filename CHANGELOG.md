@@ -12,8 +12,9 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 ### Fixed
 
 - **Pending Codex peer notices now stay visible during composer navigation.**
-  Arrow, Home, End, PageUp, and PageDown keys pass through to the PTY without
-  requeueing the notice, while typing and other actions retain the existing
+  Arrow, Home, End, PageUp, and PageDown keys no longer requeue the notice;
+  unclaimed navigation reaches the PTY while renga shortcuts and copy mode
+  retain their normal handling. Typing and other actions keep the existing
   requeue behavior. (renga-z7k)
 
 - **Peer summaries are now visible in text list output.** `list_panes` and
