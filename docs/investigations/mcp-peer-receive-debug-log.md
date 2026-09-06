@@ -183,7 +183,11 @@ entries as lost. A bounded consumed-id tombstone queue remains as insurance
 against unexpected command reordering. Each lost entry emits
 `peer_message_lost` and routes this sender notice through normal peer delivery:
 
-`Peer message to pane N was lost before it was read: its MCP peer restarted (reason: R). Sent at HH:MM:SS, delivery D, body began: <first 40 chars>. Resend if still needed.`
+A successful reconciliation removes the reported consumed ids and clears the
+corresponding overflow count. A failed reconciliation retains both for the next
+connection attempt.
+
+`Peer message to pane N was lost before it was read: its MCP peer restarted (reason: R). Sent at UNIX_SECONDS.NANOSECONDS UTC, delivery D, body began: <first 40 chars>. Resend if still needed.`
 
 The App trace actions are `peer_handover_tracked`,
 `peer_handover_consumed`, `peer_handover_lost` (with `reason` and `count`),

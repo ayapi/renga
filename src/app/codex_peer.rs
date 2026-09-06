@@ -65,6 +65,10 @@ pub(crate) const PEER_INBOX_ACK_RETRY_INTERVAL: Duration = Duration::from_millis
 pub(crate) const PEER_INBOX_ACK_TIMEOUT: Duration = Duration::from_secs(4);
 pub(crate) const PEER_HANDOVER_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn peer_ts_ms_to_string(ts_ms: u64) -> String {
+    format!("{}.{:09}", ts_ms / 1000, (ts_ms % 1000) * 1_000_000)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingPeerInboxMessage {
     pub(crate) from_pane: usize,
@@ -1546,6 +1550,7 @@ impl App {
     pub(crate) fn lose_peer_handovers(&mut self, pane_id: usize, reason: &'static str) {
         self.peer_handover_consumed_tombstones.remove(&pane_id);
         let mut entries = self.peer_handovers.remove(&pane_id).unwrap_or_default();
+        let target_is_codex = self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex);
         let mut pending_ids: Vec<u64> = if reason == "pane_closed" {
             self.pending_peer_deliveries
                 .iter()
@@ -1566,7 +1571,7 @@ impl App {
             for reply in pending.replies {
                 let _ = reply.send(Err(error.clone()));
             }
-            if !pending.message.system_generated {
+            if target_is_codex && !pending.message.system_generated {
                 entries.push_back(PeerHandover {
                     delivery_id,
                     from_pane: pending.message.from_pane,
@@ -1620,19 +1625,13 @@ impl App {
         entry: PeerHandover,
         reason: &'static str,
     ) {
-        let sent_seconds = entry.ts_ms / 1000;
-        let time = format!(
-            "{:02}:{:02}:{:02}",
-            (sent_seconds / 3600) % 24,
-            (sent_seconds / 60) % 60,
-            sent_seconds % 60
-        );
+        let sent_at = peer_ts_ms_to_string(entry.ts_ms);
         let mut preview: String = entry.body.chars().take(40).collect();
         if entry.body.chars().count() > 40 {
             preview.push('…');
         }
         let body = format!(
-            "Peer message to pane {lost_target} was lost before it was read: its MCP peer restarted (reason: {reason}). Sent at {time}, delivery {}, body began: {preview}. Resend if still needed.",
+            "Peer message to pane {lost_target} was lost before it was read: its MCP peer restarted (reason: {reason}). Sent at {sent_at} UTC, delivery {}, body began: {preview}. Resend if still needed.",
             entry.delivery_id
         );
         let result = self.prepare_peer_send_with_metadata(

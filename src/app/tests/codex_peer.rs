@@ -5411,7 +5411,7 @@ fn subscriber_gone_timeout_reports_each_unconsumed_codex_handover() {
         .all(|event| !matches!(event, ipc::Event::PeerMessageLost { .. })));
     app.peer_handover_disconnect_deadlines
         .insert(target, Instant::now());
-    app.flush_peer_handover_disconnect_timeouts();
+    app.flush_pending_peer_deliveries();
     assert_one_loss_notice(&rx, delivery_id, sender, target, "subscriber_gone_timeout");
     assert!(!app.peer_handovers.contains_key(&target));
     app.shutdown();
@@ -5478,6 +5478,23 @@ fn reconnect_reconcile_with_unreported_consumed_sends_no_loss_notice() {
         .try_iter()
         .all(|event| !matches!(event, ipc::Event::PeerMessageLost { .. })));
     assert!(!app.peer_handovers.contains_key(&target));
+    app.shutdown();
+}
+
+#[test]
+fn reconcile_overflow_retains_unmatched_handover_without_a_loss_notice() {
+    let (mut app, _sender, target, delivery_id, rx) = retain_one_codex_handover();
+    app.handle_peer_register_client(target, PeerClientKind::Codex)
+        .unwrap();
+    app.handle_peer_inbox_reconcile(target, &[], &[], 1, 0)
+        .unwrap();
+
+    assert!(rx
+        .try_iter()
+        .all(|event| !matches!(event, ipc::Event::PeerMessageLost { .. })));
+    assert!(app.peer_handovers[&target]
+        .iter()
+        .any(|entry| entry.delivery_id == delivery_id));
     app.shutdown();
 }
 
@@ -5567,6 +5584,34 @@ fn pane_close_removes_unconfirmed_delivery_instead_of_requeueing_it() {
     assert!(events.iter().any(|event| matches!(
         event,
         ipc::Event::PeerMessageLost { delivery_id: id, .. } if *id == delivery_id
+    )));
+    app.shutdown();
+}
+
+#[test]
+fn pane_close_does_not_report_unconfirmed_push_delivery_as_lost() {
+    let (mut app, sender, target, rx) = app_with_ready_peer(PeerClientKind::Claude);
+    let (reply_tx, reply_rx) = oneshot::channel();
+    app.begin_peer_send(
+        sender,
+        &ipc::PaneRef::Id(target),
+        "push not yet receipted".into(),
+        reply_tx,
+    );
+    let delivery_id = peer_delivery_id(&rx);
+    app.handle_close(&ipc::PaneRef::Id(target)).unwrap();
+
+    assert_eq!(
+        reply_rx.recv().unwrap().unwrap_err().code,
+        Some(ipc::err_code::PANE_VANISHED)
+    );
+    assert!(!app.pending_peer_deliveries.contains_key(&delivery_id));
+    assert!(rx.try_iter().all(|event| !matches!(
+        event,
+        ipc::Event::PeerMessageLost {
+            delivery_id: id,
+            ..
+        } if id == delivery_id
     )));
     app.shutdown();
 }
@@ -5689,5 +5734,22 @@ fn missing_sender_drops_loss_notice_but_still_emits_loss_event() {
     assert!(events
         .iter()
         .all(|event| !matches!(event, ipc::Event::PeerInbox { .. })));
+    app.shutdown();
+}
+
+#[test]
+fn loss_notice_labels_the_original_timestamp_as_utc() {
+    let (mut app, _sender, target, _delivery_id, rx) = retain_one_codex_handover();
+    app.peer_handovers.get_mut(&target).unwrap()[0].ts_ms = 1_725_000_123_456;
+    app.lose_peer_handovers(target, "subscriber_gone_timeout");
+
+    let body = rx
+        .try_iter()
+        .find_map(|event| match event {
+            ipc::Event::PeerInbox { body, .. } => Some(body),
+            _ => None,
+        })
+        .expect("loss notice");
+    assert!(body.contains("Sent at 1725000123.456000000 UTC"));
     app.shutdown();
 }

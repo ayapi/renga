@@ -705,6 +705,8 @@ fn reconcile_peer_inbox(ctx: &PeerCtx) -> bool {
             .lock()
             .unwrap_or_else(|items| items.into_inner());
         unreported.retain(|id| !consumed.contains(id));
+        ctx.unreported_consumed_overflow
+            .fetch_sub(consumed_overflow, Ordering::AcqRel);
     }
     if let Some(path) = ctx.debug_log_path.as_deref() {
         append_peer_debug_record(
@@ -7230,6 +7232,7 @@ Commands:
             },
         );
         retain_unreported_consumed(&ctx, 42);
+        ctx.unreported_consumed_overflow.store(3, Ordering::Release);
 
         assert!(reconcile_peer_inbox(&ctx));
 
@@ -7240,10 +7243,11 @@ Commands:
                 held: vec![41],
                 consumed: vec![42],
                 held_overflow: 0,
-                consumed_overflow: 0,
+                consumed_overflow: 3,
             }]
         );
         assert!(ctx.unreported_consumed.lock().unwrap().is_empty());
+        assert_eq!(ctx.unreported_consumed_overflow.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -7255,9 +7259,11 @@ Commands:
             code: Some(ipc::err_code::PARSE.into()),
         });
         retain_unreported_consumed(&ctx, 52);
+        ctx.unreported_consumed_overflow.store(2, Ordering::Release);
 
         assert!(!reconcile_peer_inbox(&ctx));
         assert_eq!(ctx.unreported_consumed.lock().unwrap().as_slices().0, &[52]);
+        assert_eq!(ctx.unreported_consumed_overflow.load(Ordering::Acquire), 2);
     }
 
     #[test]
