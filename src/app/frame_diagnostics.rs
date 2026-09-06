@@ -29,6 +29,7 @@ const FIELD_SIDEBAR_VISIBLE: &str = "sidebar_visible";
 const FIELD_CLAUDE_MONITOR_LINES_PARSED: &str = "claude_monitor_lines_parsed";
 const FIELD_CLAUDE_MONITOR_BYTES_READ: &str = "claude_monitor_bytes_read";
 const FIELD_CLAUDE_MONITOR_PATH_CHANGES: &str = "claude_monitor_path_changes";
+const FIELD_CLAUDE_MONITOR_LAST_MTIME_CHANGED: &str = "claude_monitor_last_mtime_changed";
 const FIELD_DRAW: &str = "draw";
 const FIELD_PRESENT: &str = "present";
 const FIELD_EVENTS_DRAINED: &str = "events_drained";
@@ -62,6 +63,7 @@ struct FrameData {
     claude_monitor_lines_parsed: usize,
     claude_monitor_bytes_read: usize,
     claude_monitor_path_changes: usize,
+    claude_monitor_last_mtime_changed: usize,
 }
 
 struct IpcCommandMetric {
@@ -165,6 +167,14 @@ pub(crate) fn record_claude_monitor_path_change() {
     STATE.with(|state| {
         if let Some(frame) = state.borrow_mut().frame.as_mut() {
             frame.claude_monitor_path_changes += 1;
+        }
+    });
+}
+
+pub(crate) fn record_claude_monitor_mtime_change() {
+    STATE.with(|state| {
+        if let Some(frame) = state.borrow_mut().frame.as_mut() {
+            frame.claude_monitor_last_mtime_changed += 1;
         }
     });
 }
@@ -348,6 +358,7 @@ fn finish_frame_at(finished_at: Instant, visible_panes: Vec<usize>) {
                 (FIELD_CLAUDE_MONITOR_LINES_PARSED): frame.claude_monitor_lines_parsed,
                 (FIELD_CLAUDE_MONITOR_BYTES_READ): frame.claude_monitor_bytes_read,
                 (FIELD_CLAUDE_MONITOR_PATH_CHANGES): frame.claude_monitor_path_changes,
+                (FIELD_CLAUDE_MONITOR_LAST_MTIME_CHANGED): frame.claude_monitor_last_mtime_changed,
                 (FIELD_EVENTS_DRAINED): frame.events_drained,
                 (FIELD_PTY_OUTPUT_EVENTS): frame.pty_output_events,
                 (FIELD_IPC_COMMANDS): ipc_commands,
@@ -424,6 +435,7 @@ mod debug_logging_tests {
         record_claude_monitor_io(3, 250);
         record_claude_monitor_path_change();
         record_claude_monitor_path_change();
+        record_claude_monitor_mtime_change();
         finish_phase(PHASE_RENDER_DRAW, render_draw_started_at);
         std::thread::sleep(Duration::from_millis(2));
         finish_phase(PHASE_RENDER, render_started_at);
@@ -474,7 +486,7 @@ mod debug_logging_tests {
         assert!(render_draw_ms > 0);
         assert!(render_present_ms > 0);
         assert_eq!(
-            record[FIELD_DRAW_MS_BY_COMPONENT],
+            record["draw_ms_by_component"],
             json!({
                 "claude_monitor": 1,
                 "file_tree": 1,
@@ -486,7 +498,7 @@ mod debug_logging_tests {
                 "tabs": 1,
             })
         );
-        let component_ms: u64 = record[FIELD_DRAW_MS_BY_COMPONENT]
+        let component_ms: u64 = record["draw_ms_by_component"]
             .as_object()
             .expect("draw component milliseconds")
             .values()
@@ -496,13 +508,14 @@ mod debug_logging_tests {
             component_ms <= render_draw_ms,
             "disjoint component measurements must fit inside draw: components={component_ms}, draw={render_draw_ms}"
         );
-        assert_eq!(record[FIELD_PREVIEW_KIND], "image");
-        assert_eq!(record[FIELD_PREVIEW_AREA], json!({"w": 42, "h": 17}));
-        assert_eq!(record[FIELD_PREVIEW_IMAGE_REENCODED], true);
-        assert_eq!(record[FIELD_SIDEBAR_VISIBLE], true);
-        assert_eq!(record[FIELD_CLAUDE_MONITOR_LINES_PARSED], 5);
-        assert_eq!(record[FIELD_CLAUDE_MONITOR_BYTES_READ], 350);
-        assert_eq!(record[FIELD_CLAUDE_MONITOR_PATH_CHANGES], 2);
+        assert_eq!(record["preview_kind"], "image");
+        assert_eq!(record["preview_area"], json!({"w": 42, "h": 17}));
+        assert_eq!(record["preview_image_reencoded"], true);
+        assert_eq!(record["sidebar_visible"], true);
+        assert_eq!(record["claude_monitor_lines_parsed"], 5);
+        assert_eq!(record["claude_monitor_bytes_read"], 350);
+        assert_eq!(record["claude_monitor_path_changes"], 2);
+        assert_eq!(record["claude_monitor_last_mtime_changed"], 1);
         assert!(
             render_ms.abs_diff(render_draw_ms + render_present_ms) <= 1,
             "render subphases should add to render: render={render_ms}, draw={render_draw_ms}, present={render_present_ms}"
@@ -554,6 +567,7 @@ mod debug_logging_tests {
         assert_eq!(record[FIELD_CLAUDE_MONITOR_LINES_PARSED], 0);
         assert_eq!(record[FIELD_CLAUDE_MONITOR_BYTES_READ], 0);
         assert_eq!(record[FIELD_CLAUDE_MONITOR_PATH_CHANGES], 0);
+        assert_eq!(record[FIELD_CLAUDE_MONITOR_LAST_MTIME_CHANGED], 0);
         std::fs::remove_file(&path).expect("remove enabled production-path JSONL");
 
         std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG");

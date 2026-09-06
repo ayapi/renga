@@ -231,6 +231,7 @@ impl ClaudeMonitor {
             if mtime == monitor.last_mtime {
                 return;
             }
+            crate::app::frame_diagnostics::record_claude_monitor_mtime_change();
             monitor.last_mtime = mtime;
 
             // File truncation/rotation detection: if file shrank, reset state

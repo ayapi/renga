@@ -590,37 +590,14 @@ fn render_main_area(app: &mut App, frame: &mut Frame, area: Rect) -> Option<(u16
         .constraints(constraints)
         .split(area);
 
-    let preview_kind = if has_preview {
-        if app.ws().preview.is_image() {
-            "image"
-        } else if app.ws().preview.is_binary {
-            "binary"
-        } else {
-            "text"
-        }
+    let preview_kind = if app.ws().preview.is_image() {
+        "image"
+    } else if app.ws().preview.is_binary {
+        "binary"
     } else {
-        "none"
+        "text"
     };
-    let preview_idx = if has_preview {
-        Some(if swapped {
-            if has_tree {
-                1
-            } else {
-                0
-            }
-        } else if has_tree {
-            2
-        } else {
-            1
-        })
-    } else {
-        None
-    };
-    let preview_area = preview_idx.map_or((0, 0), |idx| {
-        let area = chunks[idx];
-        (area.width.saturating_sub(2), area.height.saturating_sub(2))
-    });
-    crate::app::frame_diagnostics::record_render_context(preview_kind, preview_area, has_tree);
+    crate::app::frame_diagnostics::record_render_context("none", (0, 0), has_tree);
 
     let mut idx = 0;
 
@@ -638,6 +615,15 @@ fn render_main_area(app: &mut App, frame: &mut Frame, area: Rect) -> Option<(u16
 
     if swapped && has_preview {
         app.ws_mut().last_preview_rect = Some(chunks[idx]);
+        let preview_area = chunks[idx];
+        crate::app::frame_diagnostics::record_render_context(
+            preview_kind,
+            (
+                preview_area.width.saturating_sub(2),
+                preview_area.height.saturating_sub(2),
+            ),
+            has_tree,
+        );
         let started_at = crate::app::frame_diagnostics::phase_started();
         render_preview(app, frame, chunks[idx]);
         if let Some(started_at) = started_at {
@@ -651,6 +637,15 @@ fn render_main_area(app: &mut App, frame: &mut Frame, area: Rect) -> Option<(u16
 
     if !swapped && has_preview {
         app.ws_mut().last_preview_rect = Some(chunks[idx]);
+        let preview_area = chunks[idx];
+        crate::app::frame_diagnostics::record_render_context(
+            preview_kind,
+            (
+                preview_area.width.saturating_sub(2),
+                preview_area.height.saturating_sub(2),
+            ),
+            has_tree,
+        );
         let started_at = crate::app::frame_diagnostics::phase_started();
         render_preview(app, frame, chunks[idx]);
         if let Some(started_at) = started_at {
