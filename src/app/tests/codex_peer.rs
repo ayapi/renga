@@ -2808,6 +2808,108 @@ fn transcript_thinking_without_numeric_elapsed_is_not_busy() {
 }
 
 #[test]
+fn truncated_unknown_status_blocks_idle_and_commit_paths() {
+    let status = "◦ Reticulating (12s • esc to inte…";
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    let empty_screen = format!(
+        "\x1b[?25h\x1b[2J\x1b[H{status}\x1b[4;1H\u{203a} \x1b[2mAsk Codex to do anything\x1b[22m\x1b[6;1H  gpt-5.6-sol medium \u{b7} cwd\x1b[4;3H"
+    );
+    seed_pane_screen(&mut app, codex_id, empty_screen.as_bytes());
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "unknown truncated status".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::Draft { .. })
+    ));
+    assert!(app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
+    app.shutdown();
+
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_codex_busy_placeholder(&mut app, codex_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "status changed before commit".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+    let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: None,
+        from_kind: None,
+    });
+    let draft_screen = format!(
+        "\x1b[?25h\x1b[2J\x1b[H{status}\x1b[4;1H\u{203a} {expected}\x1b[8;1H  gpt-5.6-sol medium \u{b7} cwd\x1b[4;{}H",
+        expected.chars().count() + 3
+    );
+    seed_pane_screen(&mut app, codex_id, draft_screen.as_bytes());
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    make_codex_native_queue_ready(&mut app, codex_id);
+
+    app.flush_pending_codex_peer_messages();
+
+    assert!(
+        !app.ws()
+            .panes
+            .get(&codex_id)
+            .expect("pane")
+            .test_input()
+            .contains(&b'\r'),
+        "an ellipsis-truncated unknown status must not select Enter"
+    );
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::QueueAt { .. })
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn truncated_unknown_status_without_numeric_elapsed_keeps_idle_path() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Reticulating (see below)\xE2\x80\xA6\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex to do anything\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
+    );
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "nonnumeric unknown status".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
+    ));
+    app.shutdown();
+}
+
+#[test]
 fn nearby_transcript_interrupt_phrase_uses_neither_automatic_path() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     seed_pane_screen(

@@ -388,6 +388,12 @@ composer 下の `tab to queue message` footer で二重に確認する。transcr
 未知の label は native queue に使わない。未知 label でも完全な
 `esc to interrupt` が見える場合は従来どおり Enter を拒否する。
 
+さらに label の追加や改名で同じ危険が再発しないよう、prompt 上の未知 label でも
+`<英字 label> (<数字>…` の形で行末が `…` なら、Codex が status を省略したものとして
+idle の Enter 経路を拒否する。この安全網は `native_queue_busy` を立てないため、未知
+status 中に draft を書くことも Tab を押すこともない。数字がない
+`Reticulating (see below)…` のような行は対象外で、従来の挙動を維持する。
+
 debug trace には `native_queue_status_label` を追加した。認識済みなら上記 label、
 数字 elapsed を持つ未知 label なら `unknown`、該当 status がなければ `null` を
 記録する。環境変数

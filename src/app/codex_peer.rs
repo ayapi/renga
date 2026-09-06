@@ -557,6 +557,19 @@ fn codex_status_label_for_debug(status: &str) -> Option<&'static str> {
     })
 }
 
+fn codex_truncated_interrupt_status_visible(status: &str) -> bool {
+    status.lines().any(|line| {
+        let status_text = line.trim_start_matches(|ch: char| !ch.is_alphanumeric());
+        let Some((label, body)) = status_text.split_once('(') else {
+            return false;
+        };
+        !label.is_empty()
+            && label.chars().all(|ch| ch.is_ascii_alphabetic())
+            && body.starts_with(|ch: char| ch.is_ascii_digit())
+            && status_text.ends_with('…')
+    })
+}
+
 fn analyze_codex_peer_screen(
     screen: &vt100::Screen,
     capture_debug: bool,
@@ -614,7 +627,8 @@ fn analyze_codex_peer_screen(
     // A partial or unfamiliar interrupt status is not enough evidence to use
     // Codex's native queue, but it is enough to reject the idle path. This
     // keeps wrapped or renamed status text from causing an Enter mid-turn.
-    let interrupt_status_visible = status.replace('\n', "").contains("esctointerrupt");
+    let interrupt_status_visible = status.replace('\n', "").contains("esctointerrupt")
+        || codex_truncated_interrupt_status_visible(&status);
     let busy_queue_available =
         !screen.hide_cursor() && native_queue_busy && footer.contains("tabtoqueuemessage");
     let can_queue_message = !screen.hide_cursor() && has_draft == Some(false) && native_queue_busy;
