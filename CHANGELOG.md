@@ -11,6 +11,10 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Fixed
 
+- **Peer summaries are now visible in text list output.** `list_panes` and
+  `list_peers` print a pane's summary on an additive `summary:` line, matching
+  the documented `set_summary` behavior. (renga-5mz)
+
 - **Codex's current composer placeholder is no longer mistaken for a draft.**
   Placeholder recognition now covers `Ask Codex to do anything` without
   classifying similarly worded user input as placeholder text. (renga-axa)

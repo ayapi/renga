@@ -50,8 +50,9 @@ must accept these instead of JSON-RPC errors.
 | `scope` (in) | `"machine"\|"directory"\|"repo"` | Optional; **ignored**. Accepted for wire-compat with `claude-peers-mcp`. renga always treats scope as the current tab. |
 
 Result: text content listing `id`, `name`, `role`, `kind` (`claude`/`codex`),
-`receive_mode` (`push`/`pull`), `cwd`, and `pending_peer_messages`. Empty case:
-`"No peers in this tab."`.
+`receive_mode` (`push`/`pull`), `cwd`, `summary`, and
+`pending_peer_messages`. When present, the text rendering prints `summary:` on
+its own line after `cwd:`. Empty case: `"No peers in this tab."`.
 
 **Detached fallback (frozen prefix)**: `"(no peers — renga not reachable from
 this peer client: <reason>)"`. Downstream may match on this prefix; it is part
@@ -156,6 +157,8 @@ shipped in v1.0** (no longer a stub).
 from `RENGA_PANE_ID`) and surfaced as `summary` on every `PaneInfo` /
 `PeerInfo` entry returned by `list_panes` and `list_peers`. Storage is
 in-memory only — does not persist across renga restarts.
+In the text rendering, a present summary appears as a `summary:` line after
+`cwd:`.
 
 - An empty string clears the summary (round-trips to `Option::None` /
   omitted key on the wire).
@@ -231,8 +234,9 @@ Input: `{}`.
 
 Result: text describing every pane in the **current tab** (Q4): `id`, `name`,
 `role`, `focused`, geometry (`x`, `y`, `width`, `height`), `cwd`, `kind`,
-`receive_mode`, `pending_peer_messages`. Geometry fields are `0` before the
-first layout pass.
+`receive_mode`, `summary`, `pending_peer_messages`. When present, the text
+rendering prints `summary:` on its own line after `cwd:`. Geometry fields are
+`0` before the first layout pass.
 
 ### 1.6 `spawn_pane` — stable
 
@@ -576,6 +580,9 @@ in `peer_list` data):
 
 `PeerInfo` = `PaneInfo` minus the focused flag and geometry (purposefully
 hidden from cross-pane callers).
+
+The MCP text renderings for `list_panes` and `list_peers` print a present
+`summary` as a `summary:` line immediately after `cwd:`.
 
 `pending_peer_messages` is the number of undelivered peer messages / nudges
 owned by that pane: `pending_peer_inbox[pane].len()` plus the live Draft,
