@@ -3042,9 +3042,40 @@ mod tests {
     }
 
     #[test]
+    fn prompt_not_ready_for_pm_payload_ending_in_dollar() {
+        assert!(!is_prompt_ready(b"\x1b^privacy message payload$\x1b\\"));
+    }
+
+    #[test]
+    fn prompt_not_ready_for_sos_payload_ending_in_dollar() {
+        assert!(!is_prompt_ready(b"\x1bXstart of string payload$\x1b\\"));
+    }
+
+    #[test]
+    fn prompt_ready_strips_trailing_dcs() {
+        assert!(is_prompt_ready(
+            b"user@host:~$ \x1bPdevice control payload\x1b\\"
+        ));
+    }
+
+    #[test]
     fn prompt_ready_strips_trailing_apc() {
         assert!(is_prompt_ready(
             b"user@host:~$ \x1b_application payload\x1b\\"
+        ));
+    }
+
+    #[test]
+    fn prompt_ready_strips_trailing_pm() {
+        assert!(is_prompt_ready(
+            b"user@host:~$ \x1b^privacy message payload\x1b\\"
+        ));
+    }
+
+    #[test]
+    fn prompt_ready_strips_trailing_sos() {
+        assert!(is_prompt_ready(
+            b"user@host:~$ \x1bXstart of string payload\x1b\\"
         ));
     }
 
