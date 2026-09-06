@@ -1521,13 +1521,16 @@ fn extract_osc7(data: &[u8]) -> Option<PathBuf> {
     while let Some(relative_start) = find_subslice(&data[search_from..], MARKER) {
         let start = search_from + relative_start + MARKER.len();
         let rest = &data[start..];
-        let (end, after_terminator) = find_osc_terminator(rest, 0)?;
+        let (end, _after_terminator) = find_osc_terminator(rest, 0)?;
         if let Ok(uri) = std::str::from_utf8(&rest[..end]) {
             if let Some(path) = parse_osc7_uri(uri) {
                 return Some(path);
             }
         }
-        search_from = start + after_terminator;
+        // A stale unterminated marker can absorb a later sequence's
+        // terminator. Resume just after that marker so a nested valid
+        // marker is still considered.
+        search_from = start;
     }
     None
 }
@@ -1698,6 +1701,16 @@ fn strip_terminal_escapes(buf: &[u8]) -> Vec<u8> {
                             i += 1;
                             break;
                         }
+                        if buf[i] == 0x1b && buf.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                Some(b'P' | b'_' | b'^' | b'X') => {
+                    i += 2;
+                    while i < buf.len() {
                         if buf[i] == 0x1b && buf.get(i + 1) == Some(&b'\\') {
                             i += 2;
                             break;
@@ -1992,7 +2005,8 @@ mod tests {
     #[test]
     fn osc7_stream_ignores_unrelated_multibyte_output() {
         let mut stream = Osc7Stream::new();
-        let output = "日".repeat(6000).into_bytes();
+        let mut output = [0xe6, 0x97, 0xa5].repeat(2001);
+        output.truncate(6001);
         for chunk in output.chunks(4096) {
             assert_eq!(stream.push(chunk), None);
         }
@@ -2063,6 +2077,52 @@ mod tests {
             } else {
                 PathBuf::from("/c/Users/color/first")
             })
+        );
+    }
+
+    #[test]
+    fn osc7_stream_recovers_from_stale_unterminated_marker() {
+        let mut stream = Osc7Stream::new();
+        let mut stale = b"\x1b]7;".to_vec();
+        stale.extend(std::iter::repeat_n(b'x', 100));
+        assert_eq!(stream.push(&stale), None);
+        assert_eq!(
+            stream.push(b"\x1b]7;file://AYAPI-PX13/c/Users/color/Develop/renga-cdr\x07"),
+            Some(captured_osc7_path())
+        );
+    }
+
+    #[test]
+    fn osc7_stream_clears_matched_sequence_before_next_push() {
+        let mut stream = Osc7Stream::new();
+        assert_eq!(
+            stream.push(b"\x1b]7;file://host/c/Users/color/first\x07"),
+            Some(if cfg!(windows) {
+                PathBuf::from(r"C:\Users\color\first")
+            } else {
+                PathBuf::from("/c/Users/color/first")
+            })
+        );
+        assert_eq!(
+            stream.push(b"\x1b]7;file://host/c/Users/color/second\x07"),
+            Some(if cfg!(windows) {
+                PathBuf::from(r"C:\Users\color\second")
+            } else {
+                PathBuf::from("/c/Users/color/second")
+            })
+        );
+    }
+
+    #[test]
+    fn osc7_stream_drops_oversized_unterminated_sequence() {
+        let mut stream = Osc7Stream::new();
+        let mut garbage = b"\x1b]7;".to_vec();
+        garbage.extend(std::iter::repeat_n(b'x', 5000));
+        assert_eq!(stream.push(&garbage), None);
+        assert!(stream.tail.len() < Osc7Stream::CAP);
+        assert_eq!(
+            stream.push(b"\x1b]7;file://AYAPI-PX13/c/Users/color/Develop/renga-cdr\x07"),
+            Some(captured_osc7_path())
         );
     }
 
@@ -2969,6 +3029,23 @@ mod tests {
     fn prompt_ready_strips_osc_st_and_simple_escapes() {
         assert!(is_prompt_ready(b"user@host:~$ \x1b]0;title\x1b\\"));
         assert!(is_prompt_ready(b"user@host:~$ \x1b=\x1b>\x1b(B\x1b7\x1b8"));
+    }
+
+    #[test]
+    fn prompt_not_ready_for_apc_payload_ending_in_dollar() {
+        assert!(!is_prompt_ready(b"\x1b_application payload$\x1b\\"));
+    }
+
+    #[test]
+    fn prompt_not_ready_for_dcs_payload_ending_in_dollar() {
+        assert!(!is_prompt_ready(b"\x1bPdevice control payload$\x1b\\"));
+    }
+
+    #[test]
+    fn prompt_ready_strips_trailing_apc() {
+        assert!(is_prompt_ready(
+            b"user@host:~$ \x1b_application payload\x1b\\"
+        ));
     }
 
     #[test]

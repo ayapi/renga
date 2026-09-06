@@ -11,6 +11,12 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Fixed
 
+- **Shell prompt and OSC 7 detection now handles non-CSI control strings and
+  split reads.** The shell prompt latch strips OSC window-title and other
+  non-CSI control strings so Git Bash without renga's setup hook, and any shell
+  whose prompt is followed by a title update, is detected. OSC 7 cwd
+  notifications are parsed as bytes across read chunks. (renga-cdr)
+
 - **Claude transcript monitoring no longer blocks rendering.** Directory
   scans, metadata checks, capped transcript reads, and JSON parsing now run on
   a dedicated worker. Parsed cumulative state is cached per transcript path,
