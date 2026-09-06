@@ -375,13 +375,15 @@ Codex CLI v0.153.4 の実機で同じ状態を作り、composer 空では footer
 
 この場合も busy と認識できないと idle の Enter 経路が開く。そのため認識条件は
 完全な `esc to interrupt` ではなく、prompt 上の status 行が既知 label と
-数字で始まる elapsed を持つこととする。認識する status label は現在次の3つ。
+`<数字><単位>` の組で始まる elapsed を持つこととする。単位は `s` / `m` / `h` で、
+`48s` / `1m24s` / `8m55s` を認め、`2 files` / `12 files` は認めない。
+認識する status label は現在次の3つ。
 
 - `Working`
 - `Thinking`
 - `Waiting for background terminal`
 
-いずれも prompt 上の status 行が `<label> (<数字>` で始まる必要がある。
+いずれも prompt 上の status 行が `<label> (<数字><s|m|h>` で始まる必要がある。
 認識済み status が残る間は Enter を許可しない。実際に Tab を押す条件は従来どおり
 composer 下の `tab to queue message` footer で二重に確認する。transcript 内の
 `Thinking (see below)` のような数字で始まらない文言、途中で折り返された status、
@@ -389,12 +391,13 @@ composer 下の `tab to queue message` footer で二重に確認する。transcr
 `esc to interrupt` が見える場合は従来どおり Enter を拒否する。
 
 さらに label の追加や改名で同じ危険が再発しないよう、prompt 上の未知 label でも
-`<英字 label> (<数字>…` の形で行末が `…` なら、Codex が status を省略したものとして
-idle の Enter 経路を拒否する。この安全網は `native_queue_busy` を立てないため、未知
-status 中に draft を書くことも Tab を押すこともない。数字がない
-`Reticulating (see below)…` のような行は対象外で、従来の挙動を維持する。
+`<英字 label> (<数字><s|m|h>…` の elapsed 形で行末が `…` なら、Codex が status を
+省略したものとして idle の Enter 経路を拒否する。この安全網は
+`native_queue_busy` を立てないため、未知 status 中に draft を書くことも Tab を
+押すこともない。単位付き elapsed ではない `Reticulating (see below)…` や
+`Explored (12 files)…` のような行は対象外で、従来の挙動を維持する。
 
 debug trace には `native_queue_status_label` を追加した。認識済みなら上記 label、
-数字 elapsed を持つ未知 label なら `unknown`、該当 status がなければ `null` を
+単位付き elapsed を持つ行頭の未知 label なら `unknown`、該当 status がなければ `null` を
 記録する。環境変数
 `RENGA_DEBUG_CODEX_PEER_LOG` が未設定なら、従来どおり trace は出力しない。

@@ -521,6 +521,34 @@ fn raw_screen_rows(screen: &vt100::Screen, start: u16, end: u16) -> String {
         .join("\n")
 }
 
+fn starts_with_codex_elapsed(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    let mut groups = 0;
+    while index < bytes.len() {
+        let digits_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == digits_start
+            || !bytes
+                .get(index)
+                .is_some_and(|unit| matches!(unit, b's' | b'm' | b'h'))
+        {
+            return false;
+        }
+        index += 1;
+        groups += 1;
+        if !bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            break;
+        }
+    }
+    groups > 0
+        && bytes
+            .get(index)
+            .is_none_or(|next| !next.is_ascii_alphanumeric())
+}
+
 fn codex_native_queue_status_label(status: &str) -> Option<&'static str> {
     const LABELS: [(&str, &str); 3] = [
         ("working", "Working"),
@@ -536,7 +564,7 @@ fn codex_native_queue_status_label(status: &str) -> Option<&'static str> {
         let status_text = line.trim_start_matches(|ch: char| !ch.is_alphanumeric());
         LABELS.iter().find_map(|(normalized, label)| {
             let body = status_text.strip_prefix(normalized)?.strip_prefix('(')?;
-            if !body.starts_with(|ch: char| ch.is_ascii_digit()) {
+            if !starts_with_codex_elapsed(body) {
                 return None;
             }
             let interrupt_phrase_wraps =
@@ -550,9 +578,11 @@ fn codex_status_label_for_debug(status: &str) -> Option<&'static str> {
     codex_native_queue_status_label(status).or_else(|| {
         status.lines().find_map(|line| {
             let status_text = line.trim_start_matches(|ch: char| !ch.is_alphanumeric());
-            let (_, body) = status_text.split_once('(')?;
-            body.starts_with(|ch: char| ch.is_ascii_digit())
-                .then_some("unknown")
+            let (label, body) = status_text.split_once('(')?;
+            (!label.is_empty()
+                && label.chars().all(|ch| ch.is_ascii_alphabetic())
+                && starts_with_codex_elapsed(body))
+            .then_some("unknown")
         })
     })
 }
@@ -565,7 +595,7 @@ fn codex_truncated_interrupt_status_visible(status: &str) -> bool {
         };
         !label.is_empty()
             && label.chars().all(|ch| ch.is_ascii_alphabetic())
-            && body.starts_with(|ch: char| ch.is_ascii_digit())
+            && starts_with_codex_elapsed(body)
             && status_text.ends_with('…')
     })
 }
@@ -2561,6 +2591,8 @@ mod debug_logging_tests {
             codex_status_label_for_debug("◦reticulating(12s•esctointerrupt)"),
             Some("unknown")
         );
+        assert_eq!(codex_status_label_for_debug("messagewithfoo(3)"), None);
+        assert_eq!(codex_status_label_for_debug("reticulating(12files)"), None);
         assert_eq!(codex_status_label_for_debug("ordinarytranscript"), None);
     }
 }

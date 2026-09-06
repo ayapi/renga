@@ -2782,6 +2782,144 @@ fn truncated_known_busy_status_never_falls_through_to_enter() {
 }
 
 #[test]
+fn clipped_known_busy_status_without_ellipsis_never_falls_through_to_enter() {
+    let status = "◦ Working (19s • esc to interr";
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    let empty_screen = format!(
+        "\x1b[?25h\x1b[2J\x1b[H{status}\x1b[4;1H\u{203a} \x1b[2mAsk Codex to do anything\x1b[22m\x1b[6;1H  gpt-5.6-sol medium \u{b7} cwd\x1b[4;3H"
+    );
+    seed_pane_screen(&mut app, codex_id, empty_screen.as_bytes());
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "clipped known status".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::QueueAt { .. })
+    ));
+
+    let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: None,
+        from_kind: None,
+    });
+    let draft_screen = format!(
+        "\x1b[?25h\x1b[2J\x1b[H{status}\x1b[4;1H\u{203a} {expected}\x1b[8;1H  gpt-5.6-sol medium \u{b7} cwd\x1b[4;{}H",
+        expected.chars().count() + 3
+    );
+    seed_pane_screen(&mut app, codex_id, draft_screen.as_bytes());
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    make_codex_native_queue_ready(&mut app, codex_id);
+
+    app.flush_pending_codex_peer_messages();
+
+    assert!(
+        !app.ws()
+            .panes
+            .get(&codex_id)
+            .expect("pane")
+            .test_input()
+            .contains(&b'\r'),
+        "a recognized busy status must block Enter even without ellipsis"
+    );
+    app.shutdown();
+}
+
+#[test]
+fn transcript_prefix_before_working_status_is_not_native_queue_busy() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[Hthe agent was Working (12s \xE2\x80\xA2 esc to interrupt) at that point.\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex to do anything\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
+    );
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "anchored transcript".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::Draft { .. })
+    ));
+    assert!(app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("pane")
+        .test_input()
+        .is_empty());
+    app.shutdown();
+}
+
+#[test]
+fn truncated_tool_file_count_is_not_interrupt_status() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xA2 Explored(12 files) and summarised the modu\xE2\x80\xA6\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex to do anything\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
+    );
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "tool count transcript".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn working_file_count_transcript_is_not_native_queue_busy() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[HWorking (2 files) were left over\xE2\x80\xA6\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex to do anything\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
+    );
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "working file transcript".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
+    ));
+    app.shutdown();
+}
+
+#[test]
 fn transcript_thinking_without_numeric_elapsed_is_not_busy() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     seed_pane_screen(
