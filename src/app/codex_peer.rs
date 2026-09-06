@@ -71,6 +71,7 @@ pub(crate) struct PendingPeerInboxMessage {
     pub(crate) from_kind: Option<PeerClientKind>,
     pub(crate) body: String,
     pub(crate) ts_ms: u64,
+    pub(crate) debug_delivery_sequence: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -807,6 +808,20 @@ fn log_codex_peer_kind_update(
     );
 }
 
+fn peer_client_kind_label(kind: PeerClientKind) -> &'static str {
+    match kind {
+        PeerClientKind::Claude => "claude",
+        PeerClientKind::Codex => "codex",
+    }
+}
+
+fn log_peer_delivery_record(record: serde_json::Value) {
+    let Some(path) = codex_peer_debug_log_path() else {
+        return;
+    };
+    append_codex_peer_debug_record(&path, record);
+}
+
 fn log_codex_peer_decision(path: &std::ffi::OsStr, decision: CodexPeerDecision<'_>) {
     let CodexPeerDecision {
         pane_id,
@@ -1019,12 +1034,13 @@ impl App {
         } else {
             None
         };
-        let message = PendingPeerInboxMessage {
+        let mut message = PendingPeerInboxMessage {
             from_pane,
             from_name,
             from_kind,
             body: body.clone(),
             ts_ms: ipc::events::now_ms(),
+            debug_delivery_sequence: None,
         };
         if self.peer_delivery_ready.contains(&target_id) {
             Ok(PreparedPeerSend::Confirm {
@@ -1033,9 +1049,13 @@ impl App {
                 nudge,
             })
         } else {
-            let queue = self.pending_peer_inbox.entry(target_id).or_default();
-            let retained_bytes: usize = queue.iter().map(|item| item.body.len()).sum();
-            if queue.len() >= PENDING_PEER_INBOX_MAX_MESSAGES
+            let (queue_len, retained_bytes) = self
+                .pending_peer_inbox
+                .get(&target_id)
+                .map_or((0, 0), |queue| {
+                    (queue.len(), queue.iter().map(|item| item.body.len()).sum())
+                });
+            if queue_len >= PENDING_PEER_INBOX_MAX_MESSAGES
                 || retained_bytes.saturating_add(message.body.len()) > PENDING_PEER_INBOX_MAX_BYTES
             {
                 return Err(ipc::CodedError::new(
@@ -1043,7 +1063,25 @@ impl App {
                     format!("peer inbox queue for pane {target_id} is full"),
                 ));
             }
+            message.debug_delivery_sequence = codex_peer_debug_log_path().map(|_| {
+                let sequence = self
+                    .codex_peer_delivery_sequences
+                    .entry(target_id)
+                    .or_insert(0);
+                *sequence = sequence.saturating_add(1);
+                *sequence
+            });
+            let queue = self.pending_peer_inbox.entry(target_id).or_default();
             queue.push_back(message);
+            let delivery_sequence = queue
+                .back()
+                .and_then(|message| message.debug_delivery_sequence);
+            log_peer_delivery_record(serde_json::json!({
+                "action": "peer_inbox_queued_until_ready",
+                "pane_id": target_id,
+                "delivery_sequence": delivery_sequence,
+                "queue_len_after": queue.len(),
+            }));
             let outcome = ipc::PeerSendOutcome::Queued;
             self.record_peer_send(target_id, from_pane, &body, outcome);
             Ok(PreparedPeerSend::Immediate(outcome))
@@ -1287,6 +1325,11 @@ impl App {
             };
             if pending.replies.is_empty() {
                 self.peer_delivery_ready.remove(&pending.target_pane);
+                log_peer_delivery_record(serde_json::json!({
+                    "action": "peer_delivery_ready_cleared",
+                    "pane_id": pending.target_pane,
+                    "reason": "unconfirmed_delivery_expired",
+                }));
                 self.pending_peer_inbox
                     .entry(pending.target_pane)
                     .or_default()
@@ -1398,7 +1441,21 @@ impl App {
         let old_kind = self.peer_client_kinds.insert(pane_id, kind);
         log_codex_peer_kind_update(pane_id, old_kind, kind, "set_ready");
         self.peer_delivery_ready.insert(pane_id);
-        if let Some(messages) = self.pending_peer_inbox.remove(&pane_id) {
+        let messages = self.pending_peer_inbox.remove(&pane_id);
+        let delivery_sequences: Vec<u64> = messages
+            .as_ref()
+            .into_iter()
+            .flat_map(|messages| messages.iter())
+            .filter_map(|message| message.debug_delivery_sequence)
+            .collect();
+        log_peer_delivery_record(serde_json::json!({
+            "action": "peer_set_ready_flush",
+            "pane_id": pane_id,
+            "client_kind": peer_client_kind_label(kind),
+            "flushed_count": messages.as_ref().map_or(0, VecDeque::len),
+            "delivery_sequences": delivery_sequences,
+        }));
+        if let Some(messages) = messages {
             let count = messages.len();
             let is_codex = self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex);
             for (index, message) in messages.into_iter().enumerate() {
@@ -1419,6 +1476,11 @@ impl App {
     /// same transport-liveness requirement.
     pub(crate) fn handle_peer_subscriber_gone(&mut self, pane_id: usize) {
         self.peer_delivery_ready.remove(&pane_id);
+        log_peer_delivery_record(serde_json::json!({
+            "action": "peer_delivery_ready_cleared",
+            "pane_id": pane_id,
+            "reason": "subscriber_gone",
+        }));
         let mut failed: Vec<u64> = self
             .pending_peer_deliveries
             .iter()
@@ -2330,6 +2392,25 @@ impl App {
 mod debug_logging_tests {
     use super::*;
 
+    fn debug_test_path(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "renga-codex-peer-{label}-{}-{unique}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    fn read_debug_records(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .expect("debug JSONL")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSONL record"))
+            .collect()
+    }
+
     #[test]
     fn inherited_debug_log_path_is_disabled_by_default() {
         let env_read = std::cell::Cell::new(false);
@@ -2385,6 +2466,93 @@ mod debug_logging_tests {
         assert_eq!(record["action"], "client_kind_updated");
         assert_eq!(record["pane_id"], 17);
         std::fs::remove_file(path).expect("remove debug JSONL");
+    }
+
+    #[test]
+    fn peer_delivery_debug_log_correlates_queued_flush_and_ready_clears() {
+        let path = debug_test_path("delivery-lifecycle");
+        set_codex_peer_debug_log_path_test_override(Some(Some(path.as_os_str().to_owned())));
+        let mut app = App::new(40, 80).expect("App::new");
+        let sender_id = app.workspaces[app.active_tab].focused_pane_id;
+        let target_id = app
+            .handle_split(
+                &PaneRef::Focused,
+                ipc::Direction::Vertical,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("split");
+
+        let prepared = app
+            .prepare_peer_send(sender_id, &PaneRef::Id(target_id), "trace me".into())
+            .expect("queue peer message");
+        assert!(matches!(
+            prepared,
+            PreparedPeerSend::Immediate(ipc::PeerSendOutcome::Queued)
+        ));
+        app.handle_peer_set_ready(target_id, PeerClientKind::Claude, true)
+            .expect("flush queued peer message");
+        for pending in app.pending_peer_deliveries.values_mut() {
+            if pending.target_pane == target_id {
+                pending.expires_at = Instant::now();
+            }
+        }
+        app.flush_pending_peer_deliveries();
+        app.handle_peer_subscriber_gone(target_id);
+        app.shutdown();
+        set_codex_peer_debug_log_path_test_override(Some(None));
+
+        let records = read_debug_records(&path);
+        let queue = records
+            .iter()
+            .find(|record| record["action"] == "peer_inbox_queued_until_ready")
+            .expect("queue record");
+        let flush = records
+            .iter()
+            .find(|record| record["action"] == "peer_set_ready_flush")
+            .expect("flush record");
+        assert_eq!(queue["pane_id"], target_id);
+        assert_eq!(queue["queue_len_after"], 1);
+        assert_eq!(flush["client_kind"], "claude");
+        assert_eq!(flush["flushed_count"], 1);
+        assert_eq!(flush["delivery_sequences"][0], queue["delivery_sequence"]);
+        let clear_reasons: Vec<_> = records
+            .iter()
+            .filter(|record| record["action"] == "peer_delivery_ready_cleared")
+            .filter_map(|record| record["reason"].as_str())
+            .collect();
+        assert_eq!(
+            clear_reasons,
+            ["unconfirmed_delivery_expired", "subscriber_gone"]
+        );
+        for record in records.iter().filter(|record| {
+            matches!(
+                record["action"].as_str(),
+                Some(
+                    "peer_inbox_queued_until_ready"
+                        | "peer_set_ready_flush"
+                        | "peer_delivery_ready_cleared"
+                )
+            )
+        }) {
+            assert!(record.get("process_id").is_some());
+            assert!(record.get("record_sequence").is_some());
+            assert!(record.get("timestamp_unix_ms").is_some());
+        }
+        std::fs::remove_file(path).expect("remove debug JSONL");
+    }
+
+    #[test]
+    fn peer_delivery_debug_log_disabled_writes_nothing() {
+        let path = debug_test_path("delivery-disabled");
+        set_codex_peer_debug_log_path_test_override(Some(None));
+        log_peer_delivery_record(serde_json::json!({
+            "action": "peer_inbox_queued_until_ready",
+            "pane_id": 1,
+        }));
+        assert!(!path.exists());
     }
 
     #[test]

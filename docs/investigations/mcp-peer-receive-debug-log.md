@@ -51,3 +51,36 @@ values do not identify the same delivery. The only shared correlation data is
   the App to confirm storage or push delivery.
 - `peer_receipt_cache_hit`: `delivery_id` when a repeated event is retained
   idempotently instead of being emitted a second time.
+
+### Push delivery timing
+
+- `push_frame_buffered`: `delivery_id` when available, `frame_kind`
+  (`peer_inbox`, `events_dropped`, or `other`), and `pending_len_after` when a
+  notification arrives before the MCP initialized notification.
+- `push_frame_emitted`: `delivery_id`, `frame_kind`, `initialized_age_ms`, and
+  `via` (`direct` or `initialized_flush`) after a successful stdout write.
+  Flush records use an age of zero.
+- `push_frame_dropped_cap`: `frame_kind` and `pending_len` when the
+  pre-initialization notification queue is full.
+- `push_initialized`: `flushed_count` and `subscribed_at_that_time` when the MCP
+  initialized notification is handled. This record precedes the corresponding
+  `initialized_flush` emission records.
+- `push_subscribed`: `subscribed` and `initialized_at_that_time` whenever the
+  event subscription state changes.
+- `peer_set_ready_sent`: `client_kind` when mcp-peer sends App the readiness
+  update after both push initialization and subscription have completed.
+
+### App-side ready queue timing
+
+These records carry the TUI process id. The trace-only `delivery_sequence`
+assigned by `peer_inbox_queued_until_ready` is repeated in
+`peer_set_ready_flush.delivery_sequences`; it does not change the peer wire
+format.
+
+- `peer_inbox_queued_until_ready`: `delivery_sequence` and `queue_len_after`
+  when App retains a message for a pane that has not reported ready.
+- `peer_set_ready_flush`: `client_kind`, `flushed_count`, and
+  `delivery_sequences` when App marks the pane ready and drains that queue.
+- `peer_delivery_ready_cleared`: `reason` (`unconfirmed_delivery_expired` or
+  `subscriber_gone`) when App revokes readiness after a failed receipt or event
+  subscription disconnect.

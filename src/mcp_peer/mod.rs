@@ -118,6 +118,16 @@ fn set_client_ready(ctx: &PeerCtx, ready: bool) {
     let Mode::Connected { pane_id, endpoint } = &ctx.mode else {
         return;
     };
+    if let Some(path) = ctx.debug_log_path.as_deref() {
+        append_peer_debug_record(
+            path,
+            Some(*pane_id),
+            json!({
+                "action": "peer_set_ready_sent",
+                "client_kind": kind_label(ctx.client_kind),
+            }),
+        );
+    }
     match client::send_request(
         endpoint,
         &Request::PeerSetReady {
@@ -284,8 +294,16 @@ fn retain_peer_delivery_once(
 #[derive(Default)]
 struct PushState {
     initialized: bool,
+    initialized_at: Option<Instant>,
     subscribed: bool,
-    pending: VecDeque<Value>,
+    pending: VecDeque<PendingPushFrame>,
+}
+
+#[derive(Debug)]
+struct PendingPushFrame {
+    value: Value,
+    delivery_id: Option<u64>,
+    frame_kind: &'static str,
 }
 
 const PUSH_PENDING_CAP: usize = 256;
@@ -580,11 +598,22 @@ fn write_frame(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn deliver_push_frame(ctx: &PeerCtx, value: Value) -> bool {
-    deliver_push_frame_with(ctx, value, write_frame)
+fn deliver_push_frame(
+    ctx: &PeerCtx,
+    value: Value,
+    delivery_id: Option<u64>,
+    frame_kind: &'static str,
+) -> bool {
+    deliver_push_frame_with(ctx, value, delivery_id, frame_kind, write_frame)
 }
 
-fn deliver_push_frame_with<F>(ctx: &PeerCtx, value: Value, mut emit: F) -> bool
+fn deliver_push_frame_with<F>(
+    ctx: &PeerCtx,
+    value: Value,
+    delivery_id: Option<u64>,
+    frame_kind: &'static str,
+    mut emit: F,
+) -> bool
 where
     F: FnMut(&Value) -> Result<()>,
 {
@@ -595,9 +624,27 @@ where
             // initialization, so this cap normally only affects repeated
             // diagnostic notices such as EventsDropped before initialization.
             log_stderr("push notification buffer full before initialized; dropping newest notice");
+            log_push_frame(
+                ctx,
+                "push_frame_dropped_cap",
+                delivery_id,
+                frame_kind,
+                json!({ "pending_len": state.pending.len() }),
+            );
             return false;
         }
-        state.pending.push_back(value);
+        state.pending.push_back(PendingPushFrame {
+            value,
+            delivery_id,
+            frame_kind,
+        });
+        log_push_frame(
+            ctx,
+            "push_frame_buffered",
+            delivery_id,
+            frame_kind,
+            json!({ "pending_len_after": state.pending.len() }),
+        );
         return true;
     }
     // Keep the push lock through the write so a concurrent initialized
@@ -606,7 +653,58 @@ where
         log_stderr(&format!("failed to push channel notification: {e}"));
         return false;
     }
+    let initialized_age_ms = state
+        .initialized_at
+        .map_or(0, |initialized_at| initialized_at.elapsed().as_millis());
+    log_push_frame(
+        ctx,
+        "push_frame_emitted",
+        delivery_id,
+        frame_kind,
+        json!({
+            "initialized_age_ms": initialized_age_ms,
+            "via": "direct",
+        }),
+    );
     true
+}
+
+fn log_push_frame(
+    ctx: &PeerCtx,
+    action: &'static str,
+    delivery_id: Option<u64>,
+    frame_kind: &'static str,
+    fields: Value,
+) {
+    let Some(path) = ctx.debug_log_path.as_deref() else {
+        return;
+    };
+    let mut record = fields;
+    if let Some(object) = record.as_object_mut() {
+        object.insert("action".into(), json!(action));
+        object.insert("delivery_id".into(), json!(delivery_id));
+        object.insert("frame_kind".into(), json!(frame_kind));
+    }
+    let pane_id = match &ctx.mode {
+        Mode::Connected { pane_id, .. } => Some(*pane_id),
+        Mode::Detached { .. } => None,
+    };
+    append_peer_debug_record(path, pane_id, record);
+}
+
+fn log_push_lifecycle(ctx: &PeerCtx, action: &'static str, fields: Value) {
+    let Some(path) = ctx.debug_log_path.as_deref() else {
+        return;
+    };
+    let mut record = fields;
+    if let Some(object) = record.as_object_mut() {
+        object.insert("action".into(), json!(action));
+    }
+    let pane_id = match &ctx.mode {
+        Mode::Connected { pane_id, .. } => Some(*pane_id),
+        Mode::Detached { .. } => None,
+    };
+    append_peer_debug_record(path, pane_id, record);
 }
 
 fn mark_push_initialized(ctx: &PeerCtx) -> bool {
@@ -619,9 +717,31 @@ where
 {
     let mut state = ctx.push.lock().unwrap_or_else(|p| p.into_inner());
     state.initialized = true;
-    while let Some(value) = state.pending.pop_front() {
-        if let Err(e) = emit(&value) {
+    state.initialized_at = Some(Instant::now());
+    let flushed_count = state.pending.len();
+    let subscribed_at_that_time = state.subscribed;
+    log_push_lifecycle(
+        ctx,
+        "push_initialized",
+        json!({
+            "flushed_count": flushed_count,
+            "subscribed_at_that_time": subscribed_at_that_time,
+        }),
+    );
+    while let Some(frame) = state.pending.pop_front() {
+        if let Err(e) = emit(&frame.value) {
             log_stderr(&format!("failed to flush channel notification: {e}"));
+        } else {
+            log_push_frame(
+                ctx,
+                "push_frame_emitted",
+                frame.delivery_id,
+                frame.frame_kind,
+                json!({
+                    "initialized_age_ms": 0,
+                    "via": "initialized_flush",
+                }),
+            );
         }
     }
     state.subscribed
@@ -630,6 +750,14 @@ where
 fn mark_push_subscribed(ctx: &PeerCtx, subscribed: bool) -> bool {
     let mut state = ctx.push.lock().unwrap_or_else(|p| p.into_inner());
     state.subscribed = subscribed;
+    log_push_lifecycle(
+        ctx,
+        "push_subscribed",
+        json!({
+            "subscribed": subscribed,
+            "initialized_at_that_time": state.initialized,
+        }),
+    );
     state.initialized && state.subscribed
 }
 
@@ -3487,7 +3615,12 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                                     &from_pane.to_string(),
                                     from_name.as_deref(),
                                 );
-                                deliver_push_frame(&registration_ctx, note)
+                                deliver_push_frame(
+                                    &registration_ctx,
+                                    note,
+                                    delivery_id,
+                                    "peer_inbox",
+                                )
                             }
                         });
                         if let Some((receipt_cache_hit, body_len)) = debug_metadata {
@@ -3537,7 +3670,12 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                             });
                         } else {
                             let note = channel_notification(&body, "renga", Some("renga runtime"));
-                            deliver_push_frame(&registration_ctx, note);
+                            deliver_push_frame(
+                                &registration_ctx,
+                                note,
+                                None,
+                                "events_dropped",
+                            );
                         }
                     }
                     // PaneStarted / PaneExited / Heartbeat / other
@@ -3693,11 +3831,14 @@ mod tests {
         let ctx = connected_ctx_with(new_event_sink());
         let notification = channel_notification("queued", "2", Some("worker"));
 
-        deliver_push_frame(&ctx, notification.clone());
+        deliver_push_frame(&ctx, notification.clone(), Some(7), "peer_inbox");
 
         let state = ctx.push.lock().unwrap();
         assert!(!state.initialized);
-        assert_eq!(state.pending.front(), Some(&notification));
+        assert_eq!(
+            state.pending.front().map(|frame| &frame.value),
+            Some(&notification)
+        );
     }
 
     #[test]
@@ -3705,8 +3846,8 @@ mod tests {
         let ctx = connected_ctx_with(new_event_sink());
         let first = channel_notification("first", "2", None);
         let second = channel_notification("second", "2", None);
-        deliver_push_frame(&ctx, first.clone());
-        deliver_push_frame(&ctx, second.clone());
+        deliver_push_frame(&ctx, first.clone(), Some(1), "peer_inbox");
+        deliver_push_frame(&ctx, second.clone(), Some(2), "peer_inbox");
 
         let mut emitted = Vec::new();
         let ready = mark_push_initialized_with(&ctx, |value| {
@@ -3719,6 +3860,92 @@ mod tests {
         let state = ctx.push.lock().unwrap();
         assert!(state.initialized);
         assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn push_debug_log_records_buffer_flush_emit_and_lifecycle_order() {
+        let path = debug_test_path("push-lifecycle");
+        let ctx = connected_ctx_with_debug_log(path.clone());
+        let notification = channel_notification("first", "2", None);
+
+        assert!(deliver_push_frame(
+            &ctx,
+            notification,
+            Some(41),
+            "peer_inbox"
+        ));
+        assert!(!mark_push_subscribed(&ctx, true));
+        assert!(mark_push_initialized_with(&ctx, |_| Ok(())));
+        assert!(deliver_push_frame_with(
+            &ctx,
+            json!({"method": "test"}),
+            None,
+            "other",
+            |_| Ok(())
+        ));
+        set_client_ready(&ctx, true);
+
+        let records = read_debug_records(&path);
+        let actions: Vec<_> = records
+            .iter()
+            .filter_map(|record| record["action"].as_str())
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "push_frame_buffered",
+                "push_subscribed",
+                "push_initialized",
+                "push_frame_emitted",
+                "push_frame_emitted",
+                "peer_set_ready_sent",
+            ]
+        );
+        assert_eq!(records[0]["delivery_id"], 41);
+        assert_eq!(records[0]["frame_kind"], "peer_inbox");
+        assert_eq!(records[0]["pending_len_after"], 1);
+        assert_eq!(records[1]["subscribed"], true);
+        assert_eq!(records[1]["initialized_at_that_time"], false);
+        assert_eq!(records[2]["flushed_count"], 1);
+        assert_eq!(records[2]["subscribed_at_that_time"], true);
+        assert_eq!(records[3]["via"], "initialized_flush");
+        assert_eq!(records[3]["initialized_age_ms"], 0);
+        assert_eq!(records[4]["via"], "direct");
+        assert_eq!(records[5]["client_kind"], "codex");
+        for record in records {
+            assert_eq!(record["pane_id"], 1);
+            assert!(record.get("process_id").is_some());
+            assert!(record.get("record_sequence").is_some());
+            assert!(record.get("timestamp_unix_ms").is_some());
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn push_debug_log_records_cap_drop_once_and_disabled_path_writes_nothing() {
+        let path = debug_test_path("push-cap");
+        let ctx = connected_ctx_with_debug_log(path.clone());
+        for n in 0..=PUSH_PENDING_CAP {
+            deliver_push_frame_with(&ctx, json!({ "sequence": n }), None, "other", |_| Ok(()));
+        }
+        let records = read_debug_records(&path);
+        let drops: Vec<_> = records
+            .iter()
+            .filter(|record| record["action"] == "push_frame_dropped_cap")
+            .collect();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0]["frame_kind"], "other");
+        assert_eq!(drops[0]["pending_len"], PUSH_PENDING_CAP);
+        let _ = std::fs::remove_file(path);
+
+        let disabled_path = debug_test_path("push-disabled");
+        let disabled = connected_ctx_with(new_event_sink());
+        deliver_push_frame_with(&disabled, json!({"method": "test"}), None, "other", |_| {
+            Ok(())
+        });
+        mark_push_subscribed(&disabled, true);
+        mark_push_initialized_with(&disabled, |_| Ok(()));
+        assert!(!disabled_path.exists());
     }
 
     #[test]
@@ -3737,13 +3964,16 @@ mod tests {
     fn pre_initialized_push_buffer_is_bounded() {
         let ctx = connected_ctx_with(new_event_sink());
         for n in 0..(PUSH_PENDING_CAP + 1) {
-            deliver_push_frame_with(&ctx, json!({ "sequence": n }), |_| Ok(()));
+            deliver_push_frame_with(&ctx, json!({ "sequence": n }), None, "other", |_| Ok(()));
         }
         let state = ctx.push.lock().unwrap();
         assert_eq!(state.pending.len(), PUSH_PENDING_CAP);
-        assert_eq!(state.pending.front(), Some(&json!({ "sequence": 0 })));
         assert_eq!(
-            state.pending.back(),
+            state.pending.front().map(|frame| &frame.value),
+            Some(&json!({ "sequence": 0 }))
+        );
+        assert_eq!(
+            state.pending.back().map(|frame| &frame.value),
             Some(&json!({ "sequence": PUSH_PENDING_CAP - 1 }))
         );
     }
