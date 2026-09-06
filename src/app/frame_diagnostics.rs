@@ -21,6 +21,14 @@ const FIELD_ACTION: &str = "action";
 const FIELD_FRAME_MS: &str = "frame_ms";
 const FIELD_PHASE_MS: &str = "phase_ms";
 const FIELD_RENDER_BREAKDOWN_MS: &str = "render_breakdown_ms";
+const FIELD_DRAW_MS_BY_COMPONENT: &str = "draw_ms_by_component";
+const FIELD_PREVIEW_KIND: &str = "preview_kind";
+const FIELD_PREVIEW_AREA: &str = "preview_area";
+const FIELD_PREVIEW_IMAGE_REENCODED: &str = "preview_image_reencoded";
+const FIELD_SIDEBAR_VISIBLE: &str = "sidebar_visible";
+const FIELD_CLAUDE_MONITOR_LINES_PARSED: &str = "claude_monitor_lines_parsed";
+const FIELD_CLAUDE_MONITOR_BYTES_READ: &str = "claude_monitor_bytes_read";
+const FIELD_CLAUDE_MONITOR_PATH_CHANGES: &str = "claude_monitor_path_changes";
 const FIELD_DRAW: &str = "draw";
 const FIELD_PRESENT: &str = "present";
 const FIELD_EVENTS_DRAINED: &str = "events_drained";
@@ -46,6 +54,14 @@ struct FrameData {
     pty_writes_by_pane: BTreeMap<usize, usize>,
     output_bytes_by_pane: BTreeMap<usize, usize>,
     lock_wait: BTreeMap<usize, Duration>,
+    draw_by_component: BTreeMap<String, Duration>,
+    preview_kind: &'static str,
+    preview_area: (u16, u16),
+    preview_image_reencoded: bool,
+    sidebar_visible: bool,
+    claude_monitor_lines_parsed: usize,
+    claude_monitor_bytes_read: usize,
+    claude_monitor_path_changes: usize,
 }
 
 struct IpcCommandMetric {
@@ -83,6 +99,7 @@ pub(crate) fn begin_frame(started_at: Instant) {
         if state.path.is_some() {
             state.frame = Some(FrameData {
                 started_at: Some(started_at),
+                preview_kind: "none",
                 ..FrameData::default()
             });
         }
@@ -101,6 +118,53 @@ pub(crate) fn finish_phase(phase: &'static str, started_at: Option<Instant>) {
     STATE.with(|state| {
         if let Some(frame) = state.borrow_mut().frame.as_mut() {
             *frame.phase_ms.entry(phase).or_default() += elapsed;
+        }
+    });
+}
+
+pub(crate) fn record_draw_component(name: impl Into<String>, duration: Duration) {
+    STATE.with(|state| {
+        if let Some(frame) = state.borrow_mut().frame.as_mut() {
+            *frame.draw_by_component.entry(name.into()).or_default() += duration;
+        }
+    });
+}
+
+pub(crate) fn record_render_context(
+    preview_kind: &'static str,
+    preview_area: (u16, u16),
+    sidebar_visible: bool,
+) {
+    STATE.with(|state| {
+        if let Some(frame) = state.borrow_mut().frame.as_mut() {
+            frame.preview_kind = preview_kind;
+            frame.preview_area = preview_area;
+            frame.sidebar_visible = sidebar_visible;
+        }
+    });
+}
+
+pub(crate) fn record_preview_image_reencoded(reencoded: bool) {
+    STATE.with(|state| {
+        if let Some(frame) = state.borrow_mut().frame.as_mut() {
+            frame.preview_image_reencoded = reencoded;
+        }
+    });
+}
+
+pub(crate) fn record_claude_monitor_io(lines_parsed: usize, bytes_read: usize) {
+    STATE.with(|state| {
+        if let Some(frame) = state.borrow_mut().frame.as_mut() {
+            frame.claude_monitor_lines_parsed += lines_parsed;
+            frame.claude_monitor_bytes_read += bytes_read;
+        }
+    });
+}
+
+pub(crate) fn record_claude_monitor_path_change() {
+    STATE.with(|state| {
+        if let Some(frame) = state.borrow_mut().frame.as_mut() {
+            frame.claude_monitor_path_changes += 1;
         }
     });
 }
@@ -257,6 +321,11 @@ fn finish_frame_at(finished_at: Instant, visible_panes: Vec<usize>) {
             .into_iter()
             .map(|(pane_id, elapsed)| (pane_id.to_string(), elapsed.as_millis()))
             .collect();
+        let draw_ms_by_component: BTreeMap<String, u128> = frame
+            .draw_by_component
+            .into_iter()
+            .map(|(name, elapsed)| (name, elapsed.as_millis()))
+            .collect();
         drop(state);
         append_codex_peer_debug_record(
             OsStr::new(&path),
@@ -268,6 +337,17 @@ fn finish_frame_at(finished_at: Instant, visible_panes: Vec<usize>) {
                     (FIELD_DRAW): render_draw_ms,
                     (FIELD_PRESENT): render_present_ms,
                 },
+                (FIELD_DRAW_MS_BY_COMPONENT): draw_ms_by_component,
+                (FIELD_PREVIEW_KIND): frame.preview_kind,
+                (FIELD_PREVIEW_AREA): {
+                    "w": frame.preview_area.0,
+                    "h": frame.preview_area.1,
+                },
+                (FIELD_PREVIEW_IMAGE_REENCODED): frame.preview_image_reencoded,
+                (FIELD_SIDEBAR_VISIBLE): frame.sidebar_visible,
+                (FIELD_CLAUDE_MONITOR_LINES_PARSED): frame.claude_monitor_lines_parsed,
+                (FIELD_CLAUDE_MONITOR_BYTES_READ): frame.claude_monitor_bytes_read,
+                (FIELD_CLAUDE_MONITOR_PATH_CHANGES): frame.claude_monitor_path_changes,
                 (FIELD_EVENTS_DRAINED): frame.events_drained,
                 (FIELD_PTY_OUTPUT_EVENTS): frame.pty_output_events,
                 (FIELD_IPC_COMMANDS): ipc_commands,
@@ -285,6 +365,28 @@ mod debug_logging_tests {
     use super::*;
     use crate::app::AppCommand;
     use crate::pane::Pane;
+
+    struct DebugEnvRestore(Option<OsString>);
+
+    impl DebugEnvRestore {
+        fn set(path: &OsStr) -> Self {
+            let previous = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+            std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", path);
+            crate::app::set_codex_peer_debug_log_path_test_override(None);
+            Self(previous)
+        }
+    }
+
+    impl Drop for DebugEnvRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", value),
+                None => std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG"),
+            }
+            crate::app::set_codex_peer_debug_log_path_test_override(Some(None));
+            configure(None);
+        }
+    }
 
     fn temp_log_path(label: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()
@@ -306,7 +408,21 @@ mod debug_logging_tests {
         let render_started_at = phase_started();
         std::thread::sleep(Duration::from_millis(2));
         let render_draw_started_at = phase_started();
-        std::thread::sleep(Duration::from_millis(4));
+        std::thread::sleep(Duration::from_millis(10));
+        record_draw_component("tabs", Duration::from_millis(1));
+        record_draw_component("pane:3", Duration::from_millis(1));
+        record_draw_component("pane:3", Duration::from_millis(1));
+        record_draw_component("file_tree", Duration::from_millis(1));
+        record_draw_component("claude_monitor", Duration::from_millis(1));
+        record_draw_component("preview", Duration::from_millis(1));
+        record_draw_component("status_bar", Duration::from_millis(1));
+        record_draw_component("overlay", Duration::from_millis(1));
+        record_render_context("image", (42, 17), true);
+        record_preview_image_reencoded(true);
+        record_claude_monitor_io(2, 100);
+        record_claude_monitor_io(3, 250);
+        record_claude_monitor_path_change();
+        record_claude_monitor_path_change();
         finish_phase(PHASE_RENDER_DRAW, render_draw_started_at);
         std::thread::sleep(Duration::from_millis(2));
         finish_phase(PHASE_RENDER, render_started_at);
@@ -356,6 +472,35 @@ mod debug_logging_tests {
             .expect("render present milliseconds");
         assert!(render_draw_ms > 0);
         assert!(render_present_ms > 0);
+        assert_eq!(
+            record[FIELD_DRAW_MS_BY_COMPONENT],
+            json!({
+                "claude_monitor": 1,
+                "file_tree": 1,
+                "overlay": 1,
+                "pane:3": 2,
+                "preview": 1,
+                "status_bar": 1,
+                "tabs": 1,
+            })
+        );
+        let component_ms: u64 = record[FIELD_DRAW_MS_BY_COMPONENT]
+            .as_object()
+            .expect("draw component milliseconds")
+            .values()
+            .map(|value| value.as_u64().expect("component milliseconds"))
+            .sum();
+        assert!(
+            component_ms <= render_draw_ms,
+            "disjoint component measurements must fit inside draw: components={component_ms}, draw={render_draw_ms}"
+        );
+        assert_eq!(record[FIELD_PREVIEW_KIND], "image");
+        assert_eq!(record[FIELD_PREVIEW_AREA], json!({"w": 42, "h": 17}));
+        assert_eq!(record[FIELD_PREVIEW_IMAGE_REENCODED], true);
+        assert_eq!(record[FIELD_SIDEBAR_VISIBLE], true);
+        assert_eq!(record[FIELD_CLAUDE_MONITOR_LINES_PARSED], 5);
+        assert_eq!(record[FIELD_CLAUDE_MONITOR_BYTES_READ], 350);
+        assert_eq!(record[FIELD_CLAUDE_MONITOR_PATH_CHANGES], 2);
         assert!(
             render_ms.abs_diff(render_draw_ms + render_present_ms) <= 1,
             "render subphases should add to render: render={render_ms}, draw={render_draw_ms}, present={render_present_ms}"
@@ -382,6 +527,38 @@ mod debug_logging_tests {
             started_at + Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 + 1),
             vec![1],
         );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn production_configuration_writes_when_enabled_and_not_when_disabled() {
+        let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let path = temp_log_path("production-env");
+        let _env = DebugEnvRestore::set(path.as_os_str());
+
+        configure_from_env();
+        let started_at = Instant::now() - Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 + 1);
+        begin_frame(started_at);
+        finish_frame(|| vec![11]);
+        let contents = std::fs::read_to_string(&path).expect("enabled production-path JSONL");
+        assert_eq!(contents.lines().count(), 1);
+        let record: Value = serde_json::from_str(contents.trim()).expect("one JSON object");
+        assert_eq!(record[FIELD_PREVIEW_KIND], "none");
+        assert_eq!(record[FIELD_PREVIEW_AREA], json!({"w": 0, "h": 0}));
+        assert_eq!(record[FIELD_PREVIEW_IMAGE_REENCODED], false);
+        assert_eq!(record[FIELD_SIDEBAR_VISIBLE], false);
+        assert_eq!(record[FIELD_CLAUDE_MONITOR_LINES_PARSED], 0);
+        assert_eq!(record[FIELD_CLAUDE_MONITOR_BYTES_READ], 0);
+        assert_eq!(record[FIELD_CLAUDE_MONITOR_PATH_CHANGES], 0);
+        std::fs::remove_file(&path).expect("remove enabled production-path JSONL");
+
+        std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG");
+        configure_from_env();
+        let started_at = Instant::now() - Duration::from_millis(FRAME_OVER_BUDGET_MS as u64 + 1);
+        begin_frame(started_at);
+        finish_frame(|| vec![11]);
         assert!(!path.exists());
     }
 

@@ -4,6 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
+use ratatui_image::ResizeEncodeRender;
 
 use crate::app::{pane_content_rect, App, DragTarget, FocusTarget, SplitDirection};
 
@@ -134,13 +135,28 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         ])
         .split(area);
 
+    let started_at = crate::app::frame_diagnostics::phase_started();
     render_tab_bar(app, frame, chunks[0]);
+    if let Some(started_at) = started_at {
+        crate::app::frame_diagnostics::record_draw_component("tabs", started_at.elapsed());
+    }
     let pane_caret = render_main_area(app, frame, chunks[1]);
     if show_macos_tip {
+        let started_at = crate::app::frame_diagnostics::phase_started();
         render_macos_tip(app, frame, chunks[2]);
+        if let Some(started_at) = started_at {
+            crate::app::frame_diagnostics::record_draw_component("overlay", started_at.elapsed());
+        }
     }
     if show_status {
+        let started_at = crate::app::frame_diagnostics::phase_started();
         render_status_bar(app, frame, chunks[3]);
+        if let Some(started_at) = started_at {
+            crate::app::frame_diagnostics::record_draw_component(
+                "status_bar",
+                started_at.elapsed(),
+            );
+        }
     }
     // The IME composition overlay is drawn last so its centered box
     // and its caret anchor land on top of the pane content without
@@ -148,9 +164,18 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // (not `chunks[1]`) keeps it visually centered on the whole
     // window even when the status bar is visible.
     let overlay_caret = if show_overlay {
-        render_ime_overlay(app, frame, area)
+        let started_at = crate::app::frame_diagnostics::phase_started();
+        let caret = render_ime_overlay(app, frame, area);
+        if let Some(started_at) = started_at {
+            crate::app::frame_diagnostics::record_draw_component("overlay", started_at.elapsed());
+        }
+        caret
     } else if show_codex_peer_notification {
+        let started_at = crate::app::frame_diagnostics::phase_started();
         render_codex_peer_notification(app, frame, area);
+        if let Some(started_at) = started_at {
+            crate::app::frame_diagnostics::record_draw_component("overlay", started_at.elapsed());
+        }
         None
     } else {
         None
@@ -565,11 +590,47 @@ fn render_main_area(app: &mut App, frame: &mut Frame, area: Rect) -> Option<(u16
         .constraints(constraints)
         .split(area);
 
+    let preview_kind = if has_preview {
+        if app.ws().preview.is_image() {
+            "image"
+        } else if app.ws().preview.is_binary {
+            "binary"
+        } else {
+            "text"
+        }
+    } else {
+        "none"
+    };
+    let preview_idx = if has_preview {
+        Some(if swapped {
+            if has_tree {
+                1
+            } else {
+                0
+            }
+        } else if has_tree {
+            2
+        } else {
+            1
+        })
+    } else {
+        None
+    };
+    let preview_area = preview_idx.map_or((0, 0), |idx| {
+        let area = chunks[idx];
+        (area.width.saturating_sub(2), area.height.saturating_sub(2))
+    });
+    crate::app::frame_diagnostics::record_render_context(preview_kind, preview_area, has_tree);
+
     let mut idx = 0;
 
     if has_tree {
         app.ws_mut().last_file_tree_rect = Some(chunks[idx]);
+        let started_at = crate::app::frame_diagnostics::phase_started();
         render_file_tree(app, frame, chunks[idx]);
+        if let Some(started_at) = started_at {
+            crate::app::frame_diagnostics::record_draw_component("file_tree", started_at.elapsed());
+        }
         idx += 1;
     } else {
         app.ws_mut().last_file_tree_rect = None;
@@ -577,7 +638,11 @@ fn render_main_area(app: &mut App, frame: &mut Frame, area: Rect) -> Option<(u16
 
     if swapped && has_preview {
         app.ws_mut().last_preview_rect = Some(chunks[idx]);
+        let started_at = crate::app::frame_diagnostics::phase_started();
         render_preview(app, frame, chunks[idx]);
+        if let Some(started_at) = started_at {
+            crate::app::frame_diagnostics::record_draw_component("preview", started_at.elapsed());
+        }
         idx += 1;
     }
 
@@ -586,7 +651,11 @@ fn render_main_area(app: &mut App, frame: &mut Frame, area: Rect) -> Option<(u16
 
     if !swapped && has_preview {
         app.ws_mut().last_preview_rect = Some(chunks[idx]);
+        let started_at = crate::app::frame_diagnostics::phase_started();
         render_preview(app, frame, chunks[idx]);
+        if let Some(started_at) = started_at {
+            crate::app::frame_diagnostics::record_draw_component("preview", started_at.elapsed());
+        }
     }
 
     if !has_preview {
@@ -727,8 +796,15 @@ fn render_panes(app: &mut App, frame: &mut Frame, area: Rect) -> Option<(u16, u1
                 .map(|p| (pane_id, p.cwd.clone()))
         })
         .collect();
+    let started_at = crate::app::frame_diagnostics::phase_started();
     for (pane_id, cwd) in pane_cwds {
         app.claude_monitor.update(pane_id, &cwd);
+    }
+    if let Some(started_at) = started_at {
+        crate::app::frame_diagnostics::record_draw_component(
+            "claude_monitor",
+            started_at.elapsed(),
+        );
     }
 
     let focused_id = app.ws().focused_pane_id;
@@ -748,6 +824,7 @@ fn render_panes(app: &mut App, frame: &mut Frame, area: Rect) -> Option<(u16, u1
             );
             let pane_copy_mode = copy_mode.as_ref().filter(|cm| cm.pane_id == pane_id);
             let claude_state = app.claude_monitor.state(pane_id);
+            let started_at = crate::app::frame_diagnostics::phase_started();
             let pane_caret = render_single_pane(
                 pane,
                 is_focused,
@@ -760,6 +837,12 @@ fn render_panes(app: &mut App, frame: &mut Frame, area: Rect) -> Option<(u16, u1
                 frame,
                 rect,
             );
+            if let Some(started_at) = started_at {
+                crate::app::frame_diagnostics::record_draw_component(
+                    format!("pane:{pane_id}"),
+                    started_at.elapsed(),
+                );
+            }
             if is_focused {
                 caret = pane_caret;
             }
@@ -1565,9 +1648,13 @@ fn render_preview(app: &mut App, frame: &mut Frame, area: Rect) {
                 .style(Style::default().fg(TEXT_DIM).bg(PANEL_BG));
             frame.render_widget(placeholder, inner);
         } else if let Some(ref mut protocol) = app.ws_mut().preview.image_protocol {
-            let image_widget = ratatui_image::StatefulImage::default().resize(
-                ratatui_image::Resize::Fit(Some(ratatui_image::FilterType::CatmullRom)),
+            let resize = ratatui_image::Resize::Fit(Some(ratatui_image::FilterType::CatmullRom));
+            crate::app::frame_diagnostics::record_preview_image_reencoded(
+                inner.width > 0
+                    && inner.height > 0
+                    && protocol.needs_resize(&resize, inner).is_some(),
             );
+            let image_widget = ratatui_image::StatefulImage::default().resize(resize.clone());
             frame.render_stateful_widget(image_widget, inner, protocol);
         }
         return;

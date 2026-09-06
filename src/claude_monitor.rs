@@ -208,6 +208,7 @@ impl ClaudeMonitor {
                 monitor.last_rescan = Instant::now();
                 let expected_path = find_jsonl_path(cwd);
                 if monitor.jsonl_path != expected_path {
+                    crate::app::frame_diagnostics::record_claude_monitor_path_change();
                     monitor.jsonl_path = expected_path;
                     monitor.file_position = 0;
                     monitor.state = ClaudeState::default();
@@ -244,44 +245,27 @@ impl ClaudeMonitor {
         };
 
         // Phase 2: read file without holding the lock
-        let file = match File::open(&path_to_read) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        let mut reader = BufReader::new(file);
-        if reader.seek(SeekFrom::Start(read_from)).is_err() {
+        let Some((new_lines, new_position, bytes_read)) =
+            read_transcript_batch(&path_to_read, read_from)
+        else {
             return;
-        }
-
-        let mut new_lines = Vec::new();
-        let mut new_position = read_from;
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            let bytes = match reader.read_line(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            if !buf.ends_with('\n') {
-                break;
-            }
-            new_position += bytes as u64;
-            new_lines.push(buf.clone());
-        }
-
+        };
         // Phase 3: apply parsed events (short lock)
         if new_lines.is_empty() {
+            crate::app::frame_diagnostics::record_claude_monitor_io(0, bytes_read);
             return;
         }
+        let mut lines_parsed = 0;
         if let Ok(mut map) = self.inner.lock() {
             if let Some(monitor) = map.get_mut(&pane_id) {
                 monitor.file_position = new_position;
                 for line in &new_lines {
                     process_event(monitor, line);
+                    lines_parsed += 1;
                 }
             }
         }
+        crate::app::frame_diagnostics::record_claude_monitor_io(lines_parsed, bytes_read);
     }
 
     pub fn remove(&self, pane_id: usize) {
@@ -289,6 +273,32 @@ impl ClaudeMonitor {
             map.remove(&pane_id);
         }
     }
+}
+
+fn read_transcript_batch(path: &Path, read_from: u64) -> Option<(Vec<String>, u64, usize)> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(read_from)).ok()?;
+
+    let mut new_lines = Vec::new();
+    let mut new_position = read_from;
+    let mut bytes_read = 0usize;
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let bytes = match reader.read_line(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        bytes_read += bytes;
+        if !buf.ends_with('\n') {
+            break;
+        }
+        new_position += bytes as u64;
+        new_lines.push(buf.clone());
+    }
+    Some((new_lines, new_position, bytes_read))
 }
 
 /// Process a single JSONL line and update the monitor state.
@@ -525,6 +535,31 @@ fn encode_cwd_to_project_name(cwd: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_transcript_batch_reports_bytes_read_and_complete_lines_for_this_call() {
+        let path = std::env::temp_dir().join(format!(
+            "renga-claude-monitor-read-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let first = "{\"type\":\"first\"}\n";
+        let second = "{\"type\":\"second\"}\n";
+        let incomplete = "{\"type\":\"partial\"}";
+        std::fs::write(&path, format!("{first}{second}{incomplete}"))
+            .expect("write transcript fixture");
+
+        let (lines, new_position, bytes_read) =
+            read_transcript_batch(&path, first.len() as u64).expect("read transcript batch");
+        assert_eq!(lines, vec![second]);
+        assert_eq!(new_position, (first.len() + second.len()) as u64);
+        assert_eq!(bytes_read, second.len() + incomplete.len());
+
+        std::fs::remove_file(path).expect("remove transcript fixture");
+    }
 
     #[test]
     fn test_encode_cwd() {

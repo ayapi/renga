@@ -57,6 +57,28 @@ the frame threshold.
 - `render_breakdown_ms`: `draw` is the time spent building the ratatui buffer
   inside `ui::render`; `present` is the remainder of `render`, including
   terminal diff output, flush, and cursor operations.
+- `draw_ms_by_component`: disjoint portions of `ui::render`, grouped as
+  `pane:<id>`, `claude_monitor`, `file_tree`, `preview`, `tabs`, `status_bar`,
+  and `overlay`.
+  Their sum does not exceed `render_breakdown_ms.draw`; uncategorized layout
+  and background work accounts for any remainder.
+- `preview_kind`: the displayed preview type: `image`, `text`, `binary`, or
+  `none`.
+- `preview_area`: the displayed preview content dimensions as `w` and `h`, or
+  zeroes when no preview is displayed.
+- `preview_image_reencoded`: whether ratatui-image reported that the displayed
+  image needed resizing and encoding immediately before this frame rendered
+  it. False for non-image previews and while image rendering is skipped during
+  a drag.
+- `sidebar_visible`: whether the file-tree sidebar was displayed in the frame.
+- `claude_monitor_lines_parsed` and `claude_monitor_bytes_read`: complete
+  transcript lines passed to the Claude event parser and bytes read from
+  Claude JSONL files during the frame. Bytes include a trailing incomplete
+  line even though that line is not passed to the parser.
+- `claude_monitor_path_changes`: number of panes whose selected Claude JSONL
+  path changed during the frame. A nonzero value together with large monitor
+  byte/line counts distinguishes a full reread after a path change from an
+  ordinary incremental read.
 - `events_drained`: all `AppEvent` values drained in the iteration.
 - `pty_output_events`: the subset of drained events carrying PTY output.
 - `ipc_commands`: processed commands with `command`, resolved `pane_id`,
@@ -75,8 +97,18 @@ instead points to event-channel work.
 
 A large `render_breakdown_ms.present` with a small `draw` points to the host
 console or terminal-output path rather than ratatui buffer construction.
-A large `draw` with a small `present` instead points to renga's own rendering
-cost — the per-pane cell loops in `ui::render` — not the host console.
+A large `draw` with a small `present` instead points to work inside
+`ui::render`, such as pane painting, Claude transcript monitoring, the file
+tree, or preview rendering, rather than the host console.
+
+Use `draw_ms_by_component` to distinguish pane, Claude transcript monitoring,
+file-tree, preview, tab, status-bar, and overlay costs. Each `pane:<id>` entry
+covers `render_single_pane` only. Layout calculation, pane resizing, monitor
+cwd collection, background painting, and other uncategorized work remain in
+`render_breakdown_ms.draw` minus the component sum. For image previews,
+`preview_image_reencoded: true` directly identifies a resize-and-encode frame;
+this uses the read-only API exposed by ratatui-image 10.0.6 rather than an
+estimate from elapsed time.
 
 Parser-lock acquisition in `keyboard_input.rs` (lines 515 and 664),
 `pointer_input.rs` (line 181), and the user-input-only scroll methods in
