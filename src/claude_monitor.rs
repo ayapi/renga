@@ -1384,7 +1384,7 @@ mod tests {
     }
 
     #[test]
-    fn update_never_calls_filesystem_on_the_calling_thread() {
+    fn update_and_state_stay_responsive_while_worker_is_in_filesystem() {
         let accesses = Arc::new(Mutex::new(Vec::new()));
         let monitor = ClaudeMonitor::new_with_filesystem(Arc::new(SlowRecordingFilesystem {
             accesses: Arc::clone(&accesses),
@@ -1400,6 +1400,12 @@ mod tests {
         while accesses.lock().expect("access log").is_empty() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
+        let state_started = Instant::now();
+        assert_eq!(monitor.state(1), ClaudeState::default());
+        assert!(state_started.elapsed() < Duration::from_millis(50));
+        let second_update_started = Instant::now();
+        monitor.update(2, Path::new("another-project"));
+        assert!(second_update_started.elapsed() < Duration::from_millis(50));
         let observed = accesses.lock().expect("access log").clone();
         assert!(!observed.is_empty());
         assert!(observed.into_iter().all(|thread_id| thread_id != caller));
@@ -1442,6 +1448,79 @@ mod tests {
         std::fs::remove_file(path).expect("remove channel trace");
     }
 
+    struct BlockingReadFilesystem {
+        path: PathBuf,
+        entered: mpsc::Sender<()>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl MonitorFilesystem for BlockingReadFilesystem {
+        fn path_exists(&self, path: &Path) -> bool {
+            path.exists()
+        }
+
+        fn find_jsonl_path(&self, _cwd: &Path) -> Option<PathBuf> {
+            Some(self.path.clone())
+        }
+
+        fn metadata(&self, path: &Path) -> Option<TranscriptMetadata> {
+            RealMonitorFilesystem.metadata(path)
+        }
+
+        fn read_batch(
+            &self,
+            path: &Path,
+            read_from: u64,
+            max_bytes: usize,
+        ) -> Option<(Vec<String>, u64, usize)> {
+            let _ = self.entered.send(());
+            while !self.release.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            read_transcript_batch(path, read_from, max_bytes)
+        }
+    }
+
+    #[test]
+    fn remove_prevents_a_late_worker_result_from_recreating_the_pane() {
+        let path = temp_transcript("late-result");
+        std::fs::write(
+            &path,
+            "{\"type\":\"assistant\",\"requestId\":\"late\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n",
+        )
+        .expect("write transcript");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let monitor = ClaudeMonitor::new_with_filesystem(Arc::new(BlockingReadFilesystem {
+            path: path.clone(),
+            entered: entered_tx,
+            release: Arc::clone(&release),
+        }));
+        monitor.start_with_trace(None);
+        monitor.update(41, Path::new("project"));
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker entered read");
+        monitor.remove(41);
+        release.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while monitor.core.metrics.lines_parsed.load(Ordering::Acquire) == 0
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(10));
+        assert!(!monitor
+            .core
+            .shared
+            .lock()
+            .expect("published state")
+            .panes
+            .contains_key(&41));
+        monitor.shutdown();
+        std::fs::remove_file(path).expect("remove transcript");
+    }
+
     struct SwitchingFilesystem {
         selected: Arc<Mutex<Option<PathBuf>>>,
     }
@@ -1467,6 +1546,78 @@ mod tests {
         ) -> Option<(Vec<String>, u64, usize)> {
             read_transcript_batch(path, read_from, max_bytes)
         }
+    }
+
+    struct TraceEnvRestore(Option<OsString>);
+
+    impl TraceEnvRestore {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("RENGA_DEBUG_CODEX_PEER_LOG");
+            std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", path);
+            Self(previous)
+        }
+    }
+
+    impl Drop for TraceEnvRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("RENGA_DEBUG_CODEX_PEER_LOG", value),
+                None => std::env::remove_var("RENGA_DEBUG_CODEX_PEER_LOG"),
+            }
+            crate::app::set_codex_peer_debug_log_path_test_override(Some(None));
+        }
+    }
+
+    #[test]
+    fn start_captures_the_test_overridden_trace_path_before_spawning() {
+        let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let trap_path = temp_transcript("start-env-trap");
+        let enabled_path = temp_transcript("start-enabled-trace");
+        let transcript = temp_transcript("start-fixture");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"requestId\":\"start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n",
+        )
+        .expect("write transcript");
+        let _env = TraceEnvRestore::set(&trap_path);
+
+        crate::app::set_codex_peer_debug_log_path_test_override(Some(None));
+        let disabled = ClaudeMonitor::new_with_filesystem(Arc::new(SwitchingFilesystem {
+            selected: Arc::new(Mutex::new(Some(transcript.clone()))),
+        }));
+        disabled.start();
+        disabled.update(1, Path::new("project"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while disabled.core.metrics.lines_parsed.load(Ordering::Acquire) == 0
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        disabled.shutdown();
+        assert!(!trap_path.exists());
+
+        crate::app::set_codex_peer_debug_log_path_test_override(Some(Some(
+            enabled_path.as_os_str().to_owned(),
+        )));
+        let enabled = ClaudeMonitor::new_with_filesystem(Arc::new(SwitchingFilesystem {
+            selected: Arc::new(Mutex::new(Some(transcript.clone()))),
+        }));
+        enabled.start();
+        enabled.update(2, Path::new("project"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !enabled_path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        enabled.shutdown();
+        let contents = std::fs::read_to_string(&enabled_path).expect("worker trace");
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.contains("\"action\":\"claude_monitor_worker\""));
+        assert!(!trap_path.exists());
+
+        std::fs::remove_file(enabled_path).expect("remove enabled trace");
+        std::fs::remove_file(transcript).expect("remove transcript");
     }
 
     fn force_rescan(worker: &mut MonitorWorker, pane_id: usize) {
