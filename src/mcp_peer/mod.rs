@@ -1169,7 +1169,11 @@ fn append_peer_debug_record(path: &Path, pane_id: Option<usize>, mut record: Val
 }
 
 fn take_peer_debug_write_failures() -> u64 {
-    PEER_DEBUG_WRITE_FAILURES.swap(0, std::sync::atomic::Ordering::AcqRel)
+    take_failures(&PEER_DEBUG_WRITE_FAILURES)
+}
+
+fn take_failures(counter: &std::sync::atomic::AtomicU64) -> u64 {
+    counter.swap(0, std::sync::atomic::Ordering::AcqRel)
 }
 
 fn record_peer_write_result(reported_failures: u64, result: std::io::Result<()>) {
@@ -6907,15 +6911,21 @@ Commands:
 
     #[test]
     fn concurrent_peer_trace_failure_takes_report_each_failure_once() {
-        let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        PEER_DEBUG_WRITE_FAILURES.store(5, std::sync::atomic::Ordering::Relaxed);
-        let first = thread::spawn(take_peer_debug_write_failures);
-        let second = thread::spawn(take_peer_debug_write_failures);
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(5));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let spawn_take = |counter: Arc<std::sync::atomic::AtomicU64>,
+                          barrier: Arc<std::sync::Barrier>| {
+            thread::spawn(move || {
+                barrier.wait();
+                take_failures(&counter)
+            })
+        };
+        let first = spawn_take(counter.clone(), barrier.clone());
+        let second = spawn_take(counter.clone(), barrier.clone());
+        barrier.wait();
         let reported = first.join().unwrap() + second.join().unwrap();
         assert_eq!(reported, 5);
-        assert_eq!(take_peer_debug_write_failures(), 0);
+        assert_eq!(take_failures(&counter), 0);
     }
 
     fn read_debug_records(path: &Path) -> Vec<Value> {
