@@ -269,6 +269,7 @@ impl Pane {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_real_with_cwd_and_probe(
         id: usize,
         rows: u16,
