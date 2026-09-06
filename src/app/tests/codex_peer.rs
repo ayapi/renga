@@ -2,6 +2,7 @@ use super::super::*;
 use crate::app::codex_peer::{
     codex_composer_has_draft_on_screen, normalized_codex_composer_text,
     CODEX_PEER_DRAFT_STALL_TIMEOUT, CODEX_PEER_NUDGE_COMMIT_TIMEOUT, CODEX_PEER_NUDGE_MAX_RETRIES,
+    PENDING_PEER_INBOX_MAX_MESSAGES,
 };
 
 fn seed_focused_pane_screen(app: &mut App, bytes: &[u8]) -> usize {
@@ -5329,6 +5330,93 @@ fn pending_peer_message_count_combines_inbox_and_nudges_per_pane() {
     app.shutdown();
 }
 
+fn retain_one_codex_handover() -> (
+    App,
+    usize,
+    usize,
+    u64,
+    std::sync::mpsc::Receiver<ipc::Event>,
+) {
+    let (mut app, sender, target, rx) = app_with_ready_peer(PeerClientKind::Codex);
+    app.handle_peer_set_ready(sender, PeerClientKind::Claude, true)
+        .unwrap();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    app.begin_peer_send(
+        sender,
+        &ipc::PaneRef::Id(target),
+        "remember me".into(),
+        reply_tx,
+    );
+    let delivery_id = peer_delivery_id(&rx);
+    app.handle_peer_inbox_ack(target, delivery_id).unwrap();
+    assert_eq!(
+        reply_rx.recv().unwrap().unwrap(),
+        ipc::PeerSendOutcome::Delivered
+    );
+    assert_eq!(app.peer_handovers[&target].len(), 1);
+    while rx.try_recv().is_ok() {}
+    (app, sender, target, delivery_id, rx)
+}
+
+fn assert_one_loss_notice(
+    rx: &std::sync::mpsc::Receiver<ipc::Event>,
+    delivery_id: u64,
+    sender: usize,
+    target: usize,
+    reason: &str,
+) {
+    let events: Vec<_> = rx.try_iter().collect();
+    let losses = events
+        .iter()
+        .filter(|event| matches!(
+            event,
+            ipc::Event::PeerMessageLost {
+                delivery_id: id,
+                target_pane,
+                from_pane,
+                reason: event_reason,
+                ..
+            } if *id == delivery_id && *target_pane == target && *from_pane == sender && event_reason == reason
+        ))
+        .count();
+    assert_eq!(losses, 1);
+    let notices: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ipc::Event::PeerInbox {
+                target_pane,
+                from_pane,
+                from_name,
+                body,
+                ..
+            } if *target_pane == sender && *from_pane == target => {
+                Some((from_name.as_deref(), body.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].0, Some("renga"));
+    assert!(notices[0].1.contains(&format!("delivery {delivery_id}")));
+    assert!(notices[0].1.contains(reason));
+    assert!(notices[0].1.contains("remember me"));
+}
+
+#[test]
+fn subscriber_gone_timeout_reports_each_unconsumed_codex_handover() {
+    let (mut app, sender, target, delivery_id, rx) = retain_one_codex_handover();
+    app.handle_peer_subscriber_gone(target);
+    assert!(rx
+        .try_iter()
+        .all(|event| !matches!(event, ipc::Event::PeerMessageLost { .. })));
+    app.peer_handover_disconnect_deadlines
+        .insert(target, Instant::now());
+    app.flush_peer_handover_disconnect_timeouts();
+    assert_one_loss_notice(&rx, delivery_id, sender, target, "subscriber_gone_timeout");
+    assert!(!app.peer_handovers.contains_key(&target));
+    app.shutdown();
+}
+
 #[test]
 fn expired_submit_at_is_not_counted_and_is_removed_on_flush() {
     let mut app = App::new(40, 80).expect("App::new");
@@ -5348,5 +5436,258 @@ fn expired_submit_at_is_not_counted_and_is_removed_on_flush() {
     assert_eq!(app.pending_peer_message_count(pane_id), 0);
     app.flush_pending_codex_peer_messages();
     assert!(app.pending_codex_peer_messages[&pane_id].is_empty());
+    app.shutdown();
+}
+
+#[test]
+fn empty_reconcile_after_reregister_reports_each_unconsumed_codex_handover() {
+    let (mut app, sender, target, delivery_id, rx) = retain_one_codex_handover();
+    app.handle_peer_register_client(target, PeerClientKind::Codex)
+        .unwrap();
+    app.handle_peer_inbox_reconcile(target, &[], &[], 0, 0)
+        .unwrap();
+    assert_one_loss_notice(&rx, delivery_id, sender, target, "peer_restarted");
+    app.shutdown();
+}
+
+#[test]
+fn reconnect_reconcile_with_held_message_sends_no_loss_notice() {
+    let (mut app, _sender, target, delivery_id, rx) = retain_one_codex_handover();
+    app.handle_peer_subscriber_gone(target);
+    app.handle_peer_register_client(target, PeerClientKind::Codex)
+        .unwrap();
+    app.handle_peer_inbox_reconcile(target, &[delivery_id], &[], 0, 0)
+        .unwrap();
+    assert!(rx
+        .try_iter()
+        .all(|event| !matches!(event, ipc::Event::PeerMessageLost { .. })));
+    assert_eq!(app.peer_handovers[&target].len(), 1);
+    assert!(!app.peer_handover_disconnect_deadlines.contains_key(&target));
+    app.shutdown();
+}
+
+#[test]
+fn reconnect_reconcile_with_unreported_consumed_sends_no_loss_notice() {
+    let (mut app, _sender, target, delivery_id, rx) = retain_one_codex_handover();
+    app.handle_peer_subscriber_gone(target);
+    app.handle_peer_register_client(target, PeerClientKind::Codex)
+        .unwrap();
+    app.handle_peer_inbox_reconcile(target, &[], &[delivery_id], 0, 0)
+        .unwrap();
+    assert!(rx
+        .try_iter()
+        .all(|event| !matches!(event, ipc::Event::PeerMessageLost { .. })));
+    assert!(!app.peer_handovers.contains_key(&target));
+    app.shutdown();
+}
+
+#[test]
+fn reconcile_does_not_classify_current_generation_delivery_as_lost() {
+    let (mut app, sender, target, _delivery_id, rx) = retain_one_codex_handover();
+    app.handle_peer_register_client(target, PeerClientKind::Codex)
+        .unwrap();
+    let message = PendingPeerInboxMessage {
+        from_pane: sender,
+        from_name: None,
+        from_kind: None,
+        body: "new generation".into(),
+        ts_ms: 0,
+        debug_peer_inbox_sequence: None,
+        requeued_delivery_id: None,
+        requeued_nudge: None,
+        system_generated: false,
+    };
+    app.track_peer_handover(target, 9999, &message);
+    app.handle_peer_inbox_reconcile(target, &[], &[], 0, 0)
+        .unwrap();
+    let notices = rx
+        .try_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ipc::Event::PeerMessageLost {
+                    delivery_id: 9999,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(notices, 0);
+    assert!(app.peer_handovers[&target]
+        .iter()
+        .any(|entry| entry.delivery_id == 9999));
+    app.shutdown();
+}
+
+#[test]
+fn reregister_cancels_disconnect_deadline_even_without_reconcile() {
+    let (mut app, _sender, target, _delivery_id, rx) = retain_one_codex_handover();
+    app.handle_peer_subscriber_gone(target);
+    assert!(app.peer_handover_disconnect_deadlines.contains_key(&target));
+    app.handle_peer_register_client(target, PeerClientKind::Codex)
+        .unwrap();
+    assert!(!app.peer_handover_disconnect_deadlines.contains_key(&target));
+    app.flush_peer_handover_disconnect_timeouts();
+    assert!(rx
+        .try_iter()
+        .all(|event| !matches!(event, ipc::Event::PeerMessageLost { .. })));
+    app.shutdown();
+}
+
+#[test]
+fn pane_close_reports_each_unconsumed_codex_handover() {
+    let (mut app, sender, target, delivery_id, rx) = retain_one_codex_handover();
+    app.handle_close(&ipc::PaneRef::Id(target)).unwrap();
+    assert_one_loss_notice(&rx, delivery_id, sender, target, "pane_closed");
+    app.shutdown();
+}
+
+#[test]
+fn pane_close_removes_unconfirmed_delivery_instead_of_requeueing_it() {
+    let (mut app, sender, target, rx) = app_with_ready_peer(PeerClientKind::Codex);
+    app.handle_peer_set_ready(sender, PeerClientKind::Claude, true)
+        .unwrap();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    app.begin_peer_send(
+        sender,
+        &ipc::PaneRef::Id(target),
+        "not yet receipted".into(),
+        reply_tx,
+    );
+    let delivery_id = peer_delivery_id(&rx);
+    app.handle_close(&ipc::PaneRef::Id(target)).unwrap();
+
+    assert_eq!(
+        reply_rx.recv().unwrap().unwrap_err().code,
+        Some(ipc::err_code::PANE_VANISHED)
+    );
+    assert!(!app.pending_peer_deliveries.contains_key(&delivery_id));
+    assert!(!app.pending_peer_inbox.contains_key(&target));
+    let events: Vec<_> = rx.try_iter().collect();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ipc::Event::PeerMessageLost { delivery_id: id, .. } if *id == delivery_id
+    )));
+    app.shutdown();
+}
+
+#[test]
+fn consumed_codex_handover_does_not_report_loss() {
+    let (mut app, _sender, target, delivery_id, rx) = retain_one_codex_handover();
+    app.handle_peer_inbox_consumed(target, delivery_id).unwrap();
+    app.handle_peer_subscriber_gone(target);
+    assert!(rx
+        .try_iter()
+        .all(|event| !matches!(event, ipc::Event::PeerMessageLost { .. })));
+    app.shutdown();
+}
+
+#[test]
+fn consumed_before_async_receipt_leaves_no_phantom_handover() {
+    let (mut app, sender, target, rx) = app_with_ready_peer(PeerClientKind::Codex);
+    let (reply_tx, reply_rx) = oneshot::channel();
+    app.begin_peer_send(sender, &ipc::PaneRef::Id(target), "race".into(), reply_tx);
+    let delivery_id = peer_delivery_id(&rx);
+
+    app.handle_peer_inbox_consumed(target, delivery_id).unwrap();
+    assert_eq!(
+        app.peer_handover_consumed_tombstones[&target].front(),
+        Some(&delivery_id)
+    );
+    app.handle_peer_inbox_ack(target, delivery_id).unwrap();
+
+    assert_eq!(
+        reply_rx.recv().unwrap().unwrap(),
+        ipc::PeerSendOutcome::Delivered
+    );
+    assert!(!app.peer_handovers.contains_key(&target));
+    assert!(!app.peer_handover_consumed_tombstones.contains_key(&target));
+    app.shutdown();
+}
+
+#[test]
+fn duplicate_receipt_does_not_duplicate_handover_tracking() {
+    let (mut app, sender, target, rx) = app_with_ready_peer(PeerClientKind::Codex);
+    let (reply_tx, _reply_rx) = oneshot::channel();
+    app.begin_peer_send(sender, &ipc::PaneRef::Id(target), "once".into(), reply_tx);
+    let delivery_id = peer_delivery_id(&rx);
+    app.handle_peer_inbox_ack(target, delivery_id).unwrap();
+    app.handle_peer_inbox_ack(target, delivery_id).unwrap();
+    assert_eq!(app.peer_handovers[&target].len(), 1);
+    app.shutdown();
+}
+
+#[test]
+fn push_peer_receipt_is_not_tracked_as_a_handover() {
+    let (mut app, sender, target, rx) = app_with_ready_peer(PeerClientKind::Claude);
+    let (reply_tx, _reply_rx) = oneshot::channel();
+    app.begin_peer_send(sender, &ipc::PaneRef::Id(target), "push".into(), reply_tx);
+    let delivery_id = peer_delivery_id(&rx);
+    app.handle_peer_inbox_ack(target, delivery_id).unwrap();
+    assert!(!app.peer_handovers.contains_key(&target));
+    app.shutdown();
+}
+
+#[test]
+fn handover_cap_evicts_the_oldest_entry() {
+    let (mut app, _sender, target, _rx) = app_with_ready_peer(PeerClientKind::Codex);
+    let message = PendingPeerInboxMessage {
+        from_pane: app.ws().focused_pane_id,
+        from_name: None,
+        from_kind: None,
+        body: "x".into(),
+        ts_ms: 0,
+        debug_peer_inbox_sequence: None,
+        requeued_delivery_id: None,
+        requeued_nudge: None,
+        system_generated: false,
+    };
+    for delivery_id in 1..=129 {
+        app.track_peer_handover(target, delivery_id, &message);
+    }
+    let queue = &app.peer_handovers[&target];
+    assert_eq!(queue.len(), PENDING_PEER_INBOX_MAX_MESSAGES);
+    assert_eq!(queue.front().unwrap().delivery_id, 2);
+    app.shutdown();
+}
+
+#[test]
+fn codex_sender_loss_notice_uses_the_normal_nudge_path() {
+    let (mut app, sender, target, delivery_id, rx) = retain_one_codex_handover();
+    app.peer_client_kinds.insert(sender, PeerClientKind::Codex);
+    app.lose_peer_handovers(target, "subscriber_gone_timeout");
+    let notice_delivery_id = rx
+        .try_iter()
+        .find_map(|event| match event {
+            ipc::Event::PeerInbox {
+                delivery_id: Some(id),
+                target_pane,
+                from_pane,
+                ..
+            } if target_pane == sender && from_pane == target => Some(id),
+            _ => None,
+        })
+        .expect("loss notice delivery");
+    assert_ne!(notice_delivery_id, delivery_id);
+    app.handle_peer_inbox_ack(sender, notice_delivery_id)
+        .unwrap();
+    assert!(app.pending_codex_peer_messages.contains_key(&sender));
+    assert!(!app.peer_handovers.contains_key(&sender));
+    app.shutdown();
+}
+
+#[test]
+fn missing_sender_drops_loss_notice_but_still_emits_loss_event() {
+    let (mut app, _sender, target, delivery_id, rx) = retain_one_codex_handover();
+    app.peer_handovers.get_mut(&target).unwrap()[0].from_pane = usize::MAX;
+    app.lose_peer_handovers(target, "subscriber_gone_timeout");
+    let events: Vec<_> = rx.try_iter().collect();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ipc::Event::PeerMessageLost { delivery_id: id, .. } if *id == delivery_id
+    )));
+    assert!(events
+        .iter()
+        .all(|event| !matches!(event, ipc::Event::PeerInbox { .. })));
     app.shutdown();
 }

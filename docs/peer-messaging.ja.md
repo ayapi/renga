@@ -89,6 +89,11 @@ SubmitAt は本文がすでに composer に入っているため、期限切れ�
 - **相手に送ったメッセージが `<channel>` タグで表示されない** — 起動時のフラグ `--dangerously-load-development-channels server:renga-peers` を付け忘れています。`claude` と打つ代わりに `Alt+P` を使えばフラグ付きのコマンドが挿入されるので事故りにくくなります。
 - **Codex に送ったのに反応がない** — renga は Codex ペインが PTY 入力を安全に受けられる状態で、かつ非フォーカスになってから `check_messages` を促す nudge を流し込みます。フォーカス中に届いたメッセージは、会話を汚さないように通知 overlay へ回します。`Alt+Enter` / `Ctrl+Enter` で `check_messages` を呼ぶための文面だけ挿入し、`Esc` なら無視、Enter を押して実行するかどうかは人間が決めます。フォーカスを外せば worker と同じ deferred nudge に戻ります。実際の依頼本文は MCP inbox 側にあり、`check_messages` の返り値が真実です。
 - **`pending_after` が 0 より大きいまま** — FIFO の先頭が ack されていないため、後続メッセージをまだ表示できません。現在の本文を最後まで組み立てて受領 ack を返してください。未 ack の先頭を期限で消したり nudge を自動反復したりはしません。前者はサイレント損失、後者は prompt spam につながるためです。
+- **peer 配送が失われたという system message が届く** — Codex の
+  mcp-peer はメッセージを保持したため元の送信は `Delivered` でしたが、再起動後
+  の reconcile で見つからない、切断が 30 秒続く、または pane が閉じました。
+  renga は本文を自動再送しません。通知に含まれる元の
+  delivery id・送信時刻・本文先頭を確認し、まだ必要なら再送してください。
 - **新しい Codex pane で `check_messages` / `send_message` の承認がまた出る** — Codex の承認は pane-local に振る舞うことがあります。`renga mcp install --client codex --codex-auto-approve-peer-tools` で安全な peer messaging 系の承認を事前設定できますが、Codex のバージョンや実行形態によっては、新しい pane で一度だけ warm-up 承認が必要です。
 - **`spawn_codex_pane` が `[codex_not_installed]` で失敗する** — Codex の MCP 設定 (`~/.codex/config.toml`) に renga-peers エントリがない、ファイルが読めない、もしくは `[mcp_servers.renga-peers.env]` に `RENGA_PEER_CLIENT_KIND=codex` が登録されていません。`renga mcp install --client codex` を 1 回実行してください。env 値だけが欠けた既存エントリも install 経路で self-heal します。
 - **`send_keys` が効いていないように見える** — `send_keys` は target ペインの PTY に生の入力バイトを書き込むだけで、帯域外の「承認」操作ではありません。まず `inspect_pane(target=…, lines=20)` で本当に入力待ちか確認し、レイアウトが動く運用ではフォーカス推測ではなく安定した pane `name` を target に使ってください。

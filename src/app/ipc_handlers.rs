@@ -125,6 +125,31 @@ impl App {
                 let result = self.handle_peer_inbox_ack(pane_id, delivery_id);
                 let _ = reply.send(result);
             }
+            AppCommand::PeerInboxConsumed {
+                pane_id,
+                delivery_id,
+                reply,
+            } => {
+                let result = self.handle_peer_inbox_consumed(pane_id, delivery_id);
+                let _ = reply.send(result);
+            }
+            AppCommand::PeerInboxReconcile {
+                pane_id,
+                held,
+                consumed,
+                held_overflow,
+                consumed_overflow,
+                reply,
+            } => {
+                let result = self.handle_peer_inbox_reconcile(
+                    pane_id,
+                    &held,
+                    &consumed,
+                    held_overflow,
+                    consumed_overflow,
+                );
+                let _ = reply.send(result);
+            }
             AppCommand::PeerInboxHeadAcknowledged {
                 pane_id,
                 remaining,

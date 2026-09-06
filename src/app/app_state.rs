@@ -162,6 +162,19 @@ pub enum AppCommand {
         delivery_id: u64,
         reply: oneshot::Sender<std::result::Result<(), ipc::CodedError>>,
     },
+    PeerInboxConsumed {
+        pane_id: usize,
+        delivery_id: u64,
+        reply: oneshot::Sender<std::result::Result<(), ipc::CodedError>>,
+    },
+    PeerInboxReconcile {
+        pane_id: usize,
+        held: Vec<u64>,
+        consumed: Vec<u64>,
+        held_overflow: usize,
+        consumed_overflow: usize,
+        reply: oneshot::Sender<std::result::Result<(), ipc::CodedError>>,
+    },
     /// A Codex pull-inbox ack exposed another queued head. Request one fresh
     /// nudge without changing the delivery-receipt ack semantics above.
     PeerInboxHeadAcknowledged {
@@ -350,6 +363,15 @@ pub struct App {
     /// process. These are retried with the same id until confirmed or
     /// failed before the IPC caller's reply timeout.
     pub(crate) pending_peer_deliveries: HashMap<u64, PendingPeerInboxDelivery>,
+    /// Pull messages retained by an MCP peer but not yet acknowledged by its
+    /// LLM. Entries are removed on `PeerInboxConsumed` or classified as lost
+    /// when the peer process or pane disappears.
+    pub(crate) peer_handovers: HashMap<usize, VecDeque<PeerHandover>>,
+    /// Short-lived ids acknowledged by Codex before the asynchronous local
+    /// retention receipt reached the App.
+    pub(crate) peer_handover_consumed_tombstones: HashMap<usize, VecDeque<u64>>,
+    pub(crate) peer_handover_disconnect_deadlines: HashMap<usize, Instant>,
+    pub(crate) peer_handover_generations: HashMap<usize, u64>,
     pub(crate) next_peer_delivery_id: u64,
     /// One-shot nudges waiting to be injected into Codex panes so the
     /// pane runs `check_messages` once it looks ready for PTY input.

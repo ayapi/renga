@@ -144,6 +144,10 @@ impl App {
         self.peer_client_kinds.clear();
         self.peer_delivery_ready.clear();
         self.pending_peer_inbox.clear();
+        self.peer_handovers.clear();
+        self.peer_handover_consumed_tombstones.clear();
+        self.peer_handover_disconnect_deadlines.clear();
+        self.peer_handover_generations.clear();
         self.peer_inbox_debug_sequences.clear();
         self.pending_peer_deliveries.clear();
         self.pending_codex_peer_messages.clear();
@@ -204,6 +208,12 @@ impl App {
             }
             AppCommand::PeerSetReady { pane_id, .. } => ("peer_set_ready", Some(*pane_id)),
             AppCommand::PeerInboxAck { pane_id, .. } => ("peer_inbox_ack", Some(*pane_id)),
+            AppCommand::PeerInboxConsumed { pane_id, .. } => {
+                ("peer_inbox_consumed", Some(*pane_id))
+            }
+            AppCommand::PeerInboxReconcile { pane_id, .. } => {
+                ("peer_inbox_reconcile", Some(*pane_id))
+            }
             AppCommand::PeerInboxHeadAcknowledged { pane_id, .. } => {
                 ("peer_inbox_head_acknowledged", Some(*pane_id))
             }

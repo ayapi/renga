@@ -63,6 +63,7 @@ pub(crate) const PEER_INBOX_ACK_RETRY_INTERVAL: Duration = Duration::from_millis
 /// Must expire before IPC's five-second App reply limit so the sender
 /// receives a specific delivery error instead of the generic App timeout.
 pub(crate) const PEER_INBOX_ACK_TIMEOUT: Duration = Duration::from_secs(4);
+pub(crate) const PEER_HANDOVER_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingPeerInboxMessage {
@@ -74,6 +75,9 @@ pub(crate) struct PendingPeerInboxMessage {
     pub(crate) debug_peer_inbox_sequence: Option<u64>,
     pub(crate) requeued_delivery_id: Option<u64>,
     pub(crate) requeued_nudge: Option<PendingCodexPeerMessage>,
+    /// System loss notices use the normal transport but must not participate
+    /// in user-message dedupe or create another handover ledger entry.
+    pub(crate) system_generated: bool,
 }
 
 #[derive(Debug)]
@@ -86,6 +90,16 @@ pub(crate) struct PendingPeerInboxDelivery {
     pub(crate) next_retry_at: Instant,
     pub(crate) expires_at: Instant,
     pub(crate) retry_blocked_behind_head: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PeerHandover {
+    pub(crate) delivery_id: u64,
+    pub(crate) from_pane: usize,
+    pub(crate) from_name: Option<String>,
+    pub(crate) body: String,
+    pub(crate) ts_ms: u64,
+    pub(crate) generation: u64,
 }
 
 enum PreparedPeerSend {
@@ -1026,6 +1040,18 @@ impl App {
         target: &PaneRef,
         body: String,
     ) -> std::result::Result<PreparedPeerSend, ipc::CodedError> {
+        self.prepare_peer_send_with_metadata(from_pane, target, body, None, None, false)
+    }
+
+    fn prepare_peer_send_with_metadata(
+        &mut self,
+        from_pane: usize,
+        target: &PaneRef,
+        body: String,
+        from_name_override: Option<Option<String>>,
+        from_kind_override: Option<Option<PeerClientKind>>,
+        system_generated: bool,
+    ) -> std::result::Result<PreparedPeerSend, ipc::CodedError> {
         let (sender_ws, _) = self
             .resolve_pane_across_workspaces(&PaneRef::Id(from_pane))
             .ok_or_else(|| {
@@ -1039,22 +1065,28 @@ impl App {
                 ipc::PeerSendOutcome::Undeliverable,
             ));
         };
-        if let Some(outcome) = self.duplicate_peer_send_outcome(target_id, from_pane, &body) {
-            // Same (target, from, body) within the dedupe window —
-            // treat as a no-op so duplicate dispatcher acks /
-            // worker false-fires don't paper the receiver's
-            // transcript with phantom Human: turns. The sender
-            // gets a successful Ok() reply so it can't probe the
-            // dedupe state. (renga#221)
-            return Ok(PreparedPeerSend::Immediate(outcome));
+        if !system_generated {
+            if let Some(outcome) = self.duplicate_peer_send_outcome(target_id, from_pane, &body) {
+                // Same (target, from, body) within the dedupe window —
+                // treat as a no-op so duplicate dispatcher acks /
+                // worker false-fires don't paper the receiver's
+                // transcript with phantom Human: turns. The sender
+                // gets a successful Ok() reply so it can't probe the
+                // dedupe state. (renga#221)
+                return Ok(PreparedPeerSend::Immediate(outcome));
+            }
         }
-        self.materialize_unfocused_codex_peer_notification();
-        let from_name = self.workspaces[sender_ws]
+        if !system_generated {
+            self.materialize_unfocused_codex_peer_notification();
+        }
+        let discovered_from_name = self.workspaces[sender_ws]
             .pane_names
             .iter()
             .find(|(_, id)| **id == from_pane)
             .map(|(n, _)| n.clone());
-        let from_kind = self.peer_client_kinds.get(&from_pane).copied();
+        let from_name = from_name_override.unwrap_or(discovered_from_name);
+        let from_kind =
+            from_kind_override.unwrap_or_else(|| self.peer_client_kinds.get(&from_pane).copied());
         let nudge = if self.peer_delivery_ready.contains(&target_id)
             && self.pane_expects_codex_peer_delivery(sender_ws, target_id)
         {
@@ -1075,6 +1107,7 @@ impl App {
             debug_peer_inbox_sequence: None,
             requeued_delivery_id: None,
             requeued_nudge: None,
+            system_generated,
         };
         if self.peer_delivery_ready.contains(&target_id) {
             Ok(PreparedPeerSend::Confirm {
@@ -1099,7 +1132,9 @@ impl App {
             }
             self.queue_peer_inbox_until_ready(target_id, message);
             let outcome = ipc::PeerSendOutcome::Queued;
-            self.record_peer_send(target_id, from_pane, &body, outcome);
+            if !system_generated {
+                self.record_peer_send(target_id, from_pane, &body, outcome);
+            }
             Ok(PreparedPeerSend::Immediate(outcome))
         }
     }
@@ -1261,7 +1296,9 @@ impl App {
         } else {
             ipc::PeerSendOutcome::Delivered
         };
-        self.record_peer_send(target_pane, message.from_pane, &message.body, outcome);
+        if !message.system_generated {
+            self.record_peer_send(target_pane, message.from_pane, &message.body, outcome);
+        }
         Ok(outcome)
     }
 
@@ -1285,6 +1322,7 @@ impl App {
                 self.pending_peer_inbox.remove(&pane_id);
             }
             if let Some(mut message) = requeued {
+                self.track_peer_handover(pane_id, delivery_id, &message);
                 let nudge = (self.peer_client_kinds.get(&pane_id) == Some(&PeerClientKind::Codex))
                     .then(|| message.requeued_nudge.take())
                     .flatten();
@@ -1310,6 +1348,7 @@ impl App {
             .min()
             == Some(delivery_id);
         let pending = self.pending_peer_deliveries.remove(&delivery_id).unwrap();
+        self.track_peer_handover(pane_id, delivery_id, &pending.message);
         let result = self.finish_confirmed_peer_delivery(
             pending.target_pane,
             pending.message,
@@ -1338,6 +1377,296 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn track_peer_handover(
+        &mut self,
+        pane_id: usize,
+        delivery_id: u64,
+        message: &PendingPeerInboxMessage,
+    ) {
+        if message.system_generated
+            || self.peer_client_kinds.get(&pane_id) != Some(&PeerClientKind::Codex)
+        {
+            return;
+        }
+        let consumed_tombstone = self
+            .peer_handover_consumed_tombstones
+            .get_mut(&pane_id)
+            .and_then(|tombstones| {
+                let position = tombstones.iter().position(|id| *id == delivery_id)?;
+                tombstones.remove(position);
+                Some(tombstones.is_empty())
+            });
+        if consumed_tombstone == Some(true) {
+            self.peer_handover_consumed_tombstones.remove(&pane_id);
+        }
+        if consumed_tombstone.is_some() {
+            return;
+        }
+        let queue = self.peer_handovers.entry(pane_id).or_default();
+        if queue.iter().any(|item| item.delivery_id == delivery_id) {
+            return;
+        }
+        queue.push_back(PeerHandover {
+            delivery_id,
+            from_pane: message.from_pane,
+            from_name: message.from_name.clone(),
+            body: message.body.clone(),
+            ts_ms: message.ts_ms,
+            generation: self
+                .peer_handover_generations
+                .get(&pane_id)
+                .copied()
+                .unwrap_or(0),
+        });
+        let mut evicted = 0usize;
+        while queue.len() > PENDING_PEER_INBOX_MAX_MESSAGES
+            || queue.iter().map(|item| item.body.len()).sum::<usize>()
+                > PENDING_PEER_INBOX_MAX_BYTES
+        {
+            queue.pop_front();
+            evicted += 1;
+        }
+        let count = queue.len();
+        log_peer_delivery_record(codex_peer_debug_log_path().as_deref(), || {
+            serde_json::json!({
+                "action": "peer_handover_tracked",
+                "pane_id": pane_id,
+                "delivery_id": delivery_id,
+                "count": count,
+                "evicted_count": evicted,
+            })
+        });
+    }
+
+    pub(crate) fn handle_peer_inbox_consumed(
+        &mut self,
+        pane_id: usize,
+        delivery_id: u64,
+    ) -> std::result::Result<(), ipc::CodedError> {
+        let mut removed = false;
+        if let Some(queue) = self.peer_handovers.get_mut(&pane_id) {
+            if let Some(position) = queue
+                .iter()
+                .position(|item| item.delivery_id == delivery_id)
+            {
+                queue.remove(position);
+                removed = true;
+            }
+            if queue.is_empty() {
+                self.peer_handovers.remove(&pane_id);
+            }
+        }
+        let receipt_is_in_flight = self
+            .pending_peer_deliveries
+            .get(&delivery_id)
+            .is_some_and(|pending| pending.target_pane == pane_id);
+        if !removed && receipt_is_in_flight {
+            let tombstones = self
+                .peer_handover_consumed_tombstones
+                .entry(pane_id)
+                .or_default();
+            if !tombstones.contains(&delivery_id) {
+                tombstones.push_back(delivery_id);
+                while tombstones.len() > PENDING_PEER_INBOX_MAX_MESSAGES {
+                    tombstones.pop_front();
+                }
+            }
+        }
+        log_peer_delivery_record(codex_peer_debug_log_path().as_deref(), || {
+            serde_json::json!({
+                "action": "peer_handover_consumed",
+                "pane_id": pane_id,
+                "delivery_id": delivery_id,
+                "removed": removed,
+            })
+        });
+        Ok(())
+    }
+
+    pub(crate) fn handle_peer_inbox_reconcile(
+        &mut self,
+        pane_id: usize,
+        held: &[u64],
+        consumed: &[u64],
+        held_overflow: usize,
+        consumed_overflow: usize,
+    ) -> std::result::Result<(), ipc::CodedError> {
+        self.resolve_pane_across_workspaces(&PaneRef::Id(pane_id))
+            .ok_or_else(|| {
+                ipc::CodedError::new(
+                    ipc::err_code::PANE_NOT_FOUND,
+                    format!("pane {pane_id} not found for peer inbox reconciliation"),
+                )
+            })?;
+        self.peer_handover_disconnect_deadlines.remove(&pane_id);
+        for delivery_id in consumed {
+            self.handle_peer_inbox_consumed(pane_id, *delivery_id)?;
+        }
+        let mut retained = VecDeque::new();
+        let mut lost = VecDeque::new();
+        let generation = self
+            .peer_handover_generations
+            .get(&pane_id)
+            .copied()
+            .unwrap_or(0);
+        let snapshot_overflowed = held_overflow > 0 || consumed_overflow > 0;
+        for entry in self.peer_handovers.remove(&pane_id).unwrap_or_default() {
+            if entry.generation >= generation
+                || snapshot_overflowed
+                || held.contains(&entry.delivery_id)
+                || consumed.contains(&entry.delivery_id)
+            {
+                retained.push_back(entry);
+            } else {
+                lost.push_back(entry);
+            }
+        }
+        if !retained.is_empty() {
+            self.peer_handovers.insert(pane_id, retained);
+        }
+        let lost_count = lost.len();
+        log_peer_delivery_record(codex_peer_debug_log_path().as_deref(), || {
+            serde_json::json!({
+                "action": "peer_handover_reconciled",
+                "pane_id": pane_id,
+                "held_count": held.len(),
+                "consumed_count": consumed.len(),
+                "lost_count": lost_count,
+                "held_overflow": held_overflow,
+                "consumed_overflow": consumed_overflow,
+                "generation": generation,
+            })
+        });
+        self.report_lost_peer_handovers(pane_id, "peer_restarted", lost);
+        Ok(())
+    }
+
+    pub(crate) fn lose_peer_handovers(&mut self, pane_id: usize, reason: &'static str) {
+        self.peer_handover_consumed_tombstones.remove(&pane_id);
+        let mut entries = self.peer_handovers.remove(&pane_id).unwrap_or_default();
+        let mut pending_ids: Vec<u64> = if reason == "pane_closed" {
+            self.pending_peer_deliveries
+                .iter()
+                .filter_map(|(id, pending)| (pending.target_pane == pane_id).then_some(*id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        pending_ids.sort_unstable();
+        for delivery_id in pending_ids {
+            let Some(pending) = self.pending_peer_deliveries.remove(&delivery_id) else {
+                continue;
+            };
+            let error = ipc::CodedError::new(
+                ipc::err_code::PANE_VANISHED,
+                format!("target pane {pane_id} disappeared before peer receipt"),
+            );
+            for reply in pending.replies {
+                let _ = reply.send(Err(error.clone()));
+            }
+            if !pending.message.system_generated {
+                entries.push_back(PeerHandover {
+                    delivery_id,
+                    from_pane: pending.message.from_pane,
+                    from_name: pending.message.from_name,
+                    body: pending.message.body,
+                    ts_ms: pending.message.ts_ms,
+                    generation: self
+                        .peer_handover_generations
+                        .get(&pane_id)
+                        .copied()
+                        .unwrap_or(0),
+                });
+            }
+        }
+        self.report_lost_peer_handovers(pane_id, reason, entries);
+    }
+
+    fn report_lost_peer_handovers(
+        &mut self,
+        pane_id: usize,
+        reason: &'static str,
+        entries: VecDeque<PeerHandover>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        let count = entries.len();
+        log_peer_delivery_record(codex_peer_debug_log_path().as_deref(), || {
+            serde_json::json!({
+                "action": "peer_handover_lost",
+                "pane_id": pane_id,
+                "reason": reason,
+                "count": count,
+            })
+        });
+        for entry in entries {
+            self.event_bus.emit(ipc::Event::PeerMessageLost {
+                delivery_id: entry.delivery_id,
+                target_pane: pane_id,
+                from_pane: entry.from_pane,
+                reason: reason.to_string(),
+                ts_ms: ipc::events::now_ms(),
+            });
+            self.send_peer_loss_notice(pane_id, entry, reason);
+        }
+    }
+
+    fn send_peer_loss_notice(
+        &mut self,
+        lost_target: usize,
+        entry: PeerHandover,
+        reason: &'static str,
+    ) {
+        let sent_seconds = entry.ts_ms / 1000;
+        let time = format!(
+            "{:02}:{:02}:{:02}",
+            (sent_seconds / 3600) % 24,
+            (sent_seconds / 60) % 60,
+            sent_seconds % 60
+        );
+        let mut preview: String = entry.body.chars().take(40).collect();
+        if entry.body.chars().count() > 40 {
+            preview.push('…');
+        }
+        let body = format!(
+            "Peer message to pane {lost_target} was lost before it was read: its MCP peer restarted (reason: {reason}). Sent at {time}, delivery {}, body began: {preview}. Resend if still needed.",
+            entry.delivery_id
+        );
+        let result = self.prepare_peer_send_with_metadata(
+            lost_target,
+            &PaneRef::Id(entry.from_pane),
+            body,
+            Some(Some("renga".to_string())),
+            Some(None),
+            true,
+        );
+        let sent = match result {
+            Ok(PreparedPeerSend::Confirm {
+                target_pane,
+                message,
+                nudge,
+            }) => {
+                self.start_peer_delivery(target_pane, message, nudge, None);
+                true
+            }
+            Ok(PreparedPeerSend::Immediate(ipc::PeerSendOutcome::Queued))
+            | Ok(PreparedPeerSend::Immediate(ipc::PeerSendOutcome::Delivered))
+            | Ok(PreparedPeerSend::Immediate(ipc::PeerSendOutcome::PendingUserConfirmation)) => {
+                true
+            }
+            Ok(PreparedPeerSend::Immediate(ipc::PeerSendOutcome::Undeliverable)) | Err(_) => false,
+        };
+        log_peer_delivery_record(codex_peer_debug_log_path().as_deref(), || {
+            serde_json::json!({
+                "action": if sent { "peer_loss_notice_sent" } else { "peer_loss_notice_dropped" },
+                "delivery_id": entry.delivery_id,
+                "target_pane": lost_target,
+                "from_pane": entry.from_pane,
+            })
+        });
     }
 
     /// Re-arm Codex after it acknowledges one pull-inbox head while another
@@ -1418,6 +1747,7 @@ impl App {
     }
 
     pub(crate) fn flush_pending_peer_deliveries(&mut self) {
+        self.flush_peer_handover_disconnect_timeouts();
         if self.pending_peer_deliveries.is_empty() {
             return;
         }
@@ -1545,6 +1875,25 @@ impl App {
         }
     }
 
+    pub(crate) fn flush_peer_handover_disconnect_timeouts(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<usize> = self
+            .peer_handover_disconnect_deadlines
+            .iter()
+            .filter_map(|(pane_id, deadline)| (now >= *deadline).then_some(*pane_id))
+            .collect();
+        for pane_id in expired {
+            self.peer_handover_disconnect_deadlines.remove(&pane_id);
+            log_peer_delivery_record(codex_peer_debug_log_path().as_deref(), || {
+                serde_json::json!({
+                    "action": "peer_handover_disconnect_timeout",
+                    "pane_id": pane_id,
+                })
+            });
+            self.lose_peer_handovers(pane_id, "subscriber_gone_timeout");
+        }
+    }
+
     fn pending_peer_delivery_heads(&self) -> HashMap<usize, u64> {
         let mut heads = HashMap::new();
         for (delivery_id, pending) in &self.pending_peer_deliveries {
@@ -1605,6 +1954,9 @@ impl App {
                     format!("pane {pane_id} not found for peer registration"),
                 )
             })?;
+        self.peer_handover_disconnect_deadlines.remove(&pane_id);
+        let generation = self.peer_handover_generations.entry(pane_id).or_default();
+        *generation = generation.saturating_add(1);
         let old_kind = self.peer_client_kinds.insert(pane_id, kind);
         log_codex_peer_kind_update(pane_id, old_kind, kind, "register");
         Ok(())
@@ -1635,6 +1987,7 @@ impl App {
             });
             return Ok(());
         }
+        self.peer_handover_disconnect_deadlines.remove(&pane_id);
         // Readiness and kind travel atomically so a failed earlier metadata
         // registration cannot suppress Codex nudge setup.
         let old_kind = self.peer_client_kinds.insert(pane_id, kind);
@@ -1679,6 +2032,10 @@ impl App {
     /// same transport-liveness requirement.
     pub(crate) fn handle_peer_subscriber_gone(&mut self, pane_id: usize) {
         self.peer_delivery_ready.remove(&pane_id);
+        if self.peer_handovers.contains_key(&pane_id) {
+            self.peer_handover_disconnect_deadlines
+                .insert(pane_id, Instant::now() + PEER_HANDOVER_DISCONNECT_TIMEOUT);
+        }
         let debug_log_path = codex_peer_debug_log_path();
         log_peer_delivery_record(debug_log_path.as_deref(), || {
             serde_json::json!({

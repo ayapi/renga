@@ -29,6 +29,10 @@ impl App {
 
         let pane_ids_in_tab: Vec<usize> = self.workspaces[index].panes.keys().copied().collect();
 
+        for pane_id in &pane_ids_in_tab {
+            self.lose_peer_handovers(*pane_id, "pane_closed");
+        }
+
         let mut to_emit: Vec<(usize, Option<String>, Option<String>)> = Vec::new();
         {
             let ws = &mut self.workspaces[index];
@@ -51,6 +55,10 @@ impl App {
                 self.peer_client_kinds.remove(pid);
                 self.peer_delivery_ready.remove(pid);
                 self.pending_peer_inbox.remove(pid);
+                self.peer_handovers.remove(pid);
+                self.peer_handover_consumed_tombstones.remove(pid);
+                self.peer_handover_disconnect_deadlines.remove(pid);
+                self.peer_handover_generations.remove(pid);
                 self.peer_inbox_debug_sequences.remove(pid);
                 self.pending_codex_peer_messages.remove(pid);
                 self.codex_peer_delivery_sequences.remove(pid);
@@ -271,13 +279,14 @@ impl App {
         ws_index: usize,
         pane_id: usize,
     ) -> std::result::Result<(), ipc::CodedError> {
-        let ws = &mut self.workspaces[ws_index];
-        if !ws.panes.contains_key(&pane_id) {
+        if !self.workspaces[ws_index].panes.contains_key(&pane_id) {
             return Err(ipc::CodedError::new(
                 ipc::err_code::PANE_VANISHED,
                 "pane vanished",
             ));
         }
+        self.lose_peer_handovers(pane_id, "pane_closed");
+        let ws = &mut self.workspaces[ws_index];
         let pane_ids = ws.layout.collect_pane_ids();
         let current_idx = pane_ids.iter().position(|&id| id == pane_id);
 
@@ -308,6 +317,10 @@ impl App {
         self.peer_client_kinds.remove(&pane_id);
         self.peer_delivery_ready.remove(&pane_id);
         self.pending_peer_inbox.remove(&pane_id);
+        self.peer_handovers.remove(&pane_id);
+        self.peer_handover_consumed_tombstones.remove(&pane_id);
+        self.peer_handover_disconnect_deadlines.remove(&pane_id);
+        self.peer_handover_generations.remove(&pane_id);
         self.peer_inbox_debug_sequences.remove(&pane_id);
         self.pending_codex_peer_messages.remove(&pane_id);
         self.codex_peer_delivery_sequences.remove(&pane_id);

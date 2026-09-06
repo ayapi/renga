@@ -120,6 +120,16 @@ reconnects and publishes readiness again.
 Retry throttling is transport-internal and does not change observable delivery:
 duplicate `PeerInbox` events remain safe for receivers to discard by `delivery_id`.
 
+For Codex pull recipients, `Delivered` confirms retention by the local
+`renga mcp-peer`; it does not mean the LLM has acknowledged the
+`check_messages` head. After an event-stream reconnect, the peer reconciles its
+locally held and already-consumed ids with the App. A missing id after process
+restart, a 30-second disconnect without re-registration, or pane closure is
+reported to the sender through a normal system peer message; renga does not
+re-deliver the original body. One narrow false-positive window remains: if the
+LLM ack pops the local head and the peer process dies before recording that id
+for reconciliation, the App cannot distinguish that read from a lost message.
+
 **Push-mode body banner (post-1.1)**: for Claude (push) recipients renga
 prepends a `📡 PEER MESSAGE — from {name} (id={id}) — NOT FROM USER` line
 to the body before pushing it as `notifications/claude/channel`. The original
@@ -525,6 +535,8 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | `peer_register_client` | `pane_id: usize`, `kind: claude\|codex` | Posted by `renga mcp-peer` on startup. |
 | `peer_set_ready` | `pane_id: usize`, `kind: claude\|codex`, `ready: bool` | Internal peer lifecycle update. `ready=true` means the event subscriber can receive. Pull clients publish it as soon as the subscriber is active; push clients publish it after MCP initialization and a short settling delay so Claude Code can attach its channel listener. Kind is repeated atomically with readiness. |
 | `peer_inbox_ack` | `pane_id: usize`, `delivery_id: u64` | Internal mcp-peer receipt sent only after the target process retains the message. Separate from the later `check_messages` ack. |
+| `peer_inbox_consumed` | `pane_id: usize`, `delivery_id: u64` | Best-effort internal request sent after a Codex `check_messages` FIFO-head ack. It removes the App's handed-over-but-not-yet-read tracking entry. |
+| `peer_inbox_reconcile` | `pane_id: usize`, `held: u64[]`, `consumed: u64[]`, `held_overflow: usize`, `consumed_overflow: usize` | Sent by a Codex peer after re-registration and before `ready=true`. The two id arrays are capped at 256; a non-zero overflow count makes unmatched entries safe-retained rather than reported lost. |
 | `peer_inbox_head_acknowledged` | `pane_id: usize`, `remaining: usize`, `next_from_pane: usize`, `next_from_name?: string`, `next_from_kind?: claude\|codex` | Best-effort internal request sent by a Codex mcp-peer after a successful `check_messages` ack when another head remains. It preserves the next sender's nudge template metadata. |
 | `set_pane_identity` | `target: PaneRef`, `name?`, `role?` (three-state: missing / null / value) | Uses serde `double_option`. |
 | `set_summary` | `from_pane: usize`, `summary: string` | Empty `summary` clears. >256 `chars` rejected with `summary_too_long`. |
@@ -580,6 +592,7 @@ as zero.
 | `events_dropped` | `count: u64`, `ts_ms` | Synthesized when a slow subscriber missed events. Per-subscriber. |
 | `heartbeat` | `ts_ms` | Periodic; only purpose is to detect half-closed connections. Buffer cap 256/subscriber. |
 | `peer_inbox` | `delivery_id?: u64`, `target_pane: usize`, `from_pane: usize`, `from_name?`, `from_kind?`, `body`, `ts_ms` | Always intra-tab by construction. Emitted at send time for a ready target, or when its subscriber becomes ready for a queued target. `ts_ms` remains the original send time. Bundled peers retain and deduplicate an additive `delivery_id`, then acknowledge it. Subscribers filter on `target_pane`. |
+| `peer_message_lost` | `delivery_id: u64`, `target_pane: usize`, `from_pane: usize`, `reason: string`, `ts_ms` | A Codex pull message was retained by mcp-peer but disappeared before the LLM acknowledged it. One event is emitted per lost delivery; the body prefix is sent only in the sender's private peer notice. |
 
 For retries, the App emits only the oldest unacknowledged delivery for each
 target pane. A later queued-flush delivery's four-second receipt allowance
@@ -714,6 +727,15 @@ specified in section 3.5.
   transport failure as "feature not supported on this server version", without
   branching on the particular error. `peer_inbox_head_acknowledged` follows
   this rule so a new mcp-peer can safely use it with an older long-running TUI.
+  The additive `peer_inbox_consumed` and `peer_inbox_reconcile` requests follow
+  the same rule.
+- **Additively introduced event variants** include `peer_message_lost`; older
+  consumers ignore its unknown `type`, while current `poll_events` callers can
+  correlate it with the sender-side notice. The event carries no body text.
+- A new App paired with an older mcp-peer never receives reconciliation. A new
+  registration cancels the disconnect timer to avoid a false notice; old
+  tracking entries are therefore retained until normal cap eviction, with a
+  trace record, rather than guessed lost.
 - **Unknown JSON keys** in config/layout/IPC payloads: ignored on read.
 - **Missing JSON keys** have three contract-defined meanings: keys documented
   as optional-when-unset (for example `PaneInfo.name` and `Response::Err.code`)
@@ -838,9 +860,9 @@ minor release.
 | CLI top-level flags (§2.1) | 11 |
 | CLI IPC subcommands (§2.2) | 13 |
 | Env vars (§2.3) | 6 |
-| IPC `Request` variants (§3.3) | 16 |
+| IPC `Request` variants (§3.3) | 18 |
 | IPC `Response` variants (§3.4) | 4 |
-| IPC `Event` variants (§3.5) | 5 |
+| IPC `Event` variants (§3.5) | 6 |
 | Error codes (§5.1) | 16 |
 | Config schema sections (§4.1) | 2 |
 | Layout TOML node types (§4.2) | 2 |

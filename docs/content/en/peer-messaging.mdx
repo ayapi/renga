@@ -180,6 +180,12 @@ Codex delivery is pane-driven. renga queues a one-shot nudge and waits until a C
 
 When an acknowledgement leaves another pull-inbox message queued, renga requests one best-effort follow-up nudge. Call `check_messages({})` again immediately when `pending_after > 0`; do not wait for the fallback, because an older running TUI may not support the request.
 
+If a system peer message says a delivery was lost, the Codex mcp-peer had
+retained it, but reconciliation after restart could no longer find it, the pane
+stayed disconnected for 30 seconds, or the pane closed. renga does not
+re-deliver it automatically. Use the delivery id, send time, and body prefix in
+the notice to decide whether to resend it.
+
 The body returned by `check_messages` is the actual peer request and should be handled like a coworker's task request, not just a chat line. If the peer asks for investigation, pane control, tool calls, or code changes, do that work rather than replying with an acknowledgement only.
 
 ### Codex still shows `pending messages` but `check_messages` returns 0

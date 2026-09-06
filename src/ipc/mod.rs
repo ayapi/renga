@@ -194,6 +194,19 @@ pub enum Request {
     /// `check_messages` receipt token, which confirms the later
     /// MCP-client-to-Codex handoff.
     PeerInboxAck { pane_id: usize, delivery_id: u64 },
+    /// Confirm that the Codex client acknowledged a message previously
+    /// retained by its bundled MCP peer. This is best-effort bookkeeping:
+    /// the local inbox ack has already succeeded when this request is sent.
+    PeerInboxConsumed { pane_id: usize, delivery_id: u64 },
+    /// Reconcile App handover tracking with a newly connected pull peer's
+    /// process-local state.
+    PeerInboxReconcile {
+        pane_id: usize,
+        held: Vec<u64>,
+        consumed: Vec<u64>,
+        held_overflow: usize,
+        consumed_overflow: usize,
+    },
     /// Tell the App that a Codex pull-inbox head was acknowledged while
     /// another message remains. The App turns this into a fresh nudge through
     /// the normal Codex delivery path.
@@ -654,6 +667,16 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_kind: Option<PeerClientKind>,
         body: String,
+        ts_ms: u64,
+    },
+    /// A pull peer's locally retained message disappeared before the LLM
+    /// acknowledged it. Consumers may use this to correlate the sender-side
+    /// system notice with the original delivery.
+    PeerMessageLost {
+        delivery_id: u64,
+        target_pane: usize,
+        from_pane: usize,
+        reason: String,
         ts_ms: u64,
     },
 }
@@ -1244,6 +1267,27 @@ mod tests {
     }
 
     #[test]
+    fn peer_inbox_consumed_request_roundtrips() {
+        let r = Request::PeerInboxConsumed {
+            pane_id: 2,
+            delivery_id: 17,
+        };
+        assert_eq!(roundtrip(&r), r);
+    }
+
+    #[test]
+    fn peer_inbox_reconcile_request_roundtrips() {
+        let r = Request::PeerInboxReconcile {
+            pane_id: 2,
+            held: vec![17, 18],
+            consumed: vec![16],
+            held_overflow: 3,
+            consumed_overflow: 1,
+        };
+        assert_eq!(roundtrip(&r), r);
+    }
+
+    #[test]
     fn peer_inbox_head_acknowledged_request_roundtrips() {
         let r = Request::PeerInboxHeadAcknowledged {
             pane_id: 2,
@@ -1264,6 +1308,19 @@ mod tests {
             from_name: Some("leader".into()),
             from_kind: Some(PeerClientKind::Claude),
             body: "ping".into(),
+            ts_ms: 42,
+        };
+        let parsed: Event = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        assert_eq!(parsed, ev);
+    }
+
+    #[test]
+    fn peer_message_lost_event_roundtrips() {
+        let ev = Event::PeerMessageLost {
+            delivery_id: 9,
+            target_pane: 2,
+            from_pane: 1,
+            reason: "subscriber_gone".into(),
             ts_ms: 42,
         };
         let parsed: Event = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();

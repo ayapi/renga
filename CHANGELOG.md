@@ -17,6 +17,15 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
   expire instead of lingering after a composer mismatch. (renga-8r9,
   renga-446)
 
+- **Codex pull-message loss is now reported honestly to the sender.** The App
+  tracks locally retained messages until the LLM acknowledges each
+  `check_messages` head. Reconnect reconciliation, a 30-second disconnect
+  timeout, and pane closure identify messages that disappeared; renga emits
+  `peer_message_lost` and sends one system peer notice per lost delivery through
+  the normal push/pull route without re-delivering the original body. Additive
+  `peer_inbox_consumed` and `peer_inbox_reconcile` requests keep the App ledger
+  aligned with process-local state. (renga-vtl)
+
 - **Trace-only peer push lifecycle records under
   `RENGA_DEBUG_CODEX_PEER_LOG`.** The App ready queue and mcp-peer push buffer
   now record queueing, initialization, subscription, flush, emission, cap drop,

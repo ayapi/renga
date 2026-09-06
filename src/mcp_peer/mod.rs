@@ -153,7 +153,7 @@ fn set_client_ready(ctx: &PeerCtx, ready: bool) {
         Err(e) => log_stderr(&format!("peer readiness update failed: {e}")),
     }
     if let Some(path) = ctx.debug_log_path.as_deref() {
-        let (ok, error) = match result {
+        let (ok, error) = match &result {
             Ok(Response::Ok { .. }) => (true, None),
             Ok(other) => (false, Some(format!("unexpected response: {other:?}"))),
             Err(error) => (false, Some(error.to_string())),
@@ -212,7 +212,7 @@ fn acknowledge_peer_inbox(ctx: &PeerCtx, delivery_id: u64) {
 }
 
 struct PeerInboxAckQueue {
-    sender: mpsc::Sender<u64>,
+    sender: mpsc::Sender<PeerInboxQueuedRequest>,
     depth: Arc<AtomicUsize>,
     in_flight: Arc<AtomicBool>,
     cancel_drain: Arc<AtomicBool>,
@@ -223,7 +223,12 @@ struct PeerInboxAckQueue {
 
 impl PeerInboxAckQueue {
     fn enqueue(&self, delivery_id: u64) {
+        self.enqueue_request(PeerInboxQueuedRequest::Ack(delivery_id));
+    }
+
+    fn enqueue_request(&self, request: PeerInboxQueuedRequest) {
         let depth = self.depth.fetch_add(1, Ordering::AcqRel) + 1;
+        let delivery_id = request.delivery_id();
         if let Some(path) = self.ctx.debug_log_path.as_deref() {
             let pane_id = match &self.ctx.mode {
                 Mode::Connected { pane_id, .. } => Some(*pane_id),
@@ -233,13 +238,13 @@ impl PeerInboxAckQueue {
                 path,
                 pane_id,
                 json!({
-                    "action": "peer_inbox_ack_queued",
+                    "action": request.queue_action(),
                     "delivery_id": delivery_id,
                     "depth": depth,
                 }),
             );
         }
-        if self.sender.send(delivery_id).is_err() {
+        if self.sender.send(request).is_err() {
             self.depth.fetch_sub(1, Ordering::AcqRel);
             log_stderr(&format!(
                 "peer inbox receipt queue closed before delivery {delivery_id} was accepted"
@@ -261,6 +266,9 @@ impl PeerInboxAckQueue {
             handle,
             done,
         } = self;
+        *ctx.peer_inbox_request_sender
+            .lock()
+            .unwrap_or_else(|slot| slot.into_inner()) = PeerInboxRequestRoute::Unavailable;
         drop(sender);
         match done.recv_timeout(timeout) {
             Ok(()) => {
@@ -313,6 +321,37 @@ enum PeerInboxAckSender {
     Sync(PeerCtx),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerInboxQueuedRequest {
+    Ack(u64),
+    Consumed(u64),
+}
+
+#[derive(Clone)]
+enum PeerInboxRequestRoute {
+    Unavailable,
+    Async {
+        sender: mpsc::Sender<PeerInboxQueuedRequest>,
+        depth: Arc<AtomicUsize>,
+    },
+    Sync,
+}
+
+impl PeerInboxQueuedRequest {
+    fn delivery_id(self) -> u64 {
+        match self {
+            Self::Ack(id) | Self::Consumed(id) => id,
+        }
+    }
+
+    fn queue_action(self) -> &'static str {
+        match self {
+            Self::Ack(_) => "peer_inbox_ack_queued",
+            Self::Consumed(_) => "peer_inbox_consumed_queued",
+        }
+    }
+}
+
 impl PeerInboxAckSender {
     fn enqueue(&self, delivery_id: u64) {
         match self {
@@ -356,10 +395,19 @@ fn spawn_peer_inbox_ack_sender(ctx: PeerCtx) -> PeerInboxAckSender {
     let spawn_result = thread::Builder::new()
         .name("renga-mcp-peer-ack".into())
         .spawn(move || {
-            while let Ok(delivery_id) = receiver.recv() {
+            while let Ok(request) = receiver.recv() {
                 worker_depth.fetch_sub(1, Ordering::AcqRel);
                 worker_in_flight.store(true, Ordering::Release);
-                acknowledge_peer_inbox(&worker_ctx, delivery_id);
+                match request {
+                    PeerInboxQueuedRequest::Ack(delivery_id) => {
+                        acknowledge_peer_inbox(&worker_ctx, delivery_id)
+                    }
+                    PeerInboxQueuedRequest::Consumed(delivery_id) => {
+                        if notify_peer_inbox_consumed(&worker_ctx, delivery_id) {
+                            mark_consumed_reported(&worker_ctx, delivery_id);
+                        }
+                    }
+                }
                 worker_in_flight.store(false, Ordering::Release);
                 if worker_cancel_drain.load(Ordering::Acquire) {
                     let dropped = receiver.try_iter().count();
@@ -370,19 +418,30 @@ fn spawn_peer_inbox_ack_sender(ctx: PeerCtx) -> PeerInboxAckSender {
             let _ = done_tx.send(());
         });
     match spawn_result {
-        Ok(handle) => PeerInboxAckSender::Async(PeerInboxAckQueue {
-            sender,
-            depth,
-            in_flight,
-            cancel_drain,
-            ctx,
-            handle,
-            done,
-        }),
+        Ok(handle) => {
+            *ctx.peer_inbox_request_sender
+                .lock()
+                .unwrap_or_else(|slot| slot.into_inner()) = PeerInboxRequestRoute::Async {
+                sender: sender.clone(),
+                depth: depth.clone(),
+            };
+            PeerInboxAckSender::Async(PeerInboxAckQueue {
+                sender,
+                depth,
+                in_flight,
+                cancel_drain,
+                ctx,
+                handle,
+                done,
+            })
+        }
         Err(error) => {
             log_stderr(&format!(
                 "failed to spawn peer inbox receipt sender: {error}; using synchronous receipts"
             ));
+            *ctx.peer_inbox_request_sender
+                .lock()
+                .unwrap_or_else(|slot| slot.into_inner()) = PeerInboxRequestRoute::Sync;
             PeerInboxAckSender::Sync(ctx)
         }
     }
@@ -446,6 +505,222 @@ fn request_codex_renudge_after_ack(
             "rejected"
         }
     }
+}
+
+fn notify_peer_inbox_consumed(ctx: &PeerCtx, delivery_id: u64) -> bool {
+    let Mode::Connected { pane_id, endpoint } = &ctx.mode else {
+        return false;
+    };
+    let request = Request::PeerInboxConsumed {
+        pane_id: *pane_id,
+        delivery_id,
+    };
+    #[cfg(test)]
+    let result = if let Some(sink) = &ctx.request_sink {
+        sink.lock().unwrap_or_else(|p| p.into_inner()).push(request);
+        Ok(ctx
+            .request_sink_response
+            .clone()
+            .unwrap_or_else(Response::ok_unit))
+    } else {
+        client::send_request(endpoint, &request)
+    };
+    #[cfg(not(test))]
+    let result = client::send_request(endpoint, &request);
+    match &result {
+        Ok(Response::Ok { .. }) => {}
+        Ok(other) => log_stderr(&format!("peer inbox consumed request returned: {other:?}")),
+        Err(error) => log_stderr(&format!("peer inbox consumed request failed: {error}")),
+    }
+    let request_succeeded = matches!(result, Ok(Response::Ok { .. }));
+    if let Some(path) = ctx.debug_log_path.as_deref() {
+        let (ok, error) = match &result {
+            Ok(Response::Ok { .. }) => (true, None),
+            Ok(other) => (false, Some(format!("unexpected response: {other:?}"))),
+            Err(error) => (false, Some(error.to_string())),
+        };
+        append_peer_debug_record(
+            path,
+            Some(*pane_id),
+            json!({
+                "action": "peer_inbox_consumed_sent",
+                "delivery_id": delivery_id,
+                "ok": ok,
+                "error": error,
+            }),
+        );
+    }
+    request_succeeded
+}
+
+const UNREPORTED_CONSUMED_CAP: usize = 256;
+
+fn retain_unreported_consumed(ctx: &PeerCtx, delivery_id: u64) {
+    let mut ids = ctx
+        .unreported_consumed
+        .lock()
+        .unwrap_or_else(|items| items.into_inner());
+    if !ids.contains(&delivery_id) {
+        ids.push_back(delivery_id);
+        if ids.len() > UNREPORTED_CONSUMED_CAP {
+            ids.pop_front();
+            ctx.unreported_consumed_overflow
+                .fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    let count = ids.len();
+    if let Some(path) = ctx.debug_log_path.as_deref() {
+        append_peer_debug_record(
+            path,
+            peer_ctx_pane_id(ctx),
+            json!({
+                "action": "peer_inbox_consumed_unreported",
+                "delivery_id": delivery_id,
+                "count": count,
+            }),
+        );
+    }
+}
+
+fn mark_consumed_reported(ctx: &PeerCtx, delivery_id: u64) {
+    let mut ids = ctx
+        .unreported_consumed
+        .lock()
+        .unwrap_or_else(|items| items.into_inner());
+    if let Some(position) = ids.iter().position(|id| *id == delivery_id) {
+        ids.remove(position);
+    }
+    let count = ids.len();
+    if let Some(path) = ctx.debug_log_path.as_deref() {
+        append_peer_debug_record(
+            path,
+            peer_ctx_pane_id(ctx),
+            json!({
+                "action": "peer_inbox_consumed_reported",
+                "delivery_id": delivery_id,
+                "count": count,
+            }),
+        );
+    }
+}
+
+fn request_peer_inbox_consumed(ctx: &PeerCtx, delivery_id: Option<u64>) -> &'static str {
+    let Some(delivery_id) = delivery_id else {
+        return "skipped_no_delivery_id";
+    };
+    let route = ctx
+        .peer_inbox_request_sender
+        .lock()
+        .unwrap_or_else(|slot| slot.into_inner())
+        .clone();
+    match route {
+        PeerInboxRequestRoute::Unavailable => "rejected_sender_unavailable",
+        PeerInboxRequestRoute::Async { sender, depth } => {
+            let queue_depth = depth.fetch_add(1, Ordering::AcqRel) + 1;
+            if let Some(path) = ctx.debug_log_path.as_deref() {
+                append_peer_debug_record(
+                    path,
+                    peer_ctx_pane_id(ctx),
+                    json!({
+                        "action": "peer_inbox_consumed_queued",
+                        "delivery_id": delivery_id,
+                        "depth": queue_depth,
+                    }),
+                );
+            }
+            match sender.send(PeerInboxQueuedRequest::Consumed(delivery_id)) {
+                Ok(()) => "sent",
+                Err(_) => {
+                    depth.fetch_sub(1, Ordering::AcqRel);
+                    "rejected_queue_closed"
+                }
+            }
+        }
+        PeerInboxRequestRoute::Sync => {
+            if notify_peer_inbox_consumed(ctx, delivery_id) {
+                mark_consumed_reported(ctx, delivery_id);
+                "sent_sync_fallback"
+            } else {
+                "rejected_sync_fallback"
+            }
+        }
+    }
+}
+
+fn reconcile_peer_inbox(ctx: &PeerCtx) -> bool {
+    if ctx.client_kind != PeerClientKind::Codex {
+        return true;
+    }
+    let Mode::Connected { pane_id, endpoint } = &ctx.mode else {
+        return false;
+    };
+    let (held, held_overflow) = {
+        let inbox = ctx.inbox.lock().unwrap_or_else(|state| state.into_inner());
+        let ids: Vec<u64> = inbox
+            .messages
+            .iter()
+            .filter_map(|entry| entry.message.delivery_id)
+            .take(UNREPORTED_CONSUMED_CAP)
+            .collect();
+        let total = inbox
+            .messages
+            .iter()
+            .filter(|entry| entry.message.delivery_id.is_some())
+            .count();
+        (ids, total.saturating_sub(UNREPORTED_CONSUMED_CAP))
+    };
+    let consumed = ctx
+        .unreported_consumed
+        .lock()
+        .unwrap_or_else(|items| items.into_inner())
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let consumed_overflow = ctx.unreported_consumed_overflow.load(Ordering::Acquire);
+    let request = Request::PeerInboxReconcile {
+        pane_id: *pane_id,
+        held: held.clone(),
+        consumed: consumed.clone(),
+        held_overflow,
+        consumed_overflow,
+    };
+    #[cfg(test)]
+    let result = if let Some(sink) = &ctx.request_sink {
+        sink.lock()
+            .unwrap_or_else(|items| items.into_inner())
+            .push(request);
+        Ok(ctx
+            .request_sink_response
+            .clone()
+            .unwrap_or_else(Response::ok_unit))
+    } else {
+        client::send_request(endpoint, &request)
+    };
+    #[cfg(not(test))]
+    let result = client::send_request(endpoint, &request);
+    let ok = matches!(result, Ok(Response::Ok { .. }));
+    if ok {
+        let mut unreported = ctx
+            .unreported_consumed
+            .lock()
+            .unwrap_or_else(|items| items.into_inner());
+        unreported.retain(|id| !consumed.contains(id));
+    }
+    if let Some(path) = ctx.debug_log_path.as_deref() {
+        append_peer_debug_record(
+            path,
+            Some(*pane_id),
+            json!({
+                "action": "peer_inbox_reconciled",
+                "ok": ok,
+                "held_count": held.len(),
+                "consumed_count": consumed.len(),
+                "held_overflow": held_overflow,
+                "consumed_overflow": consumed_overflow,
+            }),
+        );
+    }
+    ok
 }
 
 fn log_peer_inbox_ack_sent(
@@ -544,6 +819,9 @@ struct PeerCtx {
     inbox: InboxSink,
     push: PushSink,
     ready_publish_lock: Arc<Mutex<()>>,
+    peer_inbox_request_sender: Arc<Mutex<PeerInboxRequestRoute>>,
+    unreported_consumed: Arc<Mutex<VecDeque<u64>>>,
+    unreported_consumed_overflow: Arc<AtomicUsize>,
     debug_log_path: Option<PathBuf>,
     #[cfg(test)]
     request_sink: Option<Arc<Mutex<Vec<Request>>>>,
@@ -609,6 +887,7 @@ fn new_event_sink() -> EventSink {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QueuedPeerMessage {
+    delivery_id: Option<u64>,
     from_id: String,
     from_name: Option<String>,
     from_kind: Option<PeerClientKind>,
@@ -677,6 +956,11 @@ impl PeerCtx {
                         inbox,
                         push,
                         ready_publish_lock,
+                        peer_inbox_request_sender: Arc::new(Mutex::new(
+                            PeerInboxRequestRoute::Unavailable,
+                        )),
+                        unreported_consumed_overflow: Arc::new(AtomicUsize::new(0)),
+                        unreported_consumed: Arc::new(Mutex::new(VecDeque::new())),
                         client_kind,
                         debug_log_path,
                         #[cfg(test)]
@@ -699,6 +983,11 @@ impl PeerCtx {
                     inbox,
                     push,
                     ready_publish_lock,
+                    peer_inbox_request_sender: Arc::new(Mutex::new(
+                        PeerInboxRequestRoute::Unavailable,
+                    )),
+                    unreported_consumed_overflow: Arc::new(AtomicUsize::new(0)),
+                    unreported_consumed: Arc::new(Mutex::new(VecDeque::new())),
                     client_kind,
                     debug_log_path,
                     #[cfg(test)]
@@ -717,6 +1006,9 @@ impl PeerCtx {
                 inbox,
                 push,
                 ready_publish_lock,
+                peer_inbox_request_sender: Arc::new(Mutex::new(PeerInboxRequestRoute::Unavailable)),
+                unreported_consumed_overflow: Arc::new(AtomicUsize::new(0)),
+                unreported_consumed: Arc::new(Mutex::new(VecDeque::new())),
                 client_kind,
                 debug_log_path,
                 #[cfg(test)]
@@ -734,6 +1026,9 @@ impl PeerCtx {
                 inbox,
                 push,
                 ready_publish_lock,
+                peer_inbox_request_sender: Arc::new(Mutex::new(PeerInboxRequestRoute::Unavailable)),
+                unreported_consumed_overflow: Arc::new(AtomicUsize::new(0)),
+                unreported_consumed: Arc::new(Mutex::new(VecDeque::new())),
                 client_kind,
                 debug_log_path,
                 #[cfg(test)]
@@ -2118,6 +2413,7 @@ fn check_messages_page_response(
 struct CheckMessagesHandled {
     response: Value,
     renudge_after_ack: Option<&'static str>,
+    consumed_after_ack: Option<&'static str>,
 }
 
 impl CheckMessagesHandled {
@@ -2125,6 +2421,7 @@ impl CheckMessagesHandled {
         Self {
             response,
             renudge_after_ack: None,
+            consumed_after_ack: None,
         }
     }
 }
@@ -2176,6 +2473,7 @@ fn handle_check_messages_inner(id: &Value, args: &Value, ctx: &PeerCtx) -> Check
                 "ack does not match the queued FIFO head",
             ));
         }
+        let delivery_id = head.message.delivery_id;
         inbox.messages.pop_front();
         let pending_after = inbox.messages.len();
         let next = inbox.messages.front().map(|entry| entry.message.clone());
@@ -2184,9 +2482,14 @@ fn handle_check_messages_inner(id: &Value, args: &Value, ctx: &PeerCtx) -> Check
             Some(next) => request_codex_renudge_after_ack(ctx, pending_after, next),
             None => "skipped_none_pending",
         };
+        if let Some(delivery_id) = delivery_id {
+            retain_unreported_consumed(ctx, delivery_id);
+        }
+        let consumed_after_ack = request_peer_inbox_consumed(ctx, delivery_id);
         return CheckMessagesHandled {
             response: acknowledged_check_messages_response(id, message_id, pending_after),
             renudge_after_ack: Some(renudge_after_ack),
+            consumed_after_ack: Some(consumed_after_ack),
         };
     }
 
@@ -2261,6 +2564,7 @@ fn handle_check_messages(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
     let CheckMessagesHandled {
         response,
         renudge_after_ack,
+        consumed_after_ack,
     } = handle_check_messages_inner(id, args, ctx);
     let inbox_len_after = ctx
         .inbox
@@ -2315,6 +2619,7 @@ fn handle_check_messages(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
             },
             "ack_result": ack_result,
             "renudge_after_ack": renudge_after_ack,
+            "consumed_after_ack": consumed_after_ack,
             "error_reason": error_reason,
             "response": {
                 "head_message_id": delivery.and_then(|value| value.get("message_id")).and_then(Value::as_str),
@@ -3964,6 +4269,7 @@ fn handle_peer_subscription_event(
             queue_pull_message(
                 inbox,
                 QueuedPeerMessage {
+                    delivery_id,
                     from_id: from_pane.to_string(),
                     from_name: from_name.clone(),
                     from_kind,
@@ -4033,6 +4339,7 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                 || {
                     subscribed_on_ready.store(true, std::sync::atomic::Ordering::Release);
                     register_client_kind(&registration_ctx);
+                    reconcile_peer_inbox(&registration_ctx);
                     publish_ready_after_subscribe(&registration_ctx);
                 },
                 |event| {
@@ -4084,6 +4391,7 @@ fn spawn_inbox_subscriber(ctx: PeerCtx) {
                         );
                         if client_kind.receive_mode() == ipc::PeerReceiveMode::Pull {
                             queue_pull_message(&inbox, QueuedPeerMessage {
+                                delivery_id: None,
                                 from_id: "renga".to_string(),
                                 from_name: Some("renga runtime".to_string()),
                                 from_kind: None,
@@ -6397,6 +6705,9 @@ Commands:
             inbox: new_inbox_sink(),
             push: Arc::new(Mutex::new(PushState::default())),
             ready_publish_lock: Arc::new(Mutex::new(())),
+            peer_inbox_request_sender: Arc::new(Mutex::new(PeerInboxRequestRoute::Unavailable)),
+            unreported_consumed_overflow: Arc::new(AtomicUsize::new(0)),
+            unreported_consumed: Arc::new(Mutex::new(VecDeque::new())),
             debug_log_path: None,
             request_sink: None,
             request_sink_response: None,
@@ -6415,6 +6726,9 @@ Commands:
             inbox: new_inbox_sink(),
             push: Arc::new(Mutex::new(PushState::default())),
             ready_publish_lock: Arc::new(Mutex::new(())),
+            peer_inbox_request_sender: Arc::new(Mutex::new(PeerInboxRequestRoute::Unavailable)),
+            unreported_consumed_overflow: Arc::new(AtomicUsize::new(0)),
+            unreported_consumed: Arc::new(Mutex::new(VecDeque::new())),
             debug_log_path: None,
             request_sink: None,
             request_sink_response: None,
@@ -6609,6 +6923,7 @@ Commands:
         queue_pull_message(
             &ctx.inbox,
             QueuedPeerMessage {
+                delivery_id: None,
                 from_id: "2".to_string(),
                 from_name: Some("planner".to_string()),
                 from_kind: Some(PeerClientKind::Claude),
@@ -6784,6 +7099,202 @@ Commands:
             "an accepted ack records an empty response head, distinct from its accepted status"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn check_messages_ack_preserves_delivery_id_for_consumed_request() {
+        let (ctx, requests) = connected_ctx_with_requests(PeerClientKind::Codex, PUSH_READY_DELAY);
+        let sender = spawn_peer_inbox_ack_sender(ctx.clone());
+        sender.enqueue(77);
+        queue_pull_message(
+            &ctx.inbox,
+            QueuedPeerMessage {
+                delivery_id: Some(77),
+                from_id: "2".into(),
+                from_name: Some("planner".into()),
+                from_kind: Some(PeerClientKind::Claude),
+                body: "ack me".into(),
+                sent_at: "2026-09-06T12:40:00Z".into(),
+            },
+        );
+        let first = handle_check_messages_inner(&json!(1), &json!({}), &ctx).response;
+        let message_id = first
+            .pointer("/result/structuredContent/delivery/message_id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let token = first
+            .pointer("/result/structuredContent/delivery/ack_token")
+            .and_then(Value::as_str)
+            .unwrap();
+
+        let handled = handle_check_messages_inner(
+            &json!(2),
+            &json!({"ack": {"message_id": message_id, "token": token}}),
+            &ctx,
+        );
+
+        assert_eq!(handled.consumed_after_ack, Some("sent"));
+        sender.finish();
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            &[
+                Request::PeerInboxAck {
+                    pane_id: 1,
+                    delivery_id: 77,
+                },
+                Request::PeerInboxConsumed {
+                    pane_id: 1,
+                    delivery_id: 77,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn consumed_request_uses_async_queue_sync_fallback_or_reports_unavailable() {
+        let (sent_ctx, sent_requests) =
+            connected_ctx_with_requests(PeerClientKind::Codex, PUSH_READY_DELAY);
+        let sender = spawn_peer_inbox_ack_sender(sent_ctx.clone());
+        assert_eq!(request_peer_inbox_consumed(&sent_ctx, Some(11)), "sent");
+        sender.finish();
+        assert_eq!(sent_requests.lock().unwrap().len(), 1);
+
+        let (sync_ctx, sync_requests) =
+            connected_ctx_with_requests(PeerClientKind::Codex, PUSH_READY_DELAY);
+        *sync_ctx.peer_inbox_request_sender.lock().unwrap() = PeerInboxRequestRoute::Sync;
+        assert_eq!(
+            request_peer_inbox_consumed(&sync_ctx, Some(12)),
+            "sent_sync_fallback"
+        );
+        assert_eq!(sync_requests.lock().unwrap().len(), 1);
+
+        let unavailable_ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
+        assert_eq!(
+            request_peer_inbox_consumed(&unavailable_ctx, Some(13)),
+            "rejected_sender_unavailable"
+        );
+    }
+
+    #[test]
+    fn rejected_consumed_request_keeps_ack_response_unchanged() {
+        let mut ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
+        ctx.request_sink = Some(Arc::new(Mutex::new(Vec::new())));
+        ctx.request_sink_response = Some(Response::Err {
+            message: "parse error: unknown variant peer_inbox_consumed".into(),
+            code: Some(ipc::err_code::PARSE.into()),
+        });
+        *ctx.peer_inbox_request_sender.lock().unwrap() = PeerInboxRequestRoute::Sync;
+        queue_pull_message(
+            &ctx.inbox,
+            QueuedPeerMessage {
+                delivery_id: Some(88),
+                from_id: "2".into(),
+                from_name: None,
+                from_kind: Some(PeerClientKind::Claude),
+                body: "stable bytes".into(),
+                sent_at: "2026-09-06T12:40:00Z".into(),
+            },
+        );
+        let first = handle_check_messages_inner(&json!(1), &json!({}), &ctx).response;
+        let message_id = first
+            .pointer("/result/structuredContent/delivery/message_id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let token = first
+            .pointer("/result/structuredContent/delivery/ack_token")
+            .and_then(Value::as_str)
+            .unwrap();
+        let expected = acknowledged_check_messages_response(&json!(2), message_id, 0);
+
+        let actual = handle_check_messages(
+            &json!(2),
+            &json!({"ack": {"message_id": message_id, "token": token}}),
+            &ctx,
+        );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reconcile_reports_held_and_unreported_then_clears_reported_ids() {
+        let (ctx, requests) = connected_ctx_with_requests(PeerClientKind::Codex, PUSH_READY_DELAY);
+        queue_pull_message(
+            &ctx.inbox,
+            QueuedPeerMessage {
+                delivery_id: Some(41),
+                from_id: "2".into(),
+                from_name: None,
+                from_kind: None,
+                body: "held".into(),
+                sent_at: "now".into(),
+            },
+        );
+        retain_unreported_consumed(&ctx, 42);
+
+        assert!(reconcile_peer_inbox(&ctx));
+
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            &[Request::PeerInboxReconcile {
+                pane_id: 1,
+                held: vec![41],
+                consumed: vec![42],
+                held_overflow: 0,
+                consumed_overflow: 0,
+            }]
+        );
+        assert!(ctx.unreported_consumed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_reconcile_retains_unreported_consumed_for_next_connection() {
+        let mut ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
+        ctx.request_sink = Some(Arc::new(Mutex::new(Vec::new())));
+        ctx.request_sink_response = Some(Response::Err {
+            message: "older server".into(),
+            code: Some(ipc::err_code::PARSE.into()),
+        });
+        retain_unreported_consumed(&ctx, 52);
+
+        assert!(!reconcile_peer_inbox(&ctx));
+        assert_eq!(ctx.unreported_consumed.lock().unwrap().as_slices().0, &[52]);
+    }
+
+    #[test]
+    fn push_peer_does_not_send_reconcile() {
+        let (ctx, requests) = connected_ctx_with_requests(PeerClientKind::Claude, PUSH_READY_DELAY);
+        assert!(reconcile_peer_inbox(&ctx));
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reconcile_caps_held_ids_and_marks_overflow() {
+        let (ctx, requests) = connected_ctx_with_requests(PeerClientKind::Codex, PUSH_READY_DELAY);
+        for delivery_id in 1..=257 {
+            queue_pull_message(
+                &ctx.inbox,
+                QueuedPeerMessage {
+                    delivery_id: Some(delivery_id),
+                    from_id: "2".into(),
+                    from_name: None,
+                    from_kind: None,
+                    body: "held".into(),
+                    sent_at: "now".into(),
+                },
+            );
+        }
+        assert!(reconcile_peer_inbox(&ctx));
+        match &requests.lock().unwrap()[0] {
+            Request::PeerInboxReconcile {
+                held,
+                held_overflow,
+                ..
+            } => {
+                assert_eq!(held.len(), UNREPORTED_CONSUMED_CAP);
+                assert_eq!(*held_overflow, 1);
+            }
+            other => panic!("expected reconcile request, got {other:?}"),
+        };
     }
 
     #[test]
@@ -7475,19 +7986,20 @@ Commands:
         let ctx = connected_ctx_with_kind(new_event_sink(), PeerClientKind::Codex);
         for event in events.try_iter() {
             if let ipc::Event::PeerInbox {
+                delivery_id,
                 target_pane,
                 from_pane,
                 from_name,
                 from_kind,
                 body,
                 ts_ms,
-                ..
             } = event
             {
                 assert_eq!(target_pane, codex_id);
                 queue_pull_message(
                     &ctx.inbox,
                     QueuedPeerMessage {
+                        delivery_id,
                         from_id: from_pane.to_string(),
                         from_name,
                         from_kind,

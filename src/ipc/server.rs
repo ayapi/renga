@@ -723,6 +723,28 @@ fn dispatch_request_with_registry(
             delivery_id,
             reply,
         }),
+        Request::PeerInboxConsumed {
+            pane_id,
+            delivery_id,
+        } => forward_unit(command_tx, |reply| AppCommand::PeerInboxConsumed {
+            pane_id,
+            delivery_id,
+            reply,
+        }),
+        Request::PeerInboxReconcile {
+            pane_id,
+            held,
+            consumed,
+            held_overflow,
+            consumed_overflow,
+        } => forward_unit(command_tx, |reply| AppCommand::PeerInboxReconcile {
+            pane_id,
+            held,
+            consumed,
+            held_overflow,
+            consumed_overflow,
+            reply,
+        }),
         Request::PeerInboxHeadAcknowledged {
             pane_id,
             remaining,
@@ -1403,6 +1425,67 @@ mod tests {
             Request::PeerInboxAck {
                 pane_id: 19,
                 delivery_id: 23,
+            },
+            &command_tx,
+        );
+        assert!(matches!(response, Response::Ok { .. }));
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn peer_inbox_consumed_is_forwarded_with_both_identifiers() {
+        let (command_tx, command_rx) = mpsc::channel();
+        let responder = thread::spawn(move || match command_rx.recv().unwrap() {
+            AppCommand::PeerInboxConsumed {
+                pane_id,
+                delivery_id,
+                reply,
+            } => {
+                assert_eq!(pane_id, 19);
+                assert_eq!(delivery_id, 23);
+                reply.send(Ok(())).unwrap();
+            }
+            other => panic!("expected peer consumed request, got {other:?}"),
+        });
+        let response = dispatch_request(
+            Request::PeerInboxConsumed {
+                pane_id: 19,
+                delivery_id: 23,
+            },
+            &command_tx,
+        );
+        assert!(matches!(response, Response::Ok { .. }));
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn peer_inbox_reconcile_is_forwarded() {
+        let (command_tx, command_rx) = mpsc::channel();
+        let responder = thread::spawn(move || match command_rx.recv().unwrap() {
+            AppCommand::PeerInboxReconcile {
+                pane_id,
+                held,
+                consumed,
+                held_overflow,
+                consumed_overflow,
+                reply,
+            } => {
+                assert_eq!(pane_id, 19);
+                assert_eq!(held, vec![23]);
+                assert_eq!(consumed, vec![22]);
+                assert_eq!(held_overflow, 2);
+                assert_eq!(consumed_overflow, 1);
+                reply.send(Ok(())).unwrap();
+            }
+            other => panic!("expected peer reconcile request, got {other:?}"),
+        });
+        let response = dispatch_request(
+            Request::PeerInboxReconcile {
+                pane_id: 19,
+                held: vec![23],
+                consumed: vec![22],
+                held_overflow: 2,
+                consumed_overflow: 1,
             },
             &command_tx,
         );

@@ -167,3 +167,33 @@ not re-emitted while the pane is unready and returns
 Requeued entries retain their original `delivery_id`, so a late receipt removes
 the queued entry before another flush, or confirms the same id after a flush;
 it never turns the already retained body into a second local delivery.
+
+### Post-handover loss detection (renga-vtl)
+
+For Codex pull peers, App tracking now continues after `peer_inbox_ack`: the
+handover ledger retains `(delivery_id, from_pane, from_name, body, ts_ms)` until
+the matching `peer_inbox_consumed` request arrives from a successful
+`check_messages` head ack. Consumed reports share the asynchronous receipt FIFO;
+ids whose report has not succeeded remain in a bounded process-local set. On
+reconnect, `peer_inbox_reconcile` compares held and unreported-consumed ids
+before readiness flushes new messages. Per-registration generations keep a
+newly flushed delivery out of an older reconciliation snapshot. Missing ids,
+pane closure, or a 30-second subscriber disconnect drain the applicable ledger
+entries as lost. A bounded consumed-id tombstone queue remains as insurance
+against unexpected command reordering. Each lost entry emits
+`peer_message_lost` and routes this sender notice through normal peer delivery:
+
+`Peer message to pane N was lost before it was read: its MCP peer restarted (reason: R). Sent at HH:MM:SS, delivery D, body began: <first 40 chars>. Resend if still needed.`
+
+The App trace actions are `peer_handover_tracked`,
+`peer_handover_consumed`, `peer_handover_lost` (with `reason` and `count`),
+`peer_handover_reconciled`, `peer_handover_disconnect_timeout`, and
+`peer_loss_notice_sent` (or `peer_loss_notice_dropped` when the sender no longer
+exists). The mcp-peer traces `peer_inbox_consumed_unreported`,
+`peer_inbox_consumed_queued`, `peer_inbox_consumed_sent`, and reconciliation
+counts/overflow; the `check_messages` record also includes
+`consumed_after_ack`. The log remains completely silent when
+`RENGA_DEBUG_CODEX_PEER_LOG` is unset. If the process dies after popping a local
+head but before retaining its id in the unreported set, reconciliation can still
+classify that already-read message as lost; this is the sole unavoidable
+false-positive window.

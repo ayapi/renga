@@ -179,6 +179,12 @@ Codex への配送は pane-driven です。renga が `check_messages` を促す 
 
 ack 後にも pull inbox にメッセージが残る場合、renga は best-effort で follow-up nudge を 1 回要求します。`pending_after > 0` なら直ちに `check_messages({})` を再実行してください。起動中の古い TUI がこの要求に対応しない場合があるため、fallback の nudge を待たないでください。
 
+peer 配送が失われたという system message が届いた場合、Codex の mcp-peer は
+本文を保持済みでしたが、再起動後の reconcile で見つからない、切断が 30 秒
+続く、または pane が閉じています。renga は本文を自動再送しません。通知の
+delivery id・送信時刻・本文先頭を確認し、まだ必要なら再送
+してください。
+
 `check_messages` で受け取った本文が実際の peer 依頼です。単に返事を返すためのチャットではなく、人間からの依頼に近い peer 指示として扱うのが前提です。調査、pane 操作、tool 実行、コード編集などを頼まれたなら、その作業自体を進めてください。
 
 ### Codex の `pending messages` 表示が残るのに `check_messages` は 0 件
