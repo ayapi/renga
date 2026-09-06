@@ -2920,6 +2920,32 @@ fn working_file_count_transcript_is_not_native_queue_busy() {
 }
 
 #[test]
+fn working_duration_prefix_followed_by_prose_is_not_native_queue_busy() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[HWorking (2m ago) was the last note in the log.\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex to do anything\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
+    );
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "duration prefix transcript".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
+    ));
+    app.shutdown();
+}
+
+#[test]
 fn transcript_thinking_without_numeric_elapsed_is_not_busy() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     seed_pane_screen(

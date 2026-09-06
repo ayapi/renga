@@ -2593,6 +2593,10 @@ mod debug_logging_tests {
         );
         assert_eq!(codex_status_label_for_debug("messagewithfoo(3)"), None);
         assert_eq!(codex_status_label_for_debug("reticulating(12files)"), None);
+        assert_eq!(
+            codex_status_label_for_debug("gpt-5.6-sol(12s•esctointerrupt)"),
+            None
+        );
         assert_eq!(codex_status_label_for_debug("ordinarytranscript"), None);
     }
 }
