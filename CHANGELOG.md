@@ -107,12 +107,13 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Fixed
 
-- **Codex peer nudges now use the native Tab queue while Codex is waiting for
-  a background terminal.** The anchored `Waiting for background terminal
-  (<elapsed> • esc to interrupt)` status is recognized alongside `Working`,
-  while the Tab press still requires Codex's own `tab to queue message` footer.
-  This prevents long-running background commands from delaying peer requests
-  until the turn ends. (renga-r2a)
+- **Codex peer nudges now recognize busy `Working`, `Thinking`, and `Waiting
+  for background terminal` statuses even when narrow panes truncate the
+  `esc to interrupt` suffix.** Recognition requires an anchored label followed
+  by a numeric elapsed time; Enter stays blocked while the status remains, and
+  Tab still requires Codex's own `tab to queue message` footer. This prevents
+  long-running background commands from delaying peer requests until the turn
+  ends without introducing a mid-turn Enter race. (renga-r2a)
 
 - **`send_message` now reports focused Codex confirmation waits accurately.**
   The additive `pending_user_confirmation` outcome renders as

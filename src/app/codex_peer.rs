@@ -522,20 +522,37 @@ fn raw_screen_rows(screen: &vt100::Screen, start: u16, end: u16) -> String {
 }
 
 fn codex_native_queue_status_label(status: &str) -> Option<&'static str> {
-    const LABELS: [(&str, &str); 2] = [
+    const LABELS: [(&str, &str); 3] = [
         ("working", "Working"),
+        ("thinking", "Thinking"),
         (
             "waitingforbackgroundterminal",
             "Waiting for background terminal",
         ),
     ];
 
+    let joined_status = status.replace('\n', "");
     status.lines().find_map(|line| {
         let status_text = line.trim_start_matches(|ch: char| !ch.is_alphanumeric());
         LABELS.iter().find_map(|(normalized, label)| {
             let body = status_text.strip_prefix(normalized)?.strip_prefix('(')?;
-            let (elapsed, _) = body.split_once("•esctointerrupt)")?;
-            (!elapsed.is_empty()).then_some(*label)
+            if !body.starts_with(|ch: char| ch.is_ascii_digit()) {
+                return None;
+            }
+            let interrupt_phrase_wraps =
+                !status_text.contains("esctointerrupt") && joined_status.contains("esctointerrupt");
+            (!interrupt_phrase_wraps).then_some(*label)
+        })
+    })
+}
+
+fn codex_status_label_for_debug(status: &str) -> Option<&'static str> {
+    codex_native_queue_status_label(status).or_else(|| {
+        status.lines().find_map(|line| {
+            let status_text = line.trim_start_matches(|ch: char| !ch.is_alphanumeric());
+            let (_, body) = status_text.split_once('(')?;
+            body.starts_with(|ch: char| ch.is_ascii_digit())
+                .then_some("unknown")
         })
     })
 }
@@ -589,11 +606,11 @@ fn analyze_codex_peer_screen(
     } else {
         (String::new(), String::new())
     };
-    // Positive detection controls whether renga may inject and press Tab, so
-    // anchor the busy signal above the composer and the queue action below it.
-    // Transcript mentions and unknown future UI safely remain pending.
-    let native_queue_status_label = codex_native_queue_status_label(&status);
-    let native_queue_busy = native_queue_status_label.is_some();
+    // Positive detection controls whether renga may inject, so anchor known
+    // busy labels above the composer and require a numeric elapsed value.
+    // The queue action remains independently anchored below the composer.
+    let native_queue_status_label = codex_status_label_for_debug(&status);
+    let native_queue_busy = native_queue_status_label.is_some_and(|label| label != "unknown");
     // A partial or unfamiliar interrupt status is not enough evidence to use
     // Codex's native queue, but it is enough to reject the idle path. This
     // keeps wrapped or renamed status text from causing an Enter mid-turn.
@@ -605,13 +622,16 @@ fn analyze_codex_peer_screen(
     // completion signal is that the prompt remains visible while the busy
     // status above it has disappeared. QueueAt separately requires the exact
     // injected composer text before this may result in Enter.
-    let can_submit_injected_message =
-        prompt_row.is_some() && !screen.hide_cursor() && !interrupt_status_visible;
+    let can_submit_injected_message = prompt_row.is_some()
+        && !screen.hide_cursor()
+        && !interrupt_status_visible
+        && !native_queue_busy;
     let ready_without_prompt = prompt_row.is_none() && {
         let screen_text = normalized_screen_rows(screen, 0, rows);
         screen_text.contains("entertosend") || screen_text.contains("readyforinput")
     };
     let ready_for_nudge = !interrupt_status_visible
+        && !native_queue_busy
         && screen_has_visible_text(screen)
         && (codex_prompt_allows_peer_nudge_on_screen(screen).unwrap_or(ready_without_prompt));
     CodexPeerScreenSnapshot {
@@ -2519,5 +2539,14 @@ mod debug_logging_tests {
             normal.composer,
             Some(normalize_codex_composer_expected(message))
         );
+    }
+
+    #[test]
+    fn debug_status_label_distinguishes_unknown_and_absent() {
+        assert_eq!(
+            codex_status_label_for_debug("◦reticulating(12s•esctointerrupt)"),
+            Some("unknown")
+        );
+        assert_eq!(codex_status_label_for_debug("ordinarytranscript"), None);
     }
 }

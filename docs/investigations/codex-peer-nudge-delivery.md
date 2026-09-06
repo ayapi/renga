@@ -367,17 +367,28 @@ Codex CLI v0.153.4 の実機で同じ状態を作り、composer 空では footer
 `tab to queue message                98% context left` に変わることを確認した。
 したがって Codex 自身がこの状態でも native queue を提供している。
 
-認識する status label は現在次の2つ。
+狭いペインでは同じ status が次のように末尾省略されることも実測した。
+
+```text
+◦ Waiting for background terminal (1m 24s • esc to inte…
+```
+
+この場合も busy と認識できないと idle の Enter 経路が開く。そのため認識条件は
+完全な `esc to interrupt` ではなく、prompt 上の status 行が既知 label と
+数字で始まる elapsed を持つこととする。認識する status label は現在次の3つ。
 
 - `Working`
+- `Thinking`
 - `Waiting for background terminal`
 
-どちらも prompt 上の status 行に `<label> (<elapsed> • esc to interrupt)` の形で
-現れる必要がある。実際に Tab を押す条件は従来どおり composer 下の
-`tab to queue message` footer で二重に確認する。transcript 内の同じ文言、途中で
-折り返された status、未知の label は自動経路に使わない。`Thinking` は今回の
-実測では queue footer を確認できなかったため、引き続き未知として扱う。
+いずれも prompt 上の status 行が `<label> (<数字>` で始まる必要がある。
+認識済み status が残る間は Enter を許可しない。実際に Tab を押す条件は従来どおり
+composer 下の `tab to queue message` footer で二重に確認する。transcript 内の
+`Thinking (see below)` のような数字で始まらない文言、途中で折り返された status、
+未知の label は native queue に使わない。未知 label でも完全な
+`esc to interrupt` が見える場合は従来どおり Enter を拒否する。
 
 debug trace には `native_queue_status_label` を追加した。認識済みなら上記 label、
-未知または該当 status がなければ `null` を記録する。環境変数
+数字 elapsed を持つ未知 label なら `unknown`、該当 status がなければ `null` を
+記録する。環境変数
 `RENGA_DEBUG_CODEX_PEER_LOG` が未設定なら、従来どおり trace は出力しない。

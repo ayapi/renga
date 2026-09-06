@@ -1698,7 +1698,7 @@ fn persistently_unknown_screen_surfaces_notification_on_focus() {
 }
 
 #[test]
-fn recognized_unactionable_screen_eventually_surfaces_on_focus() {
+fn unknown_unactionable_screen_eventually_surfaces_on_focus() {
     let mut app = App::new(40, 160).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
     let codex_id = app
@@ -1719,7 +1719,7 @@ fn recognized_unactionable_screen_eventually_surfaces_on_focus() {
     seed_pane_screen(
         &mut app,
         codex_id,
-        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Thinking (12s \xE2\x80\xA2 esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Reticulating (12s \xE2\x80\xA2 esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex anything...\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
     );
     {
         let pane = app.ws().panes.get(&codex_id).expect("pane");
@@ -2622,6 +2622,32 @@ fn busy_codex_uses_structured_status_row() {
 }
 
 #[test]
+fn thinking_status_uses_native_queue() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[H\xE2\x97\xA6 Thinking (12s \xE2\x80\xA2 esc to interrupt)\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex to do anything\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
+    );
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "thinking status".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::QueueAt { .. })
+    ));
+    app.shutdown();
+}
+
+#[test]
 fn waiting_for_background_terminal_field_status_uses_native_queue() {
     let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
     let status = "• Waiting for background terminal (8m 55s • esc to interrupt) · 1 background terminal running · /ps to view · /st…";
@@ -2689,6 +2715,95 @@ fn waiting_for_background_terminal_field_status_uses_native_queue() {
         b"\t",
         "Codex's queue hint must gate the Tab commit"
     );
+    app.shutdown();
+}
+
+#[test]
+fn truncated_known_busy_status_never_falls_through_to_enter() {
+    for status in [
+        "◦ Waiting for background terminal (1m 24s • esc to inte…",
+        "◦ Thinking (48s • esc to inte…",
+    ] {
+        let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+        let empty_screen = format!(
+            "\x1b[?25h\x1b[2J\x1b[H{status}\x1b[4;1H\u{203a} \x1b[2mAsk Codex to do anything\x1b[22m\x1b[6;1H  gpt-5.6-sol medium \u{b7} cwd\x1b[4;3H"
+        );
+        seed_pane_screen(&mut app, codex_id, empty_screen.as_bytes());
+        app.handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Id(codex_id),
+            "truncated busy status".to_string(),
+        )
+        .expect("peer send");
+        app.flush_pending_codex_peer_messages();
+        assert!(matches!(
+            app.pending_codex_peer_messages
+                .get(&codex_id)
+                .and_then(|q| q.front()),
+            Some(PendingCodexPeerDelivery::QueueAt { .. })
+        ));
+
+        let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+            from_pane: sender_id,
+            from_name: None,
+            from_kind: None,
+        });
+        let draft_screen = format!(
+            "\x1b[?25h\x1b[2J\x1b[H{status}\x1b[4;1H\u{203a} {expected}\x1b[8;1H  gpt-5.6-sol medium \u{b7} cwd\x1b[4;{}H",
+            expected.chars().count() + 3
+        );
+        seed_pane_screen(&mut app, codex_id, draft_screen.as_bytes());
+        app.ws_mut()
+            .panes
+            .get_mut(&codex_id)
+            .expect("pane")
+            .clear_test_input();
+        make_codex_native_queue_ready(&mut app, codex_id);
+
+        app.flush_pending_codex_peer_messages();
+
+        assert!(
+            !app.ws()
+                .panes
+                .get(&codex_id)
+                .expect("pane")
+                .test_input()
+                .contains(&b'\r'),
+            "a truncated {status} status must not select Enter before the Tab hint appears"
+        );
+        assert!(matches!(
+            app.pending_codex_peer_messages
+                .get(&codex_id)
+                .and_then(|q| q.front()),
+            Some(PendingCodexPeerDelivery::QueueAt { .. })
+        ));
+        app.shutdown();
+    }
+}
+
+#[test]
+fn transcript_thinking_without_numeric_elapsed_is_not_busy() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_pane_screen(
+        &mut app,
+        codex_id,
+        b"\x1b[?25h\x1b[2J\x1b[HThinking (see below) is transcript text, not a live status.\x1b[4;1H\xE2\x80\xBA \x1b[2mAsk Codex to do anything\x1b[22m\x1b[6;1Hgpt-5.6-sol medium \xC2\xB7 cwd\x1b[4;3H",
+    );
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "numeric elapsed required".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
+    ));
     app.shutdown();
 }
 
