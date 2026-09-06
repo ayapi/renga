@@ -347,7 +347,7 @@ debug JSONL では mcp-peer の `check_messages` record の `renudge_after_ack` 
 
 ---
 
-## 9. 追補: background terminal 待機中の native queue（2026-09-06）
+## 10. 追補: background terminal 待機中の native queue（2026-09-06）
 
 gameocr のフィールド trace で、非フォーカス・composer 空の Codex が次の表示のまま
 25分20秒 peer nudge を受け取れない事例を捕捉した。
