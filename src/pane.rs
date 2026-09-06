@@ -1521,9 +1521,7 @@ fn extract_osc7(data: &[u8]) -> Option<PathBuf> {
     while let Some(relative_start) = find_subslice(&data[search_from..], MARKER) {
         let start = search_from + relative_start + MARKER.len();
         let rest = &data[start..];
-        let Some((end, after_terminator)) = find_osc_terminator(rest, 0) else {
-            return None;
-        };
+        let (end, after_terminator) = find_osc_terminator(rest, 0)?;
         if let Ok(uri) = std::str::from_utf8(&rest[..end]) {
             if let Some(path) = parse_osc7_uri(uri) {
                 return Some(path);
