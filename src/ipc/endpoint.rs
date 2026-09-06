@@ -52,6 +52,16 @@ pub fn endpoint_for_pid(pid: u32) -> Result<EndpointName> {
     }
 }
 
+/// Extract the owning renga TUI process id from a published IPC endpoint.
+///
+/// Accept both endpoint shapes so shared trace readers can correlate records
+/// regardless of the platform that produced them.
+pub(crate) fn tui_pid_from_endpoint(endpoint: &str) -> Option<u32> {
+    let name = endpoint.rsplit(['/', '\\']).next()?;
+    let name = name.strip_suffix(".sock").unwrap_or(name);
+    name.strip_prefix("renga-")?.parse().ok()
+}
+
 #[cfg(unix)]
 fn unix_socket_dir() -> Result<PathBuf> {
     // XDG_RUNTIME_DIR (set by systemd-logind and many others) is the
@@ -161,6 +171,31 @@ mod tests {
     fn endpoint_for_pid_includes_pid() {
         let ep = endpoint_for_pid(12345).unwrap();
         assert!(ep.as_str().contains("12345"), "{}", ep.as_str());
+    }
+
+    #[test]
+    fn tui_pid_parses_windows_endpoint_shape() {
+        assert_eq!(tui_pid_from_endpoint(r"\\.\pipe\renga-12345"), Some(12345));
+    }
+
+    #[test]
+    fn tui_pid_parses_unix_endpoint_shape() {
+        assert_eq!(
+            tui_pid_from_endpoint("/tmp/renga-1000/renga-67890.sock"),
+            Some(67890)
+        );
+    }
+
+    #[test]
+    fn tui_pid_rejects_unrecognized_endpoint_shape() {
+        for endpoint in [
+            "garbage",
+            r"\\.\pipe\renga-not-a-pid",
+            "/tmp/renga-12.sock.extra",
+            "/tmp/renga-.sock",
+        ] {
+            assert_eq!(tui_pid_from_endpoint(endpoint), None, "{endpoint}");
+        }
     }
 
     #[cfg(windows)]

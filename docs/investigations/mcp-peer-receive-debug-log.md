@@ -33,6 +33,13 @@ temporary failure recovers.
 The `component: "mcp_peer"` field distinguishes this process's counter and
 records from TUI records appended to the same file.
 
+The record also carries `renga_socket`, the raw `RENGA_SOCKET` value or `null`,
+and `tui_pid`, parsed from the platform-specific `renga-PID` pipe or
+`renga-PID.sock` filename. Keep using `renga_socket_present` to distinguish an
+absent variable from a value whose endpoint shape could not be parsed. In a
+machine-wide shared trace, correlate `tui_pid` with the TUI records'
+`process_id` before comparing pane ids.
+
 ### `check_messages`
 
 - `call_shape`: `empty`, `cursor`, or `ack` according to the supplied arguments.

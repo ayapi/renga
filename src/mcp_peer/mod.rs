@@ -49,7 +49,9 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
 use crate::app::CLAUDE_PEER_LAUNCH_CMD;
-use crate::ipc::endpoint::{endpoint_from_env, EndpointName, ENV_SOCKET, ENV_TOKEN};
+use crate::ipc::endpoint::{
+    endpoint_from_env, tui_pid_from_endpoint, EndpointName, ENV_SOCKET, ENV_TOKEN,
+};
 use crate::ipc::{
     self, client, Direction, PaneInfo, PaneRef, PeerClientKind, PeerInfo, Request, Response,
 };
@@ -1103,6 +1105,10 @@ fn log_client_kind_resolution(
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis());
     let args: Vec<String> = std::env::args().collect();
+    let renga_socket =
+        std::env::var_os(ENV_SOCKET).map(|value| value.to_string_lossy().into_owned());
+    let renga_socket_present = renga_socket.is_some();
+    let tui_pid = renga_socket.as_deref().and_then(tui_pid_from_endpoint);
     let record = json!({
         "action": "client_kind_resolved",
         "version": env!("CARGO_PKG_VERSION"),
@@ -1119,7 +1125,9 @@ fn log_client_kind_resolution(
         "resolved_client_kind": kind_label(client_kind),
         "receive_mode": receive_mode_label(client_kind.receive_mode()),
         "renga_pane_id_present": std::env::var_os(ENV_PANE_ID).is_some(),
-        "renga_socket_present": std::env::var_os(ENV_SOCKET).is_some(),
+        "renga_socket_present": renga_socket_present,
+        "renga_socket": renga_socket,
+        "tui_pid": tui_pid,
         "renga_token_present": std::env::var_os(ENV_TOKEN).is_some(),
     });
     append_peer_debug_record(path, pane_id, record);
@@ -4602,6 +4610,12 @@ mod tests {
             unsafe { std::env::set_var(name, value) };
             Self { name, previous }
         }
+
+        fn unset(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe { std::env::remove_var(name) };
+            Self { name, previous }
+        }
     }
 
     impl Drop for EnvVarRestore {
@@ -6854,6 +6868,60 @@ Commands:
             std::process::id(),
             PEER_DEBUG_RECORD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn client_kind_resolved_records_socket_and_owning_tui_pid() {
+        let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let path = debug_test_path("client-kind-resolved-endpoint");
+
+        {
+            let _socket_restore =
+                EnvVarRestore::set(ENV_SOCKET, std::ffi::OsStr::new(r"\\.\pipe\renga-43210"));
+            log_client_kind_resolution(
+                Some(&path),
+                &Ok("codex".to_string()),
+                PeerClientKind::Codex,
+            );
+        }
+        {
+            let _socket_restore = EnvVarRestore::set(
+                ENV_SOCKET,
+                std::ffi::OsStr::new("/tmp/renga-1000/renga-54321.sock"),
+            );
+            log_client_kind_resolution(
+                Some(&path),
+                &Ok("codex".to_string()),
+                PeerClientKind::Codex,
+            );
+        }
+        {
+            let _socket_restore = EnvVarRestore::unset(ENV_SOCKET);
+            log_client_kind_resolution(
+                Some(&path),
+                &Err(std::env::VarError::NotPresent),
+                PeerClientKind::Claude,
+            );
+        }
+
+        let records = read_debug_records(&path);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["action"], "client_kind_resolved");
+        assert_eq!(records[0]["renga_socket"], r"\\.\pipe\renga-43210");
+        assert_eq!(records[0]["renga_socket_present"], true);
+        assert_eq!(records[0]["tui_pid"], 43210);
+        assert_eq!(
+            records[1]["renga_socket"],
+            "/tmp/renga-1000/renga-54321.sock"
+        );
+        assert_eq!(records[1]["renga_socket_present"], true);
+        assert_eq!(records[1]["tui_pid"], 54321);
+        assert_eq!(records[2]["renga_socket"], Value::Null);
+        assert_eq!(records[2]["renga_socket_present"], false);
+        assert_eq!(records[2]["tui_pid"], Value::Null);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
