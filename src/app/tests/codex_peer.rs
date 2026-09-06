@@ -4381,11 +4381,16 @@ fn handle_peer_list_excludes_caller_and_lists_siblings() {
             None,
         )
         .expect("split succeeds");
+    assert_eq!(
+        app.handle_peer_send(sender_id, &ipc::PaneRef::Id(sibling_id), "queued".into()),
+        Ok(ipc::PeerSendOutcome::Queued)
+    );
     let peers = app.handle_peer_list(sender_id).expect("peer list");
     assert_eq!(peers.len(), 1, "expected one sibling, got {peers:?}");
     assert_eq!(peers[0].id, sibling_id);
     assert_eq!(peers[0].name.as_deref(), Some("sibling"));
     assert_eq!(peers[0].role.as_deref(), Some("worker"));
+    assert_eq!(peers[0].pending_peer_messages, 1);
     // Caller must be excluded.
     assert!(
         peers.iter().all(|p| p.id != sender_id),
@@ -5266,5 +5271,74 @@ fn full_event_channel_never_reports_delivered_without_receipt() {
         .unwrap()
         .expect_err("dropped event must not deliver");
     assert_eq!(error.code, Some(ipc::err_code::PEER_DELIVERY_UNCONFIRMED));
+    app.shutdown();
+}
+
+#[test]
+fn pending_peer_message_count_combines_inbox_and_nudges_per_pane() {
+    let mut app = App::new(40, 120).expect("App::new");
+    let sender = app.ws().focused_pane_id;
+    let target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split target");
+    let other = app
+        .handle_split(
+            &ipc::PaneRef::Id(target),
+            ipc::Direction::Horizontal,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split other");
+    assert_eq!(
+        app.handle_peer_send(sender, &ipc::PaneRef::Id(target), "queued".into()),
+        Ok(ipc::PeerSendOutcome::Queued)
+    );
+    app.pending_codex_peer_messages.insert(
+        target,
+        VecDeque::from([PendingCodexPeerDelivery::Draft {
+            message: PendingCodexPeerMessage {
+                from_pane: sender,
+                from_name: None,
+                from_kind: None,
+            },
+            retries_remaining: 0,
+            stalled_since: Instant::now(),
+            delivery_sequence: None,
+        }]),
+    );
+
+    assert_eq!(app.pending_peer_message_count(target), 2);
+    assert_eq!(app.pending_peer_message_count(other), 0);
+    app.shutdown();
+}
+
+#[test]
+fn expired_submit_at_is_not_counted_and_is_removed_on_flush() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let pane_id = app.ws().focused_pane_id;
+    app.peer_client_kinds.insert(pane_id, PeerClientKind::Codex);
+    app.pending_codex_peer_messages.insert(
+        pane_id,
+        VecDeque::from([PendingCodexPeerDelivery::SubmitAt {
+            ready_at: Instant::now(),
+            expires_at: Instant::now(),
+            expected_composer: "will-not-match".into(),
+            expected_composer_raw: None,
+            delivery_sequence: None,
+        }]),
+    );
+
+    assert_eq!(app.pending_peer_message_count(pane_id), 0);
+    app.flush_pending_codex_peer_messages();
+    assert!(app.pending_codex_peer_messages[&pane_id].is_empty());
     app.shutdown();
 }

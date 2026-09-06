@@ -735,6 +735,10 @@ fn render_panes(app: &mut App, frame: &mut Frame, area: Rect) -> Option<(u16, u1
     let focus_target = app.ws().focus_target;
     let selection = app.selection.clone();
     let copy_mode = app.copy_mode.clone();
+    let pending_counts: std::collections::HashMap<usize, u32> = rects
+        .iter()
+        .map(|(pane_id, _)| (*pane_id, app.pending_peer_message_count(*pane_id)))
+        .collect();
     let mut caret: Option<(u16, u16)> = None;
     for (pane_id, rect) in rects {
         if let Some(pane) = app.ws().panes.get(&pane_id) {
@@ -749,7 +753,10 @@ fn render_panes(app: &mut App, frame: &mut Frame, area: Rect) -> Option<(u16, u1
                 is_focused,
                 pane_sel,
                 pane_copy_mode,
-                &claude_state,
+                (
+                    &claude_state,
+                    pending_counts.get(&pane_id).copied().unwrap_or(0),
+                ),
                 frame,
                 rect,
             );
@@ -815,10 +822,11 @@ fn render_single_pane(
     is_focused: bool,
     selection: Option<&crate::app::TextSelection>,
     copy_mode: Option<&crate::app::CopyModeState>,
-    claude_state: &crate::claude_monitor::ClaudeState,
+    pane_status: (&crate::claude_monitor::ClaudeState, u32),
     frame: &mut Frame,
     area: Rect,
 ) -> Option<(u16, u16)> {
+    let (claude_state, pending_peer_messages) = pane_status;
     // Cosmetic indicators (border accent, pane label) consume the
     // sticky `*_ever_seen()` latches, not the live title check —
     // Claude and Codex both rewrite their OSC titles to in-flight
@@ -875,11 +883,16 @@ fn render_single_pane(
         String::new()
     };
 
-    let pane_title = if is_focused {
+    let base_title = if is_focused {
         format!(" \u{25cf} {} [{}]{} ", label, pane.id, claude_suffix)
     } else {
         format!("   {} [{}]{} ", label, pane.id, claude_suffix)
     };
+    let pane_title = pane_title_with_pending(
+        &base_title,
+        pending_peer_messages,
+        area.width.saturating_sub(2) as usize,
+    );
 
     let title_style = if is_focused {
         if let Some(accent) = client_accent {
@@ -1923,6 +1936,55 @@ fn truncate_to_width(s: &str, max_width: usize) -> String {
         width += ch_width;
     }
     result
+}
+
+fn pane_title_with_pending(base: &str, pending: u32, max_width: usize) -> String {
+    if pending == 0 {
+        return truncate_to_width(base, max_width);
+    }
+    let badge = format!("[msg {pending}]");
+    let badge_width = unicode_width::UnicodeWidthStr::width(badge.as_str());
+    if badge_width >= max_width {
+        return truncate_to_width(&badge, max_width);
+    }
+    let prefix_width = max_width.saturating_sub(badge_width + 1);
+    format!(
+        "{} {badge}",
+        truncate_to_width(base.trim_end(), prefix_width)
+    )
+}
+
+#[cfg(test)]
+mod pane_title_pending_tests {
+    use super::pane_title_with_pending;
+
+    #[test]
+    fn omits_zero_pending_badge() {
+        assert_eq!(
+            pane_title_with_pending("   shell [1] ", 0, 30),
+            "   shell [1] "
+        );
+    }
+
+    #[test]
+    fn appends_pending_badge() {
+        assert_eq!(
+            pane_title_with_pending("   shell [1] ", 2, 30),
+            "   shell [1] [msg 2]"
+        );
+        assert_eq!(
+            pane_title_with_pending(" ● codex [1] ", 2, 30),
+            " ● codex [1] [msg 2]"
+        );
+    }
+
+    #[test]
+    fn narrow_title_prioritizes_pending_badge() {
+        assert_eq!(
+            pane_title_with_pending("   claude [123] status ", 2, 9),
+            "  [msg 2]"
+        );
+    }
 }
 
 fn vt100_color_to_ratatui(color: vt100::Color) -> Color {

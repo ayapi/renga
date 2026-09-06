@@ -79,6 +79,14 @@ Stable name lookups mean the orchestrator can address peers as `"secretary"` / `
 
 ## Pane control alongside peer messaging
 
+`list_panes` and `list_peers` include `pending_peer_messages`, the number of
+undelivered peer messages / nudges owned by each pane. It combines the
+pre-registration inbox with live Codex Draft, QueueAt, AwaitFocus, and SubmitAt
+stages; expired SubmitAt entries and a focused confirmation dialog are not
+counted. The same nonzero count appears as `[msg N]` in the pane title.
+An expired SubmitAt is simply removed because its body has already been placed
+in the composer; QueueAt keeps its existing clear-and-retry/notify fallback.
+
 When a worker lands on an interactive prompt, the orchestrator can stay in-band:
 
 - `inspect_pane(target="worker-1", lines=20)` to snapshot the visible state without asking the worker to describe itself.

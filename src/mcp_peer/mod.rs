@@ -1391,7 +1391,7 @@ fn tools_spec() -> Value {
     json!([
         {
             "name": "list_peers",
-            "description": "List other peer-enabled panes in the same renga tab. Each peer includes id, optional name / role, cwd, and when known the client kind and whether it receives messages via push or polling.",
+            "description": "List other peer-enabled panes in the same renga tab. Each peer includes id, optional name / role, cwd, pending_peer_messages (undelivered peer messages / nudges owned by that pane), and when known the client kind and whether it receives messages via push or polling.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1460,7 +1460,7 @@ fn tools_spec() -> Value {
         },
         {
             "name": "list_panes",
-            "description": "List every pane in the current renga tab, with stable id, optional name / role, focused flag, terminal geometry, cwd, and when known the peer client kind / receive mode. Complements list_peers (which only returns other panes and hides geometry).",
+            "description": "List every pane in the current renga tab, with stable id, optional name / role, focused flag, terminal geometry, cwd, pending_peer_messages (undelivered peer messages / nudges owned by that pane), and when known the peer client kind / receive mode. Complements list_peers (which only returns other panes and hides geometry).",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -1798,6 +1798,10 @@ fn format_peer_list(peers: &[PeerInfo]) -> String {
     let mut out = String::from("Peers in this tab:\n\n");
     for p in peers {
         out.push_str(&format!("- id={}", p.id));
+        out.push_str(&format!(
+            " pending_peer_messages={}",
+            p.pending_peer_messages
+        ));
         if let Some(name) = &p.name {
             out.push_str(&format!(" name={name}"));
         }
@@ -2508,6 +2512,10 @@ fn format_pane_list(panes: &[PaneInfo]) -> String {
     let mut out = String::from("Panes in this tab:\n\n");
     for p in panes {
         out.push_str(&format!("- id={}", p.id));
+        out.push_str(&format!(
+            " pending_peer_messages={}",
+            p.pending_peer_messages
+        ));
         if let Some(name) = &p.name {
             out.push_str(&format!(" name={name}"));
         }
@@ -4798,6 +4806,7 @@ mod tests {
         let panes = vec![
             PaneInfo {
                 id: 1,
+                pending_peer_messages: 3,
                 name: Some("leader".into()),
                 role: Some("foreman".into()),
                 focused: true,
@@ -4812,6 +4821,7 @@ mod tests {
             },
             PaneInfo {
                 id: 2,
+                pending_peer_messages: 0,
                 name: None,
                 role: None,
                 focused: false,
@@ -4827,12 +4837,30 @@ mod tests {
         ];
         let text = format_pane_list(&panes);
         assert!(text.contains("id=1"));
+        assert!(text.contains("pending_peer_messages=3"));
         assert!(text.contains("name=leader"));
         assert!(text.contains("role=foreman"));
         assert!(text.contains("(focused)"));
         assert!(text.contains("width=80"));
         assert!(text.contains("id=2"));
         assert!(!text.contains("id=2 name"));
+    }
+
+    #[test]
+    fn format_peer_list_includes_pending_count() {
+        let peers = vec![PeerInfo {
+            id: 2,
+            pending_peer_messages: 4,
+            name: Some("worker".into()),
+            role: None,
+            cwd: None,
+            kind: Some(PeerClientKind::Codex),
+            receive_mode: Some(ipc::PeerReceiveMode::Pull),
+            summary: None,
+        }];
+
+        let text = format_peer_list(&peers);
+        assert!(text.contains("id=2 pending_peer_messages=4"), "{text}");
     }
 
     #[test]

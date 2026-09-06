@@ -68,6 +68,9 @@ Claude B の次のターンのコンテキストに `<channel source="renga-peer
 
 ## ペイン操作を組み合わせる
 
+`list_panes` と `list_peers` の `pending_peer_messages` は、各ペインが抱える未配送の peer メッセージ / nudge 件数です。登録待ち inbox と Codex の Draft / QueueAt / AwaitFocus / SubmitAt を合算します。期限切れの SubmitAt と、フォーカス中の確認ダイアログへ移った通知は数えません。0 より大きい同じ件数をペインタイトルへ `[msg N]` と表示します。
+SubmitAt は本文がすでに composer に入っているため、期限切れ時はそのエントリだけを削除します。QueueAt は従来どおり、composer を消して再試行または通知へ移す処理を行います。
+
 ワーカーが対話プロンプトで止まった場合も、オーケストレータは会話の中で完結できます:
 
 - `inspect_pane(target="worker-1", lines=20)` でワーカー自身に画面状態を語らせずにスナップショット

@@ -368,6 +368,10 @@ fn list_includes_pane_cwd() {
 fn list_command_includes_rect_from_last_pane_rects() {
     let mut app = App::new(40, 80).expect("App::new");
     let pane_id = app.ws().focused_pane_id;
+    assert_eq!(
+        app.handle_peer_send(pane_id, &ipc::PaneRef::Id(pane_id), "queued".into()),
+        Ok(ipc::PeerSendOutcome::Queued)
+    );
     app.ws_mut().last_pane_rects = vec![(
         pane_id,
         Rect {
@@ -390,6 +394,7 @@ fn list_command_includes_rect_from_last_pane_rects() {
     assert_eq!(info.y, 3);
     assert_eq!(info.width, 50);
     assert_eq!(info.height, 20);
+    assert_eq!(info.pending_peer_messages, 1);
 }
 
 #[test]

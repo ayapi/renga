@@ -22,6 +22,7 @@ impl App {
                     let summary = pane.and_then(|p| p.summary.clone());
                     infos.push(PaneInfo {
                         id,
+                        pending_peer_messages: self.pending_peer_message_count(id),
                         name: name_by_id.get(&id).cloned(),
                         role,
                         focused: id == focused,
@@ -193,6 +194,7 @@ impl App {
                 let pane = ws.panes.get(&id);
                 PeerInfo {
                     id,
+                    pending_peer_messages: self.pending_peer_message_count(id),
                     name: name_by_id.get(&id).cloned(),
                     role: pane.and_then(|p| p.role.clone()),
                     cwd: pane.map(|p| p.cwd.to_string_lossy().to_string()),
@@ -296,6 +298,7 @@ impl App {
             .unwrap_or_default();
         Ok(PaneInfo {
             id: pane_id,
+            pending_peer_messages: self.pending_peer_message_count(pane_id),
             name: name_for_pane,
             role: pane.role.clone(),
             focused: ws.focused_pane_id == pane_id,
@@ -373,6 +376,7 @@ impl App {
             .unwrap_or_default();
         Ok(PaneInfo {
             id: pane_id,
+            pending_peer_messages: self.pending_peer_message_count(pane_id),
             name: name_for_pane,
             role: pane.role.clone(),
             focused: ws.focused_pane_id == pane_id,

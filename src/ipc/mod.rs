@@ -347,6 +347,9 @@ pub enum PeerSendOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub id: usize,
+    /// Undelivered peer messages / nudges for this pane.
+    #[serde(default)]
+    pub pending_peer_messages: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -371,6 +374,9 @@ pub struct PeerInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PaneInfo {
     pub id: usize,
+    /// Undelivered peer messages / nudges for this pane.
+    #[serde(default)]
+    pub pending_peer_messages: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Free-form label. Set via layout TOML `role = ...`, `renga split
@@ -901,6 +907,7 @@ mod tests {
     fn pane_info_role_is_omitted_when_none() {
         let info = PaneInfo {
             id: 1,
+            pending_peer_messages: 0,
             name: None,
             role: None,
             focused: false,
@@ -921,6 +928,7 @@ mod tests {
     fn pane_info_role_roundtrips_when_present() {
         let info = PaneInfo {
             id: 1,
+            pending_peer_messages: 3,
             name: Some("president".into()),
             role: Some("leader".into()),
             focused: true,
@@ -939,9 +947,30 @@ mod tests {
     }
 
     #[test]
+    fn peer_info_pending_count_roundtrips_and_legacy_defaults_to_zero() {
+        let info = PeerInfo {
+            id: 4,
+            pending_peer_messages: 2,
+            name: Some("worker".into()),
+            role: None,
+            cwd: None,
+            kind: Some(PeerClientKind::Codex),
+            receive_mode: Some(PeerReceiveMode::Pull),
+            summary: None,
+        };
+        let parsed: PeerInfo =
+            serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+        assert_eq!(parsed, info);
+
+        let legacy: PeerInfo = serde_json::from_str(r#"{"id":4}"#).unwrap();
+        assert_eq!(legacy.pending_peer_messages, 0);
+    }
+
+    #[test]
     fn pane_info_rect_fields_roundtrip() {
         let info = PaneInfo {
             id: 7,
+            pending_peer_messages: 0,
             name: Some("editor".into()),
             role: None,
             focused: false,
@@ -976,6 +1005,7 @@ mod tests {
         assert_eq!(parsed.y, 0);
         assert_eq!(parsed.width, 0);
         assert_eq!(parsed.height, 0);
+        assert_eq!(parsed.pending_peer_messages, 0);
     }
 
     #[test]
@@ -1267,6 +1297,7 @@ mod tests {
         // guarantees omission.
         let info = PaneInfo {
             id: 1,
+            pending_peer_messages: 0,
             name: None,
             role: None,
             focused: false,
@@ -1287,6 +1318,7 @@ mod tests {
     fn pane_info_includes_summary_when_set() {
         let info = PaneInfo {
             id: 1,
+            pending_peer_messages: 0,
             name: None,
             role: None,
             focused: false,

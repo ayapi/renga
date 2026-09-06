@@ -134,6 +134,7 @@ pub(crate) enum PendingCodexPeerDelivery {
     },
     SubmitAt {
         ready_at: Instant,
+        expires_at: Instant,
         expected_composer: String,
         expected_composer_raw: Option<String>,
         delivery_sequence: Option<u64>,
@@ -170,6 +171,31 @@ impl PendingCodexPeerDelivery {
                 delivery_sequence, ..
             } => *delivery_sequence,
         }
+    }
+}
+
+impl App {
+    /// Undelivered peer messages / nudges for `pane_id`: pre-registration
+    /// inbox entries plus live Codex delivery stages. Expired SubmitAt attempts are
+    /// stale bookkeeping and are deliberately excluded.
+    pub(crate) fn pending_peer_message_count(&self, pane_id: usize) -> u32 {
+        let now = Instant::now();
+        let inbox = self
+            .pending_peer_inbox
+            .get(&pane_id)
+            .map_or(0, VecDeque::len);
+        let nudges = self
+            .pending_codex_peer_messages
+            .get(&pane_id)
+            .map_or(0, |queue| {
+                queue
+                    .iter()
+                    .filter(|delivery| {
+                        !matches!(delivery, PendingCodexPeerDelivery::SubmitAt { expires_at, .. } if now >= *expires_at)
+                    })
+                    .count()
+            });
+        u32::try_from(inbox.saturating_add(nudges)).unwrap_or(u32::MAX)
     }
 }
 
@@ -1845,11 +1871,13 @@ impl App {
             *sequence
         });
         let ready_at = Instant::now() + CODEX_PEER_NUDGE_COMMIT_DELAY;
+        let expires_at = Instant::now() + CODEX_PEER_NUDGE_COMMIT_TIMEOUT;
         let expected_composer = normalize_codex_composer_expected(&payload_text);
         let queue = self.pending_codex_peer_messages.entry(pane_id).or_default();
         queue.clear();
         queue.push_back(PendingCodexPeerDelivery::SubmitAt {
             ready_at,
+            expires_at,
             expected_composer: expected_composer.clone(),
             expected_composer_raw: debug_path.as_ref().map(|_| payload_text.clone()),
             delivery_sequence,
@@ -1995,6 +2023,7 @@ impl App {
             *sequence
         });
         let ready_at = Instant::now() + CODEX_PEER_NUDGE_COMMIT_DELAY;
+        let expires_at = Instant::now() + CODEX_PEER_NUDGE_COMMIT_TIMEOUT;
         let expected_composer = normalize_codex_composer_expected(&payload_text);
         let queue = self
             .pending_codex_peer_messages
@@ -2003,6 +2032,7 @@ impl App {
         queue.clear();
         queue.push_back(PendingCodexPeerDelivery::SubmitAt {
             ready_at,
+            expires_at,
             expected_composer: expected_composer.clone(),
             expected_composer_raw: debug_path.as_ref().map(|_| payload_text.clone()),
             delivery_sequence,
@@ -2226,6 +2256,7 @@ impl App {
                                 .expect("codex peer draft payload");
                                 if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
                                     let ready_at = now + CODEX_PEER_NUDGE_COMMIT_DELAY;
+                                    let expires_at = now + CODEX_PEER_NUDGE_COMMIT_TIMEOUT;
                                     let expected_composer =
                                         normalize_codex_composer_expected(&payload_text);
                                     if let Some(path) = codex_peer_debug_log_path.as_deref() {
@@ -2236,7 +2267,7 @@ impl App {
                                                 delivery_sequence,
                                                 now,
                                                 ready_at: Some(ready_at),
-                                                expires_at: None,
+                                                expires_at: Some(expires_at),
                                                 expected_composer: Some(&expected_composer),
                                                 expected_composer_raw: Some(&payload_text),
                                                 screen: screen.as_ref(),
@@ -2252,6 +2283,7 @@ impl App {
                                     queue.pop_front();
                                     queue.push_front(PendingCodexPeerDelivery::SubmitAt {
                                         ready_at,
+                                        expires_at,
                                         expected_composer,
                                         expected_composer_raw: codex_peer_debug_log_path
                                             .as_ref()
@@ -2296,6 +2328,7 @@ impl App {
                         }
                         PendingCodexPeerDelivery::SubmitAt {
                             ready_at,
+                            expires_at,
                             expected_composer,
                             expected_composer_raw,
                             delivery_sequence,
@@ -2313,7 +2346,7 @@ impl App {
                                     delivery_sequence,
                                     now,
                                     ready_at: Some(ready_at),
-                                    expires_at: None,
+                                    expires_at: Some(expires_at),
                                     expected_composer: Some(&expected_composer),
                                     expected_composer_raw: expected_composer_raw.as_deref(),
                                     screen: screen.as_ref(),
@@ -2335,6 +2368,12 @@ impl App {
                             };
                             if now < ready_at {
                                 log_decision("submit_at_waiting_ready_at", true);
+                                continue;
+                            }
+                            if now >= expires_at {
+                                log_decision("submit_at_expired", false);
+                                queue.pop_front();
+                                self.dirty = true;
                                 continue;
                             }
                             if !composer_matches {

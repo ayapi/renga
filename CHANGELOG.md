@@ -11,6 +11,12 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Added
 
+- **Undelivered peer message visibility.** Pane titles now show a nonzero
+  `[msg N]` badge, and `list_panes` / `list_peers` include the additive
+  `pending_peer_messages` count. Stale Codex SubmitAt commit attempts now
+  expire instead of lingering after a composer mismatch. (renga-8r9,
+  renga-446)
+
 - **Trace-only peer push lifecycle records under
   `RENGA_DEBUG_CODEX_PEER_LOG`.** The App ready queue and mcp-peer push buffer
   now record queueing, initialization, subscription, flush, emission, cap drop,

@@ -50,7 +50,8 @@ must accept these instead of JSON-RPC errors.
 | `scope` (in) | `"machine"\|"directory"\|"repo"` | Optional; **ignored**. Accepted for wire-compat with `claude-peers-mcp`. renga always treats scope as the current tab. |
 
 Result: text content listing `id`, `name`, `role`, `kind` (`claude`/`codex`),
-`receive_mode` (`push`/`pull`), `cwd`. Empty case: `"No peers in this tab."`.
+`receive_mode` (`push`/`pull`), `cwd`, and `pending_peer_messages`. Empty case:
+`"No peers in this tab."`.
 
 **Detached fallback (frozen prefix)**: `"(no peers — renga not reachable from
 this peer client: <reason>)"`. Downstream may match on this prefix; it is part
@@ -217,7 +218,8 @@ Input: `{}`.
 
 Result: text describing every pane in the **current tab** (Q4): `id`, `name`,
 `role`, `focused`, geometry (`x`, `y`, `width`, `height`), `cwd`, `kind`,
-`receive_mode`. Geometry fields are `0` before the first layout pass.
+`receive_mode`, `pending_peer_messages`. Geometry fields are `0` before the
+first layout pass.
 
 ### 1.6 `spawn_pane` — stable
 
@@ -555,10 +557,17 @@ the server may predate effective-command reporting.
 
 `PaneInfo` payload (used by `list` data, `set_pane_identity` ok data, embedded
 in `peer_list` data):
-`{ id, name?, role?, focused, x, y, width, height, cwd?, kind?, receive_mode?, summary? }`.
+`{ id, pending_peer_messages, name?, role?, focused, x, y, width, height, cwd?, kind?, receive_mode?, summary? }`.
 
 `PeerInfo` = `PaneInfo` minus the focused flag and geometry (purposefully
 hidden from cross-pane callers).
+
+`pending_peer_messages` is the number of undelivered peer messages / nudges
+owned by that pane: `pending_peer_inbox[pane].len()` plus the live Draft,
+QueueAt, AwaitFocus, and SubmitAt entries in `pending_codex_peer_messages[pane]`.
+Expired SubmitAt entries are excluded. A notification already moved into the
+focused confirmation dialog is no longer in either queue and therefore counts
+as zero.
 
 ### 3.5 Event envelope — stable
 
@@ -717,6 +726,10 @@ specified in section 3.5.
   `null`, or confirmation that no action occurred. If a key qualifies as both
   optional-when-unset and additively introduced, use the conservative latter
   interpretation and treat its absence as unknown.
+- `PaneInfo.pending_peer_messages` and `PeerInfo.pending_peer_messages` are
+  **additively introduced**. Their serde default is `0` for compatibility when
+  reading older JSON; callers that need delivery certainty should treat an
+  absent key from an older server as unknown rather than confirmed empty.
 - **Unknown `peer_send.delivery` values** are unverified outcomes. The
   additively introduced `pending_user_confirmation` and `undeliverable` values
   therefore degrade to the documented unconfirmed result on older MCP clients;
