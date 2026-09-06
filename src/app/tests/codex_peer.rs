@@ -1,7 +1,7 @@
 use super::super::*;
 use crate::app::codex_peer::{
     codex_composer_has_draft_on_screen, normalized_codex_composer_text,
-    CODEX_PEER_DRAFT_STALL_TIMEOUT, CODEX_PEER_NUDGE_MAX_RETRIES,
+    CODEX_PEER_DRAFT_STALL_TIMEOUT, CODEX_PEER_NUDGE_COMMIT_TIMEOUT, CODEX_PEER_NUDGE_MAX_RETRIES,
 };
 
 fn seed_focused_pane_screen(app: &mut App, bytes: &[u8]) -> usize {
@@ -112,7 +112,15 @@ fn make_codex_submit_ready(app: &mut App, pane_id: usize) {
         .get_mut(&pane_id)
         .expect("pending nudge");
     match queue.front_mut().expect("pending delivery") {
-        PendingCodexPeerDelivery::SubmitAt { ready_at, .. } => *ready_at = Instant::now(),
+        PendingCodexPeerDelivery::SubmitAt {
+            ready_at,
+            expires_at,
+            ..
+        } => {
+            let now = Instant::now();
+            *ready_at = now;
+            *expires_at = now + CODEX_PEER_NUDGE_COMMIT_TIMEOUT;
+        }
         other => panic!("expected submit stage, got {other:?}"),
     }
 }

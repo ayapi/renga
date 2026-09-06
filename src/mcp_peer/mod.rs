@@ -4843,7 +4843,7 @@ mod tests {
         assert!(text.contains("(focused)"));
         assert!(text.contains("width=80"));
         assert!(text.contains("id=2"));
-        assert!(!text.contains("id=2 name"));
+        assert!(!text.contains("pending_peer_messages=0 name="));
     }
 
     #[test]
