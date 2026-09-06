@@ -629,8 +629,11 @@ impl MonitorWorker {
         if count == 0 {
             return;
         }
+        let Some(trace_path) = self.trace_path.as_deref() else {
+            return;
+        };
         write_worker_record(
-            self.trace_path.as_deref(),
+            Some(trace_path),
             serde_json::json!({
                 "action": "claude_monitor_request_dropped",
                 "count": count,
