@@ -5308,7 +5308,7 @@ mod tests {
 
     #[test]
     fn format_peer_list_omits_whitespace_only_summaries() {
-        for summary in ["   ", "\n"] {
+        for summary in ["   ", "\n", "\t", "\r\n"] {
             let peers = vec![PeerInfo {
                 id: 2,
                 pending_peer_messages: 0,
@@ -5353,7 +5353,7 @@ mod tests {
 
     #[test]
     fn format_pane_list_omits_whitespace_only_summaries() {
-        for summary in ["   ", "\n"] {
+        for summary in ["   ", "\n", "\t", "\r\n"] {
             let panes = vec![PaneInfo {
                 id: 1,
                 pending_peer_messages: 0,
@@ -5375,6 +5375,44 @@ mod tests {
                 "Panes in this tab:\n\n- id=1 pending_peer_messages=0\n  geometry: x=0 y=0 width=80 height=24\n"
             );
         }
+    }
+
+    #[test]
+    fn format_lists_preserve_padding_around_nonempty_summaries() {
+        let peers = vec![PeerInfo {
+            id: 2,
+            pending_peer_messages: 0,
+            name: None,
+            role: None,
+            cwd: None,
+            kind: None,
+            receive_mode: None,
+            summary: Some("  hi  ".into()),
+        }];
+        assert_eq!(
+            format_peer_list(&peers),
+            "Peers in this tab:\n\n- id=2 pending_peer_messages=0\n  summary:   hi  \n"
+        );
+
+        let panes = vec![PaneInfo {
+            id: 1,
+            pending_peer_messages: 0,
+            name: None,
+            role: None,
+            focused: false,
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+            cwd: None,
+            kind: None,
+            receive_mode: None,
+            summary: Some("  hi  ".into()),
+        }];
+        assert_eq!(
+            format_pane_list(&panes),
+            "Panes in this tab:\n\n- id=1 pending_peer_messages=0\n  geometry: x=0 y=0 width=80 height=24\n  summary:   hi  \n"
+        );
     }
 
     #[test]

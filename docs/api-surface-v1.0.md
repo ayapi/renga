@@ -159,7 +159,8 @@ from `RENGA_PANE_ID`) and surfaced as `summary` on every `PaneInfo` /
 in-memory only — does not persist across renga restarts.
 In the text rendering, a present summary appears as a `summary:` line after
 `cwd:`. That line replaces CR and LF characters with spaces and omits a
-whitespace-only summary; the `summary` value carried by IPC remains unchanged.
+whitespace-only summary. Whitespace in any other summary is printed as-is, and
+the `summary` value carried by IPC remains unchanged.
 
 - An empty string clears the summary (round-trips to `Option::None` /
   omitted key on the wire).
@@ -585,7 +586,8 @@ hidden from cross-pane callers).
 The MCP text renderings for `list_panes` and `list_peers` print a present
 `summary` as a `summary:` line immediately after `cwd:`. They replace CR and
 LF characters with spaces to keep the text on one line and omit whitespace-only
-summaries; the IPC `summary` value itself is unchanged.
+summaries. Whitespace in any other summary is printed as-is; the IPC `summary`
+value itself is unchanged.
 
 `pending_peer_messages` is the number of undelivered peer messages / nudges
 owned by that pane: `pending_peer_inbox[pane].len()` plus the live Draft,
