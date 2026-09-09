@@ -3,6 +3,7 @@ use super::*;
 pub(crate) const CODEX_APPEND_ENTER_DELAY: Duration = Duration::from_millis(75);
 pub(crate) const CODEX_PEER_NUDGE_COMMIT_DELAY: Duration = Duration::from_millis(1000);
 pub(crate) const CODEX_PEER_NUDGE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CODEX_PEER_NUDGE_RENDER_MAX_WAIT: Duration = Duration::from_secs(60);
 pub(crate) const CODEX_PEER_NUDGE_MAX_RETRIES: u8 = 1;
 static CODEX_PEER_DEBUG_RECORD_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -157,6 +158,8 @@ pub(crate) enum PendingCodexPeerDelivery {
         delivery_sequence: Option<u64>,
     },
     SubmitAt {
+        created_at: Instant,
+        observed_prefix_len: usize,
         ready_at: Instant,
         expires_at: Instant,
         expected_composer: String,
@@ -2341,6 +2344,8 @@ impl App {
         let queue = self.pending_codex_peer_messages.entry(pane_id).or_default();
         queue.clear();
         queue.push_back(PendingCodexPeerDelivery::SubmitAt {
+            created_at: Instant::now(),
+            observed_prefix_len: 0,
             ready_at,
             expires_at,
             expected_composer: expected_composer.clone(),
@@ -2496,6 +2501,8 @@ impl App {
             .or_default();
         queue.clear();
         queue.push_back(PendingCodexPeerDelivery::SubmitAt {
+            created_at: Instant::now(),
+            observed_prefix_len: 0,
             ready_at,
             expires_at,
             expected_composer: expected_composer.clone(),
@@ -2747,6 +2754,8 @@ impl App {
                                     }
                                     queue.pop_front();
                                     queue.push_front(PendingCodexPeerDelivery::SubmitAt {
+                                        created_at: now,
+                                        observed_prefix_len: 0,
                                         ready_at,
                                         expires_at,
                                         expected_composer,
@@ -2792,6 +2801,8 @@ impl App {
                             }
                         }
                         PendingCodexPeerDelivery::SubmitAt {
+                            created_at,
+                            observed_prefix_len,
                             ready_at,
                             expires_at,
                             expected_composer,
@@ -2835,7 +2846,35 @@ impl App {
                                 log_decision("submit_at_waiting_ready_at", true);
                                 continue;
                             }
-                            if now >= expires_at {
+                            // A growing normalized prefix is Codex drawing our injected
+                            // text. Refresh before expiry, with a fixed total lifetime.
+                            let render_deadline = created_at + CODEX_PEER_NUDGE_RENDER_MAX_WAIT;
+                            if now < render_deadline {
+                                if let Some(composer) = screen
+                                    .as_ref()
+                                    .and_then(|state| state.composer.as_ref())
+                                    .filter(|composer| {
+                                        composer.len() > observed_prefix_len
+                                            && composer.len() < expected_composer.len()
+                                            && expected_composer.starts_with(composer.as_str())
+                                    })
+                                {
+                                    log_decision("submit_at_composer_rendering", false);
+                                    if let Some(PendingCodexPeerDelivery::SubmitAt {
+                                        expires_at,
+                                        observed_prefix_len,
+                                        ..
+                                    }) = queue.front_mut()
+                                    {
+                                        *expires_at = (now + CODEX_PEER_NUDGE_COMMIT_TIMEOUT)
+                                            .min(render_deadline);
+                                        *observed_prefix_len = composer.len();
+                                    }
+                                    self.dirty = true;
+                                    continue;
+                                }
+                            }
+                            if now >= expires_at || now >= render_deadline {
                                 log_decision("submit_at_expired", false);
                                 queue.pop_front();
                                 self.dirty = true;

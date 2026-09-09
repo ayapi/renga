@@ -5751,6 +5751,8 @@ fn expired_submit_at_is_not_counted_and_is_removed_on_flush() {
     app.pending_codex_peer_messages.insert(
         pane_id,
         VecDeque::from([PendingCodexPeerDelivery::SubmitAt {
+            created_at: Instant::now(),
+            observed_prefix_len: 0,
             ready_at: Instant::now(),
             expires_at: Instant::now(),
             expected_composer: "will-not-match".into(),
@@ -6117,5 +6119,100 @@ fn loss_notice_labels_the_original_timestamp_as_utc() {
         })
         .expect("loss notice");
     assert!(body.contains("Sent at 1725000123.456000000 UTC"));
+    app.shutdown();
+}
+
+fn setup_slow_codex_submit() -> (App, usize, String) {
+    let mut app = App::new(40, 160).expect("App::new");
+    let pane_id = app.ws().focused_pane_id;
+    app.peer_client_kinds.insert(pane_id, PeerClientKind::Codex);
+    seed_codex_live_ready_placeholder(&mut app, pane_id);
+    let message = PendingCodexPeerMessage {
+        from_pane: 999,
+        from_name: None,
+        from_kind: Some(PeerClientKind::Claude),
+    };
+    let expected: String = format_codex_peer_message(&message)
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    app.pending_codex_peer_messages.insert(
+        pane_id,
+        VecDeque::from([PendingCodexPeerDelivery::SubmitAt {
+            created_at: Instant::now(),
+            observed_prefix_len: 0,
+            ready_at: Instant::now(),
+            expires_at: Instant::now() + CODEX_PEER_NUDGE_COMMIT_TIMEOUT,
+            expected_composer: expected.clone(),
+            expected_composer_raw: None,
+            delivery_sequence: None,
+        }]),
+    );
+    app.ws_mut()
+        .panes
+        .get_mut(&pane_id)
+        .unwrap()
+        .clear_test_input();
+    (app, pane_id, expected)
+}
+
+fn elapse_codex_submit(app: &mut App, pane_id: usize, elapsed: Duration) {
+    match app
+        .pending_codex_peer_messages
+        .get_mut(&pane_id)
+        .unwrap()
+        .front_mut()
+        .unwrap()
+    {
+        PendingCodexPeerDelivery::SubmitAt {
+            created_at,
+            ready_at,
+            expires_at,
+            ..
+        } => {
+            *created_at -= elapsed;
+            *ready_at -= elapsed;
+            *expires_at -= elapsed;
+        }
+        other => panic!("expected submit stage, got {other:?}"),
+    }
+}
+
+#[test]
+fn submit_commit_tracks_slow_render_progress_beyond_original_timeout() {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+    for (len, elapsed_ms) in [(1, 1000), (44, 2000), (143, 2500)] {
+        elapse_codex_submit(&mut app, pane_id, Duration::from_millis(elapsed_ms));
+        seed_codex_idle_composer(&mut app, pane_id, &expected[..len]);
+        app.flush_pending_codex_peer_messages();
+        assert!(app.ws().panes[&pane_id].test_input().is_empty());
+        assert!(matches!(app.pending_codex_peer_messages[&pane_id].front(),
+            Some(PendingCodexPeerDelivery::SubmitAt { observed_prefix_len, expires_at, .. })
+            if *observed_prefix_len == len && *expires_at > Instant::now()));
+    }
+    elapse_codex_submit(&mut app, pane_id, Duration::from_secs(1));
+    seed_codex_idle_composer(&mut app, pane_id, &expected);
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(app.ws().panes[&pane_id].test_input(), b"\r");
+    assert!(!app.pending_codex_peer_messages.contains_key(&pane_id));
+    app.shutdown();
+}
+
+#[test]
+fn submit_commit_render_progress_cannot_extend_absolute_cap() {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+    for len in 1..=60 {
+        elapse_codex_submit(&mut app, pane_id, Duration::from_secs(1));
+        seed_codex_idle_composer(&mut app, pane_id, &expected[..len]);
+        app.flush_pending_codex_peer_messages();
+        assert!(app.ws().panes[&pane_id].test_input().is_empty());
+        if len < 60 {
+            assert!(matches!(
+                app.pending_codex_peer_messages[&pane_id].front(),
+                Some(PendingCodexPeerDelivery::SubmitAt { .. })
+            ));
+        }
+    }
+    assert!(app.pending_codex_peer_messages[&pane_id].is_empty());
     app.shutdown();
 }
