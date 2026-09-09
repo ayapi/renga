@@ -770,9 +770,21 @@ specified in section 3.5.
   reading older JSON; callers that need delivery certainty should treat an
   absent key from an older server as unknown rather than confirmed empty.
   Since renga-bkp, expired SubmitAt attempts remain counted while awaiting
-  recovery. Older servers exclude those attempts, so a reported zero alone
-  cannot establish successful delivery on those versions. The wire field and
-  default are unchanged; this corrects stalled-delivery visibility.
+  recovery. This is an intentional semantic change under
+  `semver-policy.md` section 3: the same pane in the same state now reports a
+  different number for a documented field. It does not require a major
+  release for this bug fix because all three compatibility conditions remain
+  true:
+  1. The wire field, its type, and its serde default remain unchanged. No
+     documented output field is removed or renamed.
+  2. The previous count incorrectly hid a stranded delivery as zero pending
+     messages. Correcting that value restores undelivered-message visibility;
+     the erroneous zero was not a successful-delivery contract callers could
+     rely on.
+  3. A reported zero on an older server still cannot establish successful
+     delivery. Callers must continue to treat delivery without supporting
+     evidence as unknown, including the already documented case of an absent
+     field from an older server.
 - **Unknown `peer_send.delivery` values** are unverified outcomes. The
   additively introduced `pending_user_confirmation` and `undeliverable` values
   therefore degrade to the documented unconfirmed result on older MCP clients;
