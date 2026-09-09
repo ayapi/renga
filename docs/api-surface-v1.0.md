@@ -592,7 +592,9 @@ value itself is unchanged.
 `pending_peer_messages` is the number of undelivered peer messages / nudges
 owned by that pane: `pending_peer_inbox[pane].len()` plus the live Draft,
 QueueAt, AwaitFocus, and SubmitAt entries in `pending_codex_peer_messages[pane]`.
-Expired SubmitAt entries are excluded. A notification already moved into the
+Expired SubmitAt entries remain counted until the delivery loop resolves them:
+it submits an exact match, removes a released composer after observing our text,
+or retains the nudge for retry / notification. A notification already moved into the
 focused confirmation dialog is no longer in either queue and therefore counts
 as zero.
 
@@ -767,6 +769,10 @@ specified in section 3.5.
   **additively introduced**. Their serde default is `0` for compatibility when
   reading older JSON; callers that need delivery certainty should treat an
   absent key from an older server as unknown rather than confirmed empty.
+  Since renga-bkp, expired SubmitAt attempts remain counted while awaiting
+  recovery. Older servers exclude those attempts, so a reported zero alone
+  cannot establish successful delivery on those versions. The wire field and
+  default are unchanged; this corrects stalled-delivery visibility.
 - **Unknown `peer_send.delivery` values** are unverified outcomes. The
   additively introduced `pending_user_confirmation` and `undeliverable` values
   therefore degrade to the documented unconfirmed result on older MCP clients;

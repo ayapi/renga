@@ -19,6 +19,12 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Fixed
 
+- **Slow Codex peer nudges no longer disappear when submission times out.**
+  Growing composer text extends the wait up to 60 seconds. Stalled nudges stay
+  visible in pending counts and recover through retries or notifications;
+  recovery preserves user text and never clears a composer with an unseen end.
+  (renga-bkp)
+
 - **Pending Codex peer notices now stay visible during composer navigation.**
   Arrow, Home, End, PageUp, and PageDown keys no longer requeue the notice;
   unclaimed navigation reaches the PTY while renga shortcuts and copy mode
