@@ -6436,3 +6436,113 @@ fn submit_commit_exact_composer_submits_even_after_deadline() {
     assert!(!app.pending_codex_peer_messages.contains_key(&pane_id));
     app.shutdown();
 }
+
+fn assert_submit_observes_during_delay(complete: bool) {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+    let rendered = if complete {
+        expected.as_str()
+    } else {
+        &expected[..44]
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    if let Some(PendingCodexPeerDelivery::SubmitAt {
+        ready_at,
+        expires_at,
+        ..
+    }) = app
+        .pending_codex_peer_messages
+        .get_mut(&pane_id)
+        .unwrap()
+        .front_mut()
+    {
+        *ready_at = Instant::now() + Duration::from_secs(1);
+        *expires_at = deadline;
+    }
+    seed_codex_idle_composer(&mut app, pane_id, rendered);
+    app.flush_pending_codex_peer_messages();
+    assert!(
+        app.ws().panes[&pane_id].test_input().is_empty(),
+        "observation during the delay must never send Enter"
+    );
+    assert!(
+        matches!(app.pending_codex_peer_messages[&pane_id].front(),
+        Some(PendingCodexPeerDelivery::SubmitAt { observed_prefix_len, expires_at, .. })
+        if *observed_prefix_len == rendered.len() && *expires_at == deadline),
+        "record partial and complete rendering during the delay without extending expiry"
+    );
+    seed_codex_busy_placeholder(&mut app, pane_id);
+    elapse_codex_submit(&mut app, pane_id, CODEX_PEER_NUDGE_COMMIT_TIMEOUT);
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(
+        app.pending_peer_message_count(pane_id),
+        0,
+        "already submitted text must not be retried"
+    );
+    assert!(app.ws().panes[&pane_id].test_input().is_empty());
+    assert!(app.codex_peer_notification.is_none());
+    app.shutdown();
+}
+
+#[test]
+fn submit_commit_observes_partial_render_during_delay_before_release() {
+    assert_submit_observes_during_delay(false);
+}
+
+#[test]
+fn submit_commit_observes_complete_render_during_delay_before_release() {
+    assert_submit_observes_during_delay(true);
+}
+
+#[test]
+fn submit_commit_slow_render_survives_null_scrape_between_progress_ticks() {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+    if let Some(PendingCodexPeerDelivery::SubmitAt { ready_at, .. }) = app
+        .pending_codex_peer_messages
+        .get_mut(&pane_id)
+        .unwrap()
+        .front_mut()
+    {
+        *ready_at += Duration::from_secs(1);
+    }
+    let mut observed = 0;
+    // Replay the 00:17 field shape: early paint during the delay, a transient
+    // missing scrape, then continued growth beyond the original five seconds.
+    for (elapsed_ms, len) in [
+        (100, Some(1)),
+        (200, Some(1)),
+        (200, Some(6)),
+        (600, Some(6)),
+        (300, Some(9)),
+        (1000, Some(35)),
+        (300, Some(35)),
+        (300, Some(36)),
+        (300, Some(41)),
+        (300, Some(41)),
+        (300, Some(42)),
+        (500, Some(43)),
+        (520, None),
+        (212, Some(48)),
+    ] {
+        elapse_codex_submit(&mut app, pane_id, Duration::from_millis(elapsed_ms));
+        if let Some(len) = len {
+            seed_codex_idle_composer(&mut app, pane_id, &expected[..len]);
+            observed = observed.max(len);
+        } else {
+            seed_pane_screen(&mut app, pane_id, b"\x1b[2J\x1b[H");
+        }
+        app.flush_pending_codex_peer_messages();
+        assert!(app.ws().panes[&pane_id].test_input().is_empty());
+        assert!(
+            matches!(app.pending_codex_peer_messages[&pane_id].front(),
+            Some(PendingCodexPeerDelivery::SubmitAt { observed_prefix_len, .. })
+            if *observed_prefix_len == observed),
+            "a null scrape must preserve progress and keep waiting"
+        );
+    }
+    elapse_codex_submit(&mut app, pane_id, Duration::from_secs(1));
+    seed_codex_idle_composer(&mut app, pane_id, &expected);
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(app.ws().panes[&pane_id].test_input(), b"\r");
+    assert_eq!(app.pending_peer_message_count(pane_id), 0);
+    app.shutdown();
+}

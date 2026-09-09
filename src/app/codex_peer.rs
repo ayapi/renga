@@ -2854,6 +2854,26 @@ impl App {
                                     log_codex_peer_decision(path, decision);
                                 }
                             };
+                            // Observe even during the commit delay: Codex may consume the
+                            // text before Enter is due. Exact text also proves it rendered.
+                            if let Some(composer) = screen
+                                .as_ref()
+                                .and_then(|state| state.composer.as_ref())
+                                .filter(|composer| {
+                                    !composer.is_empty()
+                                        && composer.len() > observed_prefix_len
+                                        && composer.len() <= expected_composer.len()
+                                        && expected_composer.starts_with(composer.as_str())
+                                })
+                            {
+                                if let Some(PendingCodexPeerDelivery::SubmitAt {
+                                    observed_prefix_len,
+                                    ..
+                                }) = queue.front_mut()
+                                {
+                                    *observed_prefix_len = composer.len();
+                                }
+                            }
                             if now < ready_at {
                                 log_decision("submit_at_waiting_ready_at", true);
                                 continue;
