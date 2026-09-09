@@ -6336,8 +6336,8 @@ fn submit_commit_missing_scrape_waits_then_requeues_without_clear() {
 }
 
 #[test]
-fn submit_commit_initial_placeholder_waits_but_released_composer_drops_without_retry() {
-    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+fn submit_commit_initial_placeholder_waits_without_render_evidence() {
+    let (mut app, pane_id, _) = setup_slow_codex_submit();
     app.flush_pending_codex_peer_messages();
     assert!(matches!(
         app.pending_codex_peer_messages[&pane_id].front(),
@@ -6346,6 +6346,14 @@ fn submit_commit_initial_placeholder_waits_but_released_composer_drops_without_r
             ..
         })
     ));
+    assert!(app.ws().panes[&pane_id].test_input().is_empty());
+    assert_eq!(app.pending_peer_message_count(pane_id), 1);
+    app.shutdown();
+}
+
+#[test]
+fn submit_commit_released_composer_drops_without_retry() {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
     seed_codex_idle_composer(&mut app, pane_id, &expected[..44]);
     app.flush_pending_codex_peer_messages();
     seed_codex_busy_placeholder(&mut app, pane_id);
@@ -6491,6 +6499,93 @@ fn submit_commit_observes_partial_render_during_delay_before_release() {
 #[test]
 fn submit_commit_observes_complete_render_during_delay_before_release() {
     assert_submit_observes_during_delay(true);
+}
+
+fn codex_nudge_substring(expected: &str) -> String {
+    let user_text = "Runcheck_messagesnow";
+    assert!(expected.contains(user_text));
+    assert!(!expected.starts_with(user_text));
+    user_text.to_string()
+}
+
+#[test]
+fn submit_commit_substring_user_draft_never_clears_after_expiry() {
+    assert_changed_submit_preserved(codex_nudge_substring, true);
+}
+
+#[test]
+fn submit_commit_substring_user_draft_never_counts_as_render_progress() {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+    seed_codex_idle_composer(&mut app, pane_id, &codex_nudge_substring(&expected));
+    app.flush_pending_codex_peer_messages();
+    assert_submit_requeued(&app, pane_id);
+    assert!(app.ws().panes[&pane_id].test_input().is_empty());
+    // Releasing this user draft must not erase the retained peer message.
+    seed_codex_busy_placeholder(&mut app, pane_id);
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(app.pending_peer_message_count(pane_id), 1);
+    app.shutdown();
+}
+
+#[test]
+fn submit_commit_substring_during_delay_does_not_arm_release() {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+    if let Some(PendingCodexPeerDelivery::SubmitAt { ready_at, .. }) = app
+        .pending_codex_peer_messages
+        .get_mut(&pane_id)
+        .unwrap()
+        .front_mut()
+    {
+        *ready_at += Duration::from_secs(1);
+    }
+    seed_codex_idle_composer(&mut app, pane_id, &codex_nudge_substring(&expected));
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages[&pane_id].front(),
+        Some(PendingCodexPeerDelivery::SubmitAt {
+            observed_prefix_len: 0,
+            ..
+        })
+    ));
+    seed_codex_busy_placeholder(&mut app, pane_id);
+    elapse_codex_submit(&mut app, pane_id, CODEX_PEER_NUDGE_COMMIT_TIMEOUT);
+    app.flush_pending_codex_peer_messages();
+    assert_submit_requeued(&app, pane_id);
+    assert!(app.ws().panes[&pane_id].test_input().is_empty());
+    app.shutdown();
+}
+
+#[test]
+fn submit_commit_visible_end_empty_scrape_is_preserved_with_prefix_clear_control() {
+    for is_prefix in [false, true] {
+        let (mut app, pane_id, expected) = setup_slow_codex_submit();
+        // Both buffers use exactly the same prompt, separator, footer and cursor
+        // geometry. The prefix case proves this layout permits recovery clearing.
+        let text = if is_prefix { &expected[..10] } else { "" };
+        let screen = format!(
+            "\x1b[2J\x1b[H\u{203a} {text}\x1b[3;1H  gpt-5.6-sol medium \u{b7} cwd\x1b[3;3H"
+        );
+        seed_pane_screen(&mut app, pane_id, screen.as_bytes());
+        {
+            let parser = app.ws().panes[&pane_id].parser.lock().unwrap();
+            assert_eq!(
+                normalized_codex_composer_text(parser.screen()),
+                Some(text.to_string())
+            );
+        }
+        app.flush_pending_codex_peer_messages();
+        assert!(app.ws().panes[&pane_id].test_input().is_empty());
+        elapse_codex_submit(&mut app, pane_id, CODEX_PEER_NUDGE_COMMIT_TIMEOUT);
+        app.flush_pending_codex_peer_messages();
+        assert_submit_requeued(&app, pane_id);
+        let expected_input: &[u8] = if is_prefix { b"\x15" } else { b"" };
+        assert_eq!(
+            app.ws().panes[&pane_id].test_input(),
+            expected_input,
+            "visible-end empty text must be preserved, while our real prefix must clear"
+        );
+        app.shutdown();
+    }
 }
 
 #[test]
