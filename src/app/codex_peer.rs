@@ -158,6 +158,8 @@ pub(crate) enum PendingCodexPeerDelivery {
         delivery_sequence: Option<u64>,
     },
     SubmitAt {
+        message: PendingCodexPeerMessage,
+        retries_remaining: u8,
         created_at: Instant,
         observed_prefix_len: usize,
         ready_at: Instant,
@@ -203,10 +205,9 @@ impl PendingCodexPeerDelivery {
 
 impl App {
     /// Undelivered peer messages / nudges for `pane_id`: pre-registration
-    /// inbox entries plus live Codex delivery stages. Expired SubmitAt attempts are
-    /// stale bookkeeping and are deliberately excluded.
+    /// inbox entries plus retained Codex delivery stages, including stalled
+    /// SubmitAt attempts awaiting recovery.
     pub(crate) fn pending_peer_message_count(&self, pane_id: usize) -> u32 {
-        let now = Instant::now();
         let inbox = self
             .pending_peer_inbox
             .get(&pane_id)
@@ -214,14 +215,7 @@ impl App {
         let nudges = self
             .pending_codex_peer_messages
             .get(&pane_id)
-            .map_or(0, |queue| {
-                queue
-                    .iter()
-                    .filter(|delivery| {
-                        !matches!(delivery, PendingCodexPeerDelivery::SubmitAt { expires_at, .. } if now >= *expires_at)
-                    })
-                    .count()
-            });
+            .map_or(0, VecDeque::len);
         u32::try_from(inbox.saturating_add(nudges)).unwrap_or(u32::MAX)
     }
 }
@@ -230,6 +224,7 @@ impl App {
 struct CodexPeerScreenSnapshot {
     has_draft: Option<bool>,
     composer: Option<String>,
+    composer_end_visible: bool,
     ready_for_nudge: bool,
     can_queue_message: bool,
     hide_cursor: bool,
@@ -331,6 +326,10 @@ fn looks_like_codex_footer_rows(rows: &[String], separator_rows: usize) -> bool 
 }
 
 fn codex_live_composer_position(screen: &vt100::Screen) -> Option<(u16, u16)> {
+    codex_live_composer_layout(screen).map(|(row, col, _)| (row, col))
+}
+
+fn codex_live_composer_layout(screen: &vt100::Screen) -> Option<(u16, u16, bool)> {
     let (rows, cols) = screen.size();
     let (prompt_row, prompt_col) = (0..rows).rev().find_map(|row| {
         (0..cols).find_map(|col| {
@@ -371,13 +370,13 @@ fn codex_live_composer_position(screen: &vt100::Screen) -> Option<(u16, u16)> {
     if footer_seen
         || (footer_rows.is_empty() && !content_before_separator && cursor_row == prompt_row)
     {
-        return Some((prompt_row, prompt_col));
+        return Some((prompt_row, prompt_col, footer_seen));
     }
     (footer_rows.is_empty()
         && content_before_separator
         && cursor_row > prompt_row
         && cursor_row <= last_content_before_separator)
-        .then_some((prompt_row, prompt_col))
+        .then_some((prompt_row, prompt_col, false))
 }
 
 pub(crate) fn codex_prompt_allows_peer_nudge_on_screen(screen: &vt100::Screen) -> Option<bool> {
@@ -785,6 +784,8 @@ fn analyze_codex_peer_screen(
     CodexPeerScreenSnapshot {
         has_draft,
         composer,
+        composer_end_visible: codex_live_composer_layout(screen)
+            .is_some_and(|(_, _, end_visible)| end_visible),
         ready_for_nudge,
         can_queue_message,
         hide_cursor: screen.hide_cursor(),
@@ -1003,6 +1004,7 @@ fn log_codex_peer_decision(path: &std::ffi::OsStr, decision: CodexPeerDecision<'
             "expected_composer": expected_composer,
             "expected_composer_raw": expected_composer_raw,
             "screen_composer": screen.and_then(|state| state.composer.as_deref()),
+            "composer_end_visible": screen.map(|state| state.composer_end_visible),
             "screen_composer_raw": debug.and_then(|state| state.composer_raw.as_deref()),
             "has_draft": screen.and_then(|state| state.has_draft),
             "ready_for_nudge": screen.map(|state| state.ready_for_nudge),
@@ -2344,6 +2346,8 @@ impl App {
         let queue = self.pending_codex_peer_messages.entry(pane_id).or_default();
         queue.clear();
         queue.push_back(PendingCodexPeerDelivery::SubmitAt {
+            message,
+            retries_remaining: CODEX_PEER_NUDGE_MAX_RETRIES,
             created_at: Instant::now(),
             observed_prefix_len: 0,
             ready_at,
@@ -2501,6 +2505,10 @@ impl App {
             .or_default();
         queue.clear();
         queue.push_back(PendingCodexPeerDelivery::SubmitAt {
+            message: notification.message,
+            retries_remaining: notification
+                .retries_remaining
+                .unwrap_or(CODEX_PEER_NUDGE_MAX_RETRIES),
             created_at: Instant::now(),
             observed_prefix_len: 0,
             ready_at,
@@ -2754,6 +2762,8 @@ impl App {
                                     }
                                     queue.pop_front();
                                     queue.push_front(PendingCodexPeerDelivery::SubmitAt {
+                                        message,
+                                        retries_remaining,
                                         created_at: now,
                                         observed_prefix_len: 0,
                                         ready_at,
@@ -2801,6 +2811,8 @@ impl App {
                             }
                         }
                         PendingCodexPeerDelivery::SubmitAt {
+                            message,
+                            retries_remaining,
                             created_at,
                             observed_prefix_len,
                             ready_at,
@@ -2827,7 +2839,7 @@ impl App {
                                     expected_composer_raw: expected_composer_raw.as_deref(),
                                     screen: screen.as_ref(),
                                     composer_matches: Some(composer_matches),
-                                    retries_remaining: None,
+                                    retries_remaining: Some(retries_remaining),
                                     queue_entries_total,
                                     other_queue_entries: queue_entries_total.saturating_sub(1),
                                     action,
@@ -2846,6 +2858,44 @@ impl App {
                                 log_decision("submit_at_waiting_ready_at", true);
                                 continue;
                             }
+                            // Completion wins even on the last tick of the render budget.
+                            if composer_matches {
+                                let payload =
+                                    crate::mcp_peer::build_send_keys_payload("", None, true)
+                                        .expect("codex peer submit payload");
+                                if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
+                                    log_decision("submit_at_enter_pressed", false);
+                                    queue.pop_front();
+                                    if queue.is_empty() {
+                                        empty_panes.push(pane_id);
+                                    }
+                                    self.dirty = true;
+                                } else {
+                                    log_decision("submit_at_enter_write_failed", true);
+                                }
+                                continue;
+                            }
+                            let composer =
+                                screen.as_ref().and_then(|state| state.composer.as_ref());
+                            let ours = composer.is_some_and(|text| {
+                                !text.is_empty() && expected_composer.starts_with(text.as_str())
+                            });
+                            let has_draft = screen.as_ref().and_then(|state| state.has_draft);
+                            let released = observed_prefix_len > 0 && has_draft == Some(false);
+                            if released {
+                                log_decision("submit_at_composer_released", false);
+                                queue.pop_front();
+                                if queue.is_empty() {
+                                    empty_panes.push(pane_id);
+                                }
+                                self.dirty = true;
+                                continue;
+                            }
+                            // A placeholder before any of our text appears is still waiting
+                            // for the initial paint, not evidence of user input or delivery.
+                            let diverged = composer.is_some_and(|text| !text.is_empty())
+                                && !ours
+                                && has_draft != Some(false);
                             // A growing normalized prefix is Codex drawing our injected
                             // text. Refresh before expiry, with a fixed total lifetime.
                             let render_deadline = created_at + CODEX_PEER_NUDGE_RENDER_MAX_WAIT;
@@ -2874,25 +2924,52 @@ impl App {
                                     continue;
                                 }
                             }
-                            if now >= expires_at || now >= render_deadline {
-                                log_decision("submit_at_expired", false);
+                            if diverged || now >= expires_at || now >= render_deadline {
+                                if ours
+                                    && screen
+                                        .as_ref()
+                                        .is_some_and(|state| state.composer_end_visible)
+                                {
+                                    if write_input_to_pane(pane, b"\x15", false).is_ok() {
+                                        log_decision(
+                                            "submit_at_expired_cleared_and_requeued",
+                                            false,
+                                        );
+                                    } else {
+                                        log_decision(
+                                            "submit_at_expired_clear_failed_requeued",
+                                            false,
+                                        );
+                                    }
+                                } else {
+                                    log_decision(
+                                        if diverged {
+                                            "submit_at_diverged_requeued_without_clear"
+                                        } else {
+                                            "submit_at_expired_requeued_without_clear"
+                                        },
+                                        false,
+                                    );
+                                }
                                 queue.pop_front();
+                                if retries_remaining > 0 {
+                                    queue.push_front(PendingCodexPeerDelivery::Draft {
+                                        message,
+                                        retries_remaining: retries_remaining - 1,
+                                        stalled_since: now,
+                                        delivery_sequence,
+                                    });
+                                } else {
+                                    queue.push_front(PendingCodexPeerDelivery::AwaitFocus {
+                                        message,
+                                        retries_remaining: 0,
+                                        delivery_sequence,
+                                    });
+                                }
                                 self.dirty = true;
                                 continue;
                             }
-                            if !composer_matches {
-                                log_decision("submit_at_composer_mismatch", true);
-                                continue;
-                            }
-                            let payload = crate::mcp_peer::build_send_keys_payload("", None, true)
-                                .expect("codex peer submit payload");
-                            if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
-                                log_decision("submit_at_enter_pressed", false);
-                                queue.pop_front();
-                                self.dirty = true;
-                            } else {
-                                log_decision("submit_at_enter_write_failed", true);
-                            }
+                            log_decision("submit_at_composer_mismatch", true);
                         }
                         PendingCodexPeerDelivery::QueueAt {
                             ready_at,

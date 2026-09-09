@@ -3777,7 +3777,7 @@ fn submit_commit_does_not_send_changed_composer() {
         app.pending_codex_peer_messages
             .get(&codex_id)
             .and_then(|queue| queue.front()),
-        Some(PendingCodexPeerDelivery::SubmitAt { .. })
+        Some(PendingCodexPeerDelivery::Draft { .. })
     ));
     app.shutdown();
 }
@@ -5744,13 +5744,19 @@ fn subscriber_gone_timeout_reports_each_unconsumed_codex_handover() {
 }
 
 #[test]
-fn expired_submit_at_is_not_counted_and_is_removed_on_flush() {
+fn expired_submit_at_stays_counted_and_is_requeued_on_flush() {
     let mut app = App::new(40, 80).expect("App::new");
     let pane_id = app.ws().focused_pane_id;
     app.peer_client_kinds.insert(pane_id, PeerClientKind::Codex);
     app.pending_codex_peer_messages.insert(
         pane_id,
         VecDeque::from([PendingCodexPeerDelivery::SubmitAt {
+            message: PendingCodexPeerMessage {
+                from_pane: 999,
+                from_name: None,
+                from_kind: Some(PeerClientKind::Claude),
+            },
+            retries_remaining: CODEX_PEER_NUDGE_MAX_RETRIES,
             created_at: Instant::now(),
             observed_prefix_len: 0,
             ready_at: Instant::now(),
@@ -5761,9 +5767,12 @@ fn expired_submit_at_is_not_counted_and_is_removed_on_flush() {
         }]),
     );
 
-    assert_eq!(app.pending_peer_message_count(pane_id), 0);
+    assert_eq!(app.pending_peer_message_count(pane_id), 1);
     app.flush_pending_codex_peer_messages();
-    assert!(app.pending_codex_peer_messages[&pane_id].is_empty());
+    assert_eq!(app.pending_peer_message_count(pane_id), 1);
+    assert!(matches!(app.pending_codex_peer_messages[&pane_id].front(),
+        Some(PendingCodexPeerDelivery::Draft { retries_remaining, .. })
+        if *retries_remaining == CODEX_PEER_NUDGE_MAX_RETRIES - 1));
     app.shutdown();
 }
 
@@ -6139,6 +6148,8 @@ fn setup_slow_codex_submit() -> (App, usize, String) {
     app.pending_codex_peer_messages.insert(
         pane_id,
         VecDeque::from([PendingCodexPeerDelivery::SubmitAt {
+            message,
+            retries_remaining: CODEX_PEER_NUDGE_MAX_RETRIES,
             created_at: Instant::now(),
             observed_prefix_len: 0,
             ready_at: Instant::now(),
@@ -6205,14 +6216,223 @@ fn submit_commit_render_progress_cannot_extend_absolute_cap() {
         elapse_codex_submit(&mut app, pane_id, Duration::from_secs(1));
         seed_codex_idle_composer(&mut app, pane_id, &expected[..len]);
         app.flush_pending_codex_peer_messages();
-        assert!(app.ws().panes[&pane_id].test_input().is_empty());
         if len < 60 {
+            assert!(app.ws().panes[&pane_id].test_input().is_empty());
             assert!(matches!(
                 app.pending_codex_peer_messages[&pane_id].front(),
                 Some(PendingCodexPeerDelivery::SubmitAt { .. })
             ));
         }
     }
-    assert!(app.pending_codex_peer_messages[&pane_id].is_empty());
+    assert_eq!(app.ws().panes[&pane_id].test_input(), b"\x15");
+    assert!(matches!(app.pending_codex_peer_messages[&pane_id].front(),
+        Some(PendingCodexPeerDelivery::Draft { retries_remaining, .. })
+        if *retries_remaining == CODEX_PEER_NUDGE_MAX_RETRIES - 1));
+    app.shutdown();
+}
+
+fn assert_submit_requeued(app: &App, pane_id: usize) {
+    assert_eq!(app.pending_peer_message_count(pane_id), 1);
+    assert!(matches!(app.pending_codex_peer_messages[&pane_id].front(),
+        Some(PendingCodexPeerDelivery::Draft { message, retries_remaining, .. })
+        if message.from_pane == 999
+            && *retries_remaining == CODEX_PEER_NUDGE_MAX_RETRIES - 1));
+}
+
+fn assert_changed_submit_preserved(make_text: impl FnOnce(&str) -> String, expired: bool) {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+    let changed = make_text(&expected);
+    seed_codex_idle_composer(&mut app, pane_id, &changed);
+    {
+        let parser = app.ws().panes[&pane_id].parser.lock().unwrap();
+        assert_eq!(
+            normalized_codex_composer_text(parser.screen()),
+            Some(changed.clone())
+        );
+    }
+    if expired {
+        elapse_codex_submit(&mut app, pane_id, CODEX_PEER_NUDGE_COMMIT_TIMEOUT);
+    }
+    app.flush_pending_codex_peer_messages();
+    assert!(
+        app.ws().panes[&pane_id].test_input().is_empty(),
+        "user text must neither submit nor clear"
+    );
+    assert_submit_requeued(&app, pane_id);
+    // A retained user draft eventually surfaces through the existing notification path.
+    if let Some(PendingCodexPeerDelivery::Draft { stalled_since, .. }) = app
+        .pending_codex_peer_messages
+        .get_mut(&pane_id)
+        .unwrap()
+        .front_mut()
+    {
+        *stalled_since -= CODEX_PEER_DRAFT_STALL_TIMEOUT;
+    }
+    app.flush_pending_codex_peer_messages();
+    assert!(app.codex_peer_notification.is_some());
+    assert!(app.ws().panes[&pane_id].test_input().is_empty());
+    app.shutdown();
+}
+
+#[test]
+fn submit_commit_partial_nudge_then_user_text_fails_fast_without_clear() {
+    assert_changed_submit_preserved(
+        |expected| format!("{}日本語の下書き", &expected[..143]),
+        false,
+    );
+}
+
+#[test]
+fn submit_commit_user_draft_then_full_nudge_never_clears() {
+    assert_changed_submit_preserved(|expected| format!("日本語の下書き{expected}"), true);
+}
+
+#[test]
+fn submit_commit_full_nudge_then_user_text_never_clears_after_expiry() {
+    assert_changed_submit_preserved(|expected| format!("{expected}ABC"), true);
+}
+
+#[test]
+fn submit_commit_empty_scrape_waits_then_requeues_without_clear() {
+    let (mut app, pane_id, _) = setup_slow_codex_submit();
+    seed_pane_screen(&mut app, pane_id, b"\x1b[2J\x1b[H\xE2\x80\xBA \x1b[1;3H");
+    {
+        let parser = app.ws().panes[&pane_id].parser.lock().unwrap();
+        assert_eq!(
+            normalized_codex_composer_text(parser.screen()),
+            Some(String::new())
+        );
+    }
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages[&pane_id].front(),
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
+    ));
+    elapse_codex_submit(&mut app, pane_id, CODEX_PEER_NUDGE_COMMIT_TIMEOUT);
+    app.flush_pending_codex_peer_messages();
+    assert!(app.ws().panes[&pane_id].test_input().is_empty());
+    assert_submit_requeued(&app, pane_id);
+    app.shutdown();
+}
+
+#[test]
+fn submit_commit_missing_scrape_waits_then_requeues_without_clear() {
+    let (mut app, pane_id, _) = setup_slow_codex_submit();
+    seed_pane_screen(&mut app, pane_id, b"\x1b[2J\x1b[H");
+    {
+        let parser = app.ws().panes[&pane_id].parser.lock().unwrap();
+        assert_eq!(normalized_codex_composer_text(parser.screen()), None);
+    }
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages[&pane_id].front(),
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
+    ));
+    elapse_codex_submit(&mut app, pane_id, CODEX_PEER_NUDGE_COMMIT_TIMEOUT);
+    app.flush_pending_codex_peer_messages();
+    assert!(app.ws().panes[&pane_id].test_input().is_empty());
+    assert_submit_requeued(&app, pane_id);
+    app.shutdown();
+}
+
+#[test]
+fn submit_commit_initial_placeholder_waits_but_released_composer_drops_without_retry() {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages[&pane_id].front(),
+        Some(PendingCodexPeerDelivery::SubmitAt {
+            observed_prefix_len: 0,
+            ..
+        })
+    ));
+    seed_codex_idle_composer(&mut app, pane_id, &expected[..44]);
+    app.flush_pending_codex_peer_messages();
+    seed_codex_busy_placeholder(&mut app, pane_id);
+    elapse_codex_submit(&mut app, pane_id, CODEX_PEER_NUDGE_COMMIT_TIMEOUT);
+    app.flush_pending_codex_peer_messages();
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(app.pending_peer_message_count(pane_id), 0);
+    assert!(!app.pending_codex_peer_messages.contains_key(&pane_id));
+    assert!(app.codex_peer_notification.is_none());
+    assert!(app.ws().panes[&pane_id].test_input().is_empty());
+    app.shutdown();
+}
+
+#[test]
+fn submit_commit_stalled_prefix_clears_and_requeues_when_end_visible() {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+    seed_codex_idle_composer(&mut app, pane_id, &expected[..44]);
+    app.flush_pending_codex_peer_messages();
+    elapse_codex_submit(&mut app, pane_id, CODEX_PEER_NUDGE_COMMIT_TIMEOUT);
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(app.ws().panes[&pane_id].test_input(), b"\x15");
+    assert_submit_requeued(&app, pane_id);
+    app.shutdown();
+}
+
+#[test]
+fn submit_commit_stalled_prefix_with_hidden_end_never_clears() {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+    let (rows, _) = app.ws().panes[&pane_id]
+        .parser
+        .lock()
+        .unwrap()
+        .screen()
+        .size();
+    let screen = format!(
+        "\x1b[2J\x1b[{};1H\u{203a} {}\x1b[{rows};1H  {}\x1b[{rows};10H",
+        rows - 1,
+        &expected[..20],
+        &expected[20..44]
+    );
+    seed_pane_screen(&mut app, pane_id, screen.as_bytes());
+    {
+        let parser = app.ws().panes[&pane_id].parser.lock().unwrap();
+        assert_eq!(
+            normalized_codex_composer_text(parser.screen()),
+            Some(expected[..44].to_string())
+        );
+    }
+    app.flush_pending_codex_peer_messages();
+    elapse_codex_submit(&mut app, pane_id, CODEX_PEER_NUDGE_COMMIT_TIMEOUT);
+    app.flush_pending_codex_peer_messages();
+    assert!(app.ws().panes[&pane_id].test_input().is_empty());
+    assert_submit_requeued(&app, pane_id);
+    app.shutdown();
+}
+
+#[test]
+fn submit_commit_exhausted_retries_waits_for_focus() {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+    if let Some(PendingCodexPeerDelivery::SubmitAt {
+        retries_remaining, ..
+    }) = app
+        .pending_codex_peer_messages
+        .get_mut(&pane_id)
+        .unwrap()
+        .front_mut()
+    {
+        *retries_remaining = 0;
+    }
+    seed_codex_idle_composer(&mut app, pane_id, &expected[..44]);
+    app.flush_pending_codex_peer_messages();
+    elapse_codex_submit(&mut app, pane_id, CODEX_PEER_NUDGE_COMMIT_TIMEOUT);
+    app.flush_pending_codex_peer_messages();
+    assert!(
+        matches!(app.pending_codex_peer_messages[&pane_id].front(), Some(PendingCodexPeerDelivery::AwaitFocus { message, retries_remaining: 0, .. }) if message.from_pane == 999)
+    );
+    assert_eq!(app.pending_peer_message_count(pane_id), 1);
+    app.shutdown();
+}
+
+#[test]
+fn submit_commit_exact_composer_submits_even_after_deadline() {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+    seed_codex_idle_composer(&mut app, pane_id, &expected);
+    elapse_codex_submit(&mut app, pane_id, Duration::from_secs(61));
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(app.ws().panes[&pane_id].test_input(), b"\r");
+    assert!(!app.pending_codex_peer_messages.contains_key(&pane_id));
     app.shutdown();
 }
