@@ -143,6 +143,7 @@ impl App {
             ws.shutdown();
         }
         self.peer_client_kinds.clear();
+        self.peer_live_subscribers.clear();
         self.peer_delivery_ready.clear();
         self.pending_peer_inbox.clear();
         self.peer_handovers.clear();
@@ -217,6 +218,9 @@ impl App {
             }
             AppCommand::PeerInboxHeadAcknowledged { pane_id, .. } => {
                 ("peer_inbox_head_acknowledged", Some(*pane_id))
+            }
+            AppCommand::PeerSubscriberArrived { pane_id } => {
+                ("peer_subscriber_arrived", Some(*pane_id))
             }
             AppCommand::PeerSubscriberGone { pane_id, .. } => {
                 ("peer_subscriber_gone", Some(*pane_id))

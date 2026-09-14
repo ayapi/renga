@@ -76,10 +76,16 @@ struct PeerSubscriptionRegistry {
 }
 
 impl PeerSubscriptionRegistry {
-    fn register(&self, pane_id: usize) {
+    fn register(&self, pane_id: usize, command_tx: &Sender<AppCommand>) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.managed_panes.insert(pane_id);
         *state.counts.entry(pane_id).or_default() += 1;
+        // App commands share one FIFO channel. Enqueueing arrival while this
+        // registry lock is held, before begin_subscription writes its ack,
+        // guarantees that the App records liveness before the client's
+        // post-ack registration/readiness request. The matching gone command
+        // is enqueued under this same lock when the count reaches zero.
+        let _ = enqueue_app_command(command_tx, AppCommand::PeerSubscriberArrived { pane_id });
     }
 
     /// Decrement a pane's stream count and run `on_last` while still
@@ -372,7 +378,7 @@ fn begin_subscription<W: Write>(
     // count is already non-zero.
     let (sub_id, rx) = event_bus.subscribe();
     if let Some(pane_id) = pane_id {
-        peer_subscriptions.register(pane_id);
+        peer_subscriptions.register(pane_id, command_tx);
     }
     if let Err(e) = write_response_line(sink, &Response::Subscribed) {
         end_subscription(
@@ -1197,13 +1203,14 @@ mod tests {
 
     #[test]
     fn peer_subscription_is_registered_before_subscribed_ack() {
-        struct AckObserver {
+        struct AckObserver<'a> {
             registry: PeerSubscriptionRegistry,
             pane_id: usize,
             saw_registered: bool,
+            command_rx: &'a mpsc::Receiver<AppCommand>,
         }
 
-        impl Write for AckObserver {
+        impl Write for AckObserver<'_> {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
                 let state = self
                     .registry
@@ -1215,6 +1222,10 @@ mod tests {
                     self.saw_registered,
                     "subscribe.pane_id must be counted before the ack is written"
                 );
+                assert!(matches!(
+                    self.command_rx.try_recv(),
+                    Ok(AppCommand::PeerSubscriberArrived { pane_id }) if pane_id == self.pane_id
+                ));
                 Ok(buf.len())
             }
 
@@ -1225,11 +1236,12 @@ mod tests {
 
         let registry = PeerSubscriptionRegistry::default();
         let event_bus = EventBus::new();
-        let (command_tx, _command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::channel();
         let mut writer = AckObserver {
             registry: registry.clone(),
             pane_id: 7,
             saw_registered: false,
+            command_rx: &command_rx,
         };
 
         let (sub_id, _rx) =
@@ -1275,6 +1287,10 @@ mod tests {
             &command_tx,
         )
         .is_err());
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(AppCommand::PeerSubscriberArrived { pane_id: 17 })
+        ));
         assert!(matches!(
             command_rx.recv_timeout(Duration::from_secs(1)),
             Ok(AppCommand::PeerSubscriberGone {
@@ -1328,6 +1344,10 @@ mod tests {
 
         assert!(matches!(
             command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(AppCommand::PeerSubscriberArrived { pane_id: 8 })
+        ));
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
             Ok(AppCommand::PeerSubscriberGone {
                 pane_id: 8,
                 detail: "test_disconnect"
@@ -1339,8 +1359,14 @@ mod tests {
     fn only_last_peer_subscription_disconnect_enqueues_gone() {
         let registry = PeerSubscriptionRegistry::default();
         let (command_tx, command_rx) = mpsc::channel();
-        registry.register(9);
-        registry.register(9);
+        registry.register(9, &command_tx);
+        registry.register(9, &command_tx);
+        for _ in 0..2 {
+            assert!(matches!(
+                command_rx.recv_timeout(Duration::from_secs(1)),
+                Ok(AppCommand::PeerSubscriberArrived { pane_id: 9 })
+            ));
+        }
 
         registry.unregister(9, &command_tx, "test_disconnect");
         assert!(command_rx.try_recv().is_err());
@@ -1358,8 +1384,12 @@ mod tests {
     #[test]
     fn zero_notification_precedes_new_ack_and_ready() {
         let registry = PeerSubscriptionRegistry::default();
-        registry.register(11);
         let (command_tx, command_rx) = mpsc::channel();
+        registry.register(11, &command_tx);
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(AppCommand::PeerSubscriberArrived { pane_id: 11 })
+        ));
         let (inside_tx, inside_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
 
@@ -1380,11 +1410,12 @@ mod tests {
         inside_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         let new_registry = registry.clone();
+        let new_command_tx = command_tx.clone();
         let (acked_tx, acked_rx) = mpsc::channel();
         let (attempted_tx, attempted_rx) = mpsc::channel();
         let new = thread::spawn(move || {
             attempted_tx.send(()).unwrap();
-            new_registry.register(11);
+            new_registry.register(11, &new_command_tx);
             // Models the Subscribed ack: production also sends it only
             // after register returns.
             acked_tx.send(()).unwrap();
@@ -1406,6 +1437,10 @@ mod tests {
         ));
         acked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         new.join().unwrap();
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(AppCommand::PeerSubscriberArrived { pane_id: 11 })
+        ));
 
         let responder = thread::spawn(move || match command_rx.recv().unwrap() {
             AppCommand::PeerSetReady {
@@ -1437,7 +1472,11 @@ mod tests {
     fn late_ready_after_server_observed_disconnect_is_rejected() {
         let registry = PeerSubscriptionRegistry::default();
         let (command_tx, command_rx) = mpsc::channel();
-        registry.register(13);
+        registry.register(13, &command_tx);
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(AppCommand::PeerSubscriberArrived { pane_id: 13 })
+        ));
         registry.unregister(13, &command_tx, "test_disconnect");
         assert!(matches!(
             command_rx.recv_timeout(Duration::from_secs(1)),
@@ -1465,7 +1504,11 @@ mod tests {
     fn cooperative_false_does_not_clear_overlapping_live_subscription() {
         let registry = PeerSubscriptionRegistry::default();
         let (command_tx, command_rx) = mpsc::channel();
-        registry.register(15);
+        registry.register(15, &command_tx);
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(AppCommand::PeerSubscriberArrived { pane_id: 15 })
+        ));
 
         let response = dispatch_request_with_registry(
             Request::PeerSetReady {

@@ -512,10 +512,13 @@ fn closing_pane_discards_its_pre_registration_queue() {
     )
     .expect("queued send");
     assert!(app.pending_peer_inbox.contains_key(&sibling_id));
+    app.handle_peer_subscriber_arrived(sibling_id);
+    assert!(app.peer_live_subscribers.contains(&sibling_id));
 
     app.handle_close(&ipc::PaneRef::Id(sibling_id))
         .expect("close sibling");
     assert!(!app.pending_peer_inbox.contains_key(&sibling_id));
+    assert!(!app.peer_live_subscribers.contains(&sibling_id));
     app.shutdown();
 }
 
@@ -539,8 +542,10 @@ fn shutdown_discards_all_pre_registration_queues() {
         "discard on shutdown".to_string(),
     )
     .expect("queued send");
+    app.handle_peer_subscriber_arrived(sibling_id);
     app.shutdown();
     assert!(app.pending_peer_inbox.is_empty());
+    assert!(app.peer_live_subscribers.is_empty());
 }
 
 #[test]
@@ -563,10 +568,12 @@ fn closing_tab_discards_its_pre_registration_queues() {
         "discard with tab".to_string(),
     )
     .expect("queued send");
+    app.handle_peer_subscriber_arrived(sibling_id);
 
     let closing_tab = app.active_tab;
     app.close_tab(closing_tab);
     assert!(!app.pending_peer_inbox.contains_key(&sibling_id));
+    assert!(!app.peer_live_subscribers.contains(&sibling_id));
     app.shutdown();
 }
 
@@ -4851,14 +4858,92 @@ fn subscriber_gone_revokes_pull_and_push_readiness_without_erasing_kind() {
         let pane_id = app.ws().focused_pane_id;
         app.handle_peer_set_ready(pane_id, kind, true)
             .expect("peer readiness");
+        app.handle_peer_subscriber_arrived(pane_id);
         assert!(app.peer_delivery_ready.contains(&pane_id));
+        assert!(app.peer_live_subscribers.contains(&pane_id));
 
         app.handle_peer_subscriber_gone(pane_id, "event_bus_closed");
 
         assert!(!app.peer_delivery_ready.contains(&pane_id));
+        assert!(!app.peer_live_subscribers.contains(&pane_id));
         assert_eq!(app.peer_client_kinds.get(&pane_id), Some(&kind));
         app.shutdown();
     }
+}
+
+#[test]
+fn codex_kind_can_change_to_claude_without_a_live_subscriber() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let pane_id = app.ws().focused_pane_id;
+
+    app.handle_peer_register_client(pane_id, PeerClientKind::Codex)
+        .expect("register Codex before subscribe");
+    assert!(!app.peer_live_subscribers.contains(&pane_id));
+    app.handle_peer_register_client(pane_id, PeerClientKind::Claude)
+        .expect("replace a peer that never subscribed");
+
+    assert_eq!(
+        app.peer_client_kinds.get(&pane_id),
+        Some(&PeerClientKind::Claude)
+    );
+    app.shutdown();
+}
+
+#[test]
+fn codex_kind_can_change_to_claude_after_the_last_subscriber_leaves() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let pane_id = app.ws().focused_pane_id;
+    app.handle_peer_register_client(pane_id, PeerClientKind::Codex)
+        .expect("register Codex");
+    app.handle_peer_subscriber_arrived(pane_id);
+    app.handle_peer_subscriber_gone(pane_id, "event_bus_closed");
+
+    app.handle_peer_register_client(pane_id, PeerClientKind::Claude)
+        .expect("register replacement Claude");
+
+    assert_eq!(
+        app.peer_client_kinds.get(&pane_id),
+        Some(&PeerClientKind::Claude)
+    );
+    app.shutdown();
+}
+
+#[test]
+fn claude_kind_can_change_to_codex_while_subscribed() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let pane_id = app.ws().focused_pane_id;
+    app.handle_peer_register_client(pane_id, PeerClientKind::Claude)
+        .expect("register Claude");
+    app.handle_peer_subscriber_arrived(pane_id);
+
+    app.handle_peer_register_client(pane_id, PeerClientKind::Codex)
+        .expect("upgrade to Codex");
+
+    assert_eq!(
+        app.peer_client_kinds.get(&pane_id),
+        Some(&PeerClientKind::Codex)
+    );
+    app.shutdown();
+}
+
+#[test]
+fn live_but_not_ready_codex_subscriber_refuses_claude_downgrade() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let pane_id = app.ws().focused_pane_id;
+    app.handle_peer_register_client(pane_id, PeerClientKind::Codex)
+        .expect("register Codex");
+    app.handle_peer_subscriber_arrived(pane_id);
+    assert!(!app.peer_delivery_ready.contains(&pane_id));
+
+    app.handle_peer_register_client(pane_id, PeerClientKind::Claude)
+        .expect("nested Claude registration is handled");
+
+    assert_eq!(
+        app.peer_client_kinds.get(&pane_id),
+        Some(&PeerClientKind::Codex)
+    );
+    assert!(!app.peer_delivery_ready.contains(&pane_id));
+    app.shutdown();
 }
 
 #[test]

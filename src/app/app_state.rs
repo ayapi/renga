@@ -185,6 +185,10 @@ pub enum AppCommand {
         next_from_kind: Option<PeerClientKind>,
         reply: oneshot::Sender<std::result::Result<(), ipc::CodedError>>,
     },
+    /// The IPC server registered a pane-associated event stream. The server
+    /// emits this while holding the same per-pane subscription lock used for
+    /// the last-stream notification, so the two commands define liveness.
+    PeerSubscriberArrived { pane_id: usize },
     /// The IPC server observed the last pane-associated event stream
     /// terminate. Unlike `PeerSetReady`, this is authoritative server
     /// state and does not need client-kind metadata or a reply.
@@ -353,6 +357,10 @@ pub struct App {
     /// Keyed by pane id so `list_peers` / `list_panes` can surface
     /// whether a pane is using Claude-style push or Codex-style poll.
     pub(crate) peer_client_kinds: HashMap<usize, PeerClientKind>,
+    /// Panes with at least one live MCP event stream, as reported by the IPC
+    /// server's per-pane subscription registry. This is deliberately separate
+    /// from delivery readiness, which may be false while the stream is alive.
+    pub(crate) peer_live_subscribers: HashSet<usize>,
     pub(crate) peer_delivery_ready: HashSet<usize>,
     /// Peer inbox messages sent before the target pane's MCP client
     /// has registered. Registration happens only after its event

@@ -916,6 +916,44 @@ fn log_codex_peer_kind_update(
     update_path: &'static str,
     pane_title_seen: Option<(bool, bool)>,
 ) {
+    log_codex_peer_kind_record(
+        "client_kind_updated",
+        pane_id,
+        old_kind,
+        new_kind,
+        update_path,
+        pane_title_seen,
+        None,
+    );
+}
+
+fn log_codex_peer_kind_downgrade_refused(
+    pane_id: usize,
+    old_kind: PeerClientKind,
+    new_kind: PeerClientKind,
+    update_path: &'static str,
+    pane_title_seen: Option<(bool, bool)>,
+) {
+    log_codex_peer_kind_record(
+        "client_kind_downgrade_refused",
+        pane_id,
+        Some(old_kind),
+        new_kind,
+        update_path,
+        pane_title_seen,
+        Some("live_subscriber_preserves_codex"),
+    );
+}
+
+fn log_codex_peer_kind_record(
+    action: &'static str,
+    pane_id: usize,
+    old_kind: Option<PeerClientKind>,
+    new_kind: PeerClientKind,
+    update_path: &'static str,
+    pane_title_seen: Option<(bool, bool)>,
+    reason: Option<&'static str>,
+) {
     let Some(path) = codex_peer_debug_log_path() else {
         return;
     };
@@ -934,23 +972,24 @@ fn log_codex_peer_kind_update(
             PeerClientKind::Codex => claude_seen && !codex_seen,
         })
     });
-    append_codex_peer_debug_record(
-        &path,
-        serde_json::json!({
-            "action": "client_kind_updated",
-            "pane_id": pane_id,
-            "kind_update_path": update_path,
-            "old_client_kind": old_kind.map(kind_label),
-            "new_client_kind": kind_label(new_kind),
-            "receive_mode": match new_kind.receive_mode() {
-                ipc::PeerReceiveMode::Push => "push",
-                ipc::PeerReceiveMode::Pull => "pull",
-            },
-            "pane_title_codex_seen": pane_title_codex_seen,
-            "pane_title_claude_seen": pane_title_claude_seen,
-            "kind_title_mismatch": kind_title_mismatch,
-        }),
-    );
+    let mut record = serde_json::json!({
+        "action": action,
+        "pane_id": pane_id,
+        "kind_update_path": update_path,
+        "old_client_kind": old_kind.map(kind_label),
+        "new_client_kind": kind_label(new_kind),
+        "receive_mode": match new_kind.receive_mode() {
+            ipc::PeerReceiveMode::Push => "push",
+            ipc::PeerReceiveMode::Pull => "pull",
+        },
+        "pane_title_codex_seen": pane_title_codex_seen,
+        "pane_title_claude_seen": pane_title_claude_seen,
+        "kind_title_mismatch": kind_title_mismatch,
+    });
+    if let Some(reason) = reason {
+        record["reason"] = serde_json::Value::String(reason.to_string());
+    }
+    append_codex_peer_debug_record(&path, record);
 }
 
 fn peer_client_kind_label(kind: PeerClientKind) -> &'static str {
@@ -1091,6 +1130,32 @@ pub(crate) fn write_input_to_pane(
 }
 
 impl App {
+    fn update_peer_client_kind(
+        &mut self,
+        pane_id: usize,
+        kind: PeerClientKind,
+        update_path: &'static str,
+        pane_title_seen: Option<(bool, bool)>,
+    ) -> PeerClientKind {
+        let old_kind = self.peer_client_kinds.get(&pane_id).copied();
+        if old_kind == Some(PeerClientKind::Codex)
+            && kind == PeerClientKind::Claude
+            && self.peer_live_subscribers.contains(&pane_id)
+        {
+            log_codex_peer_kind_downgrade_refused(
+                pane_id,
+                PeerClientKind::Codex,
+                kind,
+                update_path,
+                pane_title_seen,
+            );
+            return PeerClientKind::Codex;
+        }
+        let old_kind = self.peer_client_kinds.insert(pane_id, kind);
+        log_codex_peer_kind_update(pane_id, old_kind, kind, update_path, pane_title_seen);
+        kind
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_codex_peer_front_is_draft(&self, pane_id: usize) -> bool {
         matches!(
@@ -2062,8 +2127,7 @@ impl App {
         self.peer_handover_disconnect_deadlines.remove(&pane_id);
         let generation = self.peer_handover_generations.entry(pane_id).or_default();
         *generation = generation.saturating_add(1);
-        let old_kind = self.peer_client_kinds.insert(pane_id, kind);
-        log_codex_peer_kind_update(pane_id, old_kind, kind, "register", pane_title_seen);
+        self.update_peer_client_kind(pane_id, kind, "register", pane_title_seen);
         Ok(())
     }
 
@@ -2100,10 +2164,15 @@ impl App {
             return Ok(());
         }
         self.peer_handover_disconnect_deadlines.remove(&pane_id);
-        // Readiness and kind travel atomically so a failed earlier metadata
-        // registration cannot suppress Codex nudge setup.
-        let old_kind = self.peer_client_kinds.insert(pane_id, kind);
-        log_codex_peer_kind_update(pane_id, old_kind, kind, "set_ready", pane_title_seen);
+        // Readiness and kind normally travel atomically so a failed earlier
+        // metadata registration cannot suppress Codex nudge setup. A live
+        // Codex stream is the exception: a nested Claude must not replace it.
+        // Subscriber arrival is enqueued before the subscribe ack, so it is
+        // observed before this post-ack request. A register racing the final
+        // disconnect can still see the old liveness state; the next register
+        // self-corrects that pre-existing stale-kind window.
+        let effective_kind =
+            self.update_peer_client_kind(pane_id, kind, "set_ready", pane_title_seen);
         self.peer_delivery_ready.insert(pane_id);
         let messages = self.pending_peer_inbox.remove(&pane_id);
         let peer_inbox_sequences: Vec<u64> = messages
@@ -2118,7 +2187,7 @@ impl App {
             serde_json::json!({
                 "action": "peer_set_ready_flush",
                 "pane_id": pane_id,
-                "client_kind": peer_client_kind_label(kind),
+                "client_kind": peer_client_kind_label(effective_kind),
                 "flushed_count": flushed_count,
                 "peer_inbox_sequences": peer_inbox_sequences,
             })
@@ -2138,11 +2207,16 @@ impl App {
         Ok(())
     }
 
+    pub(crate) fn handle_peer_subscriber_arrived(&mut self, pane_id: usize) {
+        self.peer_live_subscribers.insert(pane_id);
+    }
+
     /// Revoke delivery readiness after the IPC server observes that the
     /// pane's last identified event stream has ended. Client kind is
     /// intentionally irrelevant: pull and push subscribers share the
     /// same transport-liveness requirement.
     pub(crate) fn handle_peer_subscriber_gone(&mut self, pane_id: usize, detail: &'static str) {
+        self.peer_live_subscribers.remove(&pane_id);
         self.peer_delivery_ready.remove(&pane_id);
         if self.peer_handovers.contains_key(&pane_id) {
             self.peer_handover_disconnect_deadlines
@@ -3449,6 +3523,90 @@ mod debug_logging_tests {
         assert_eq!(records[1]["pane_title_codex_seen"], true);
         assert_eq!(records[1]["pane_title_claude_seen"], false);
         assert_eq!(records[1]["kind_title_mismatch"], false);
+        std::fs::remove_file(path).expect("remove debug JSONL");
+    }
+
+    #[test]
+    fn live_codex_subscriber_refuses_claude_kind_but_still_flushes_and_nudges() {
+        let path = debug_test_path("live-codex-refuses-claude");
+        set_codex_peer_debug_log_path_test_override(Some(Some(path.as_os_str().to_owned())));
+        let mut app = App::new(40, 80).expect("App::new");
+        let sender_id = app.workspaces[app.active_tab].focused_pane_id;
+        let target_id = app
+            .handle_split(
+                &PaneRef::Focused,
+                ipc::Direction::Vertical,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("split target");
+        app.handle_focus(&PaneRef::Id(sender_id))
+            .expect("focus sender");
+        app.workspaces[app.active_tab].panes[&target_id]
+            .codex_seen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        app.handle_peer_register_client(target_id, PeerClientKind::Codex)
+            .expect("register Codex");
+        app.handle_peer_subscriber_arrived(target_id);
+        app.handle_peer_register_client(target_id, PeerClientKind::Claude)
+            .expect("handle nested Claude registration");
+        assert_eq!(
+            app.handle_peer_send(sender_id, &PaneRef::Id(target_id), "queued".into())
+                .expect("queue before readiness"),
+            ipc::PeerSendOutcome::Queued
+        );
+
+        app.handle_peer_set_ready(target_id, PeerClientKind::Claude, true)
+            .expect("nested Claude readiness still makes the stream ready");
+
+        assert_eq!(
+            app.peer_client_kinds.get(&target_id),
+            Some(&PeerClientKind::Codex)
+        );
+        assert!(app.peer_delivery_ready.contains(&target_id));
+        assert!(!app.pending_peer_inbox.contains_key(&target_id));
+        assert_eq!(
+            app.handle_peer_send(sender_id, &PaneRef::Id(target_id), "nudge".into())
+                .expect("send through retained Codex route"),
+            ipc::PeerSendOutcome::Delivered
+        );
+        assert!(app.pending_codex_peer_front_is_draft(target_id));
+        app.shutdown();
+        set_codex_peer_debug_log_path_test_override(Some(None));
+
+        let records = read_debug_records(&path);
+        let refused: Vec<_> = records
+            .iter()
+            .filter(|record| record["action"] == "client_kind_downgrade_refused")
+            .collect();
+        assert_eq!(refused.len(), 2);
+        assert_eq!(refused[0]["kind_update_path"], "register");
+        assert_eq!(refused[1]["kind_update_path"], "set_ready");
+        for record in refused {
+            assert_eq!(record["old_client_kind"], "codex");
+            assert_eq!(record["new_client_kind"], "claude");
+            assert_eq!(record["receive_mode"], "push");
+            assert_eq!(record["pane_title_codex_seen"], true);
+            assert_eq!(record["pane_title_claude_seen"], false);
+            assert_eq!(record["kind_title_mismatch"], true);
+            assert_eq!(record["reason"], "live_subscriber_preserves_codex");
+        }
+        assert!(records.iter().any(|record| {
+            record["action"] == "peer_set_ready_flush"
+                && record["client_kind"] == "codex"
+                && record["flushed_count"] == 1
+        }));
+        assert!(records
+            .iter()
+            .any(|record| record["action"] == "nudge_enqueued_draft"));
+        assert!(!records.iter().any(|record| {
+            record["action"] == "client_kind_updated"
+                && record["old_client_kind"] == "codex"
+                && record["new_client_kind"] == "claude"
+        }));
         std::fs::remove_file(path).expect("remove debug JSONL");
     }
 

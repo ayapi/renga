@@ -53,6 +53,7 @@ impl App {
                 self.saved_overlay_drafts.remove(pid);
                 self.claude_monitor.remove(*pid);
                 self.peer_client_kinds.remove(pid);
+                self.peer_live_subscribers.remove(pid);
                 self.peer_delivery_ready.remove(pid);
                 self.pending_peer_inbox.remove(pid);
                 self.peer_handovers.remove(pid);
@@ -315,6 +316,7 @@ impl App {
         self.drop_overlay_for_pane(pane_id);
         self.claude_monitor.remove(pane_id);
         self.peer_client_kinds.remove(&pane_id);
+        self.peer_live_subscribers.remove(&pane_id);
         self.peer_delivery_ready.remove(&pane_id);
         self.pending_peer_inbox.remove(&pane_id);
         self.peer_handovers.remove(&pane_id);

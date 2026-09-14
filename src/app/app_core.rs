@@ -72,6 +72,7 @@ impl App {
             },
             claude_monitor: crate::claude_monitor::ClaudeMonitor::new(),
             peer_client_kinds: HashMap::new(),
+            peer_live_subscribers: HashSet::new(),
             peer_delivery_ready: HashSet::new(),
             pending_peer_inbox: HashMap::new(),
             peer_inbox_debug_sequences: HashMap::new(),
