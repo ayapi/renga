@@ -492,3 +492,46 @@ AwaitFocus により通知へ進み、本文を黙って失わない。
 - `submit_at_expired_requeued_without_clear`: 末尾不明または本文不明のため消去せず回復
 
 `RENGA_DEBUG_CODEX_PEER_LOG` が未設定なら trace を出力しない契約は維持する。
+
+## 2026-09-14 追記: 残留 nudge の draft 誤認と focus 待ち (renga-4jj)
+
+gameocr の TUI (pid 16180) で、renga が書いた nudge が composer に残った後、
+次の配送がそれをユーザー下書きと誤認して `AwaitFocus` に入り、後続配送が停止した。
+22:12〜23:00 JST の全 trace で確認した代表的な形状は次のとおり。
+
+| pane / sequence | 実測 |
+|---|---|
+| pane 7, 791 → 792 | 22:25:34.300 に 791 を書き込み、22:25:35.331 に不一致、22:25:36.693 に `submit_at_composer_released`。22:26:45.269 に 792 が残留 791 を draft と判定し、22:26:46.796 に `AwaitFocus`。22:27:35〜22:52:40 に 20 件が後ろで待ち、22:55:05.636 のユーザー操作まで約 30 分停止した。 |
+| pane 14, 445 → 446 | 22:54:31.583 に 445 を書き込み、22:54:32.617 に release。22:58:24.588 に 446 が完全に残った 445 を draft と判定した。 |
+| pane 11, 378 | 22:38:41.433 の end-invisible repaint を誤って divergence と判定し、47 ms 後に Draft が composer を空と誤認して同じ本文を再度書いた。22:38:42.509 には 2 コピーが連結し、22:58:54 の観測終了まで後続 nudge が待った。 |
+
+根因は二つある。第一に、`SubmitAt` の released または clear なし requeue が
+renga 自身の文字列を composer に残しても、その文字列を次の `Draft` が識別する
+状態を持たなかった。第二に、cursor が prompt 行の editable start 以前にあると、
+prompt 行の文字を走査せず `has_draft=false` としていた。Codex の複数行 repaint
+中は文字が残っていてもこの cursor 配置になり、二重書き込みを許していた。
+
+renga-4jj は、composer を空にしたと確認できるまで、pane ごとに直近 8 種類の
+正規化済み注入本文を保持する。`Draft` と `AwaitFocus` は、画面内に composer
+末尾が見え、composer 全体が保持本文だけの一つ以上の連結として厳密に分割できる
+場合に限り、これを残留注入と認識する。Codex が idle、pane が非 focus の場合だけ
+Enter を送り、現在の pending 本文がその連結に含まれれば同じ配送を完了扱いにして
+再注入しない。別送信者の古い本文だけなら、古い本文を送った後も現在の Draft を
+保持する。busy 中は Enter/Tab を送らず、focus 中は従来の通知経路を使う。
+
+`has_draft` の cursor shortcut は draft の存在を示す `true` だけを返す。
+`false` は prompt 行の text/placeholder 走査だけが返すため、editable start に
+cursor があっても通常文字は draft として保護される。`SubmitAt` の divergence も
+composer 末尾が見える frame だけで確定する。末尾が見えない別送信者の transcript
+行を composer と誤って scrape した frame は、通常の mismatch として待機する。
+
+新しい判断は `stale_injection_submitted`、`stale_injection_waiting_until_idle`、
+`stale_injection_focused_notification`、`stale_injection_enter_write_failed` で trace
+され、`expected_composer` と `screen_composer` を既存形式で記録する。注入記録は
+SubmitAt Enter、QueueAt Enter/Tab、stale Enter、成功した Ctrl-U、subscriber
+切断、pane/tab close、shutdown で消す。`pending_peer_messages` は配送 queue のみを
+数え続けるため、公開 field と `list_panes` / `list_peers` の意味は変わらない。
+
+この field build e424bd0 は、後の synchronized paint と erase hold の変更を含まない。
+そのため renga-4jj の実機確認では、停止が再現しないことだけを根拠にせず、現行 build
+で上記の新 action が記録されることを確認する必要がある。

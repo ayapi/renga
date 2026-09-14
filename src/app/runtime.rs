@@ -168,6 +168,7 @@ impl App {
         self.peer_inbox_debug_sequences.clear();
         self.pending_peer_deliveries.clear();
         self.pending_codex_peer_messages.clear();
+        self.codex_peer_injected_composers.clear();
         self.codex_peer_delivery_sequences.clear();
         self.codex_peer_debug_observations.clear();
     }

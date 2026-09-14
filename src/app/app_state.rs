@@ -387,6 +387,9 @@ pub struct App {
     /// One-shot nudges waiting to be injected into Codex panes so the
     /// pane runs `check_messages` once it looks ready for PTY input.
     pub(crate) pending_codex_peer_messages: HashMap<usize, VecDeque<PendingCodexPeerDelivery>>,
+    /// Normalized nudge texts written into each Codex composer since renga
+    /// last confirmed that the composer was emptied.
+    pub(crate) codex_peer_injected_composers: HashMap<usize, VecDeque<String>>,
     /// Per-pane sequence assigned to Codex peer delivery attempts. Used only
     /// by opt-in diagnostics to correlate enqueue, injection, and later state
     /// observations.

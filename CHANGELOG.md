@@ -19,6 +19,14 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Fixed
 
+- **Codex peer nudges left in the composer now recover without waiting for
+  user focus.** Renga remembers normalized nudge text it injected, recognizes
+  only complete visible composers made entirely from those injections, and
+  submits the stale text once Codex is idle. Draft detection now scans prompt
+  text before declaring the composer empty, while incomplete repaint frames
+  cannot trigger submission or early divergence. Genuine user drafts remain
+  untouched and continue through the notification flow. (renga-4jj)
+
 - **Measured erase-keyed pane repaints are now applied as one parser update.**
   Outside DEC private mode 2026 frames, `ESC[2J` and `ESC[3J` start a pane-local
   output hold. The first later PTY read or UI iteration at or after 40 ms

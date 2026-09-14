@@ -5,6 +5,7 @@ pub(crate) const CODEX_PEER_NUDGE_COMMIT_DELAY: Duration = Duration::from_millis
 pub(crate) const CODEX_PEER_NUDGE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const CODEX_PEER_NUDGE_RENDER_MAX_WAIT: Duration = Duration::from_secs(60);
 pub(crate) const CODEX_PEER_NUDGE_MAX_RETRIES: u8 = 1;
+const CODEX_PEER_INJECTED_COMPOSER_MAX_ENTRIES: usize = 8;
 static CODEX_PEER_DEBUG_RECORD_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 static CODEX_PEER_DEBUG_WRITE_FAILURES: std::sync::atomic::AtomicU64 =
@@ -182,6 +183,60 @@ pub(crate) enum PendingCodexPeerDelivery {
         retries_remaining: u8,
         delivery_sequence: Option<u64>,
     },
+}
+
+fn remember_codex_peer_injected_composer(
+    injected: &mut HashMap<usize, VecDeque<String>>,
+    pane_id: usize,
+    expected_composer: &str,
+) {
+    if expected_composer.is_empty() {
+        return;
+    }
+    let entries = injected.entry(pane_id).or_default();
+    if let Some(index) = entries.iter().position(|entry| entry == expected_composer) {
+        entries.remove(index);
+    }
+    entries.push_back(expected_composer.to_string());
+    while entries.len() > CODEX_PEER_INJECTED_COMPOSER_MAX_ENTRIES {
+        entries.pop_front();
+    }
+}
+
+fn exact_codex_peer_injected_concatenation(
+    composer: &str,
+    expected_composers: Option<&VecDeque<String>>,
+    current_expected_composer: &str,
+) -> Option<bool> {
+    let expected_composers = expected_composers?;
+    if composer.is_empty() || expected_composers.is_empty() {
+        return None;
+    }
+    let mut reachable = vec![[false; 2]; composer.len() + 1];
+    reachable[0][0] = true;
+    for offset in 0..composer.len() {
+        if !composer.is_char_boundary(offset) {
+            continue;
+        }
+        for used_current in [false, true] {
+            if !reachable[offset][usize::from(used_current)] {
+                continue;
+            }
+            for expected in expected_composers {
+                if !expected.is_empty() && composer[offset..].starts_with(expected) {
+                    let next_used_current = used_current || expected == current_expected_composer;
+                    reachable[offset + expected.len()][usize::from(next_used_current)] = true;
+                }
+            }
+        }
+    }
+    if reachable[composer.len()][1] {
+        Some(true)
+    } else if reachable[composer.len()][0] {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 impl PendingCodexPeerDelivery {
@@ -491,11 +546,8 @@ pub(crate) fn codex_composer_has_draft_on_screen(screen: &vt100::Screen) -> Opti
     if cursor_row > row && !cursor_is_on_codex_footer(screen, row, cursor_row, cols) {
         return Some(true);
     }
-    if cursor_row == row {
-        if cursor_col > editable_start {
-            return Some(true);
-        }
-        return Some(false);
+    if cursor_row == row && cursor_col > editable_start {
+        return Some(true);
     }
 
     let mut input_text = String::new();
@@ -2221,6 +2273,7 @@ impl App {
     pub(crate) fn handle_peer_subscriber_gone(&mut self, pane_id: usize, detail: &'static str) {
         self.peer_live_subscribers.remove(&pane_id);
         self.peer_delivery_ready.remove(&pane_id);
+        self.codex_peer_injected_composers.remove(&pane_id);
         if self.peer_handovers.contains_key(&pane_id) {
             self.peer_handover_disconnect_deadlines
                 .insert(pane_id, Instant::now() + PEER_HANDOVER_DISCONNECT_TIMEOUT);
@@ -2420,6 +2473,11 @@ impl App {
         let ready_at = Instant::now() + CODEX_PEER_NUDGE_COMMIT_DELAY;
         let expires_at = Instant::now() + CODEX_PEER_NUDGE_COMMIT_TIMEOUT;
         let expected_composer = normalize_codex_composer_expected(&payload_text);
+        remember_codex_peer_injected_composer(
+            &mut self.codex_peer_injected_composers,
+            pane_id,
+            &expected_composer,
+        );
         let queue = self.pending_codex_peer_messages.entry(pane_id).or_default();
         queue.clear();
         queue.push_back(PendingCodexPeerDelivery::SubmitAt {
@@ -2576,6 +2634,11 @@ impl App {
         let ready_at = Instant::now() + CODEX_PEER_NUDGE_COMMIT_DELAY;
         let expires_at = Instant::now() + CODEX_PEER_NUDGE_COMMIT_TIMEOUT;
         let expected_composer = normalize_codex_composer_expected(&payload_text);
+        remember_codex_peer_injected_composer(
+            &mut self.codex_peer_injected_composers,
+            notification.target_pane,
+            &expected_composer,
+        );
         let queue = self
             .pending_codex_peer_messages
             .entry(notification.target_pane)
@@ -2672,6 +2735,7 @@ impl App {
         let now = Instant::now();
         let codex_peer_debug_log_path = codex_peer_debug_log_path();
         let codex_peer_debug_observations = &mut self.codex_peer_debug_observations;
+        let codex_peer_injected_composers = &mut self.codex_peer_injected_composers;
         let mut empty_panes = Vec::new();
         let mut focused_notifications = Vec::new();
         let active_tab = self.active_tab;
@@ -2704,6 +2768,9 @@ impl App {
                             delivery_sequence,
                         } => {
                             let queue_entries_total = queue.len();
+                            let payload_text = format_codex_peer_message(&message);
+                            let current_expected_composer =
+                                normalize_codex_composer_expected(&payload_text);
                             let mut log_decision = |action, only_if_changed| {
                                 let Some(path) = codex_peer_debug_log_path.as_deref() else {
                                     return;
@@ -2733,6 +2800,76 @@ impl App {
                                     log_codex_peer_decision(path, decision);
                                 }
                             };
+                            let stale_composer = screen
+                                .as_ref()
+                                .filter(|state| state.composer_end_visible)
+                                .and_then(|state| state.composer.as_deref())
+                                .and_then(|composer| {
+                                    exact_codex_peer_injected_concatenation(
+                                        composer,
+                                        codex_peer_injected_composers.get(&pane_id),
+                                        &current_expected_composer,
+                                    )
+                                    .map(|contains_current| (composer, contains_current))
+                                });
+                            if let Some((stale_composer, contains_current)) = stale_composer {
+                                let log_stale_decision = |action| {
+                                    let Some(path) = codex_peer_debug_log_path.as_deref() else {
+                                        return;
+                                    };
+                                    log_codex_peer_decision(
+                                        path,
+                                        CodexPeerDecision {
+                                            pane_id,
+                                            delivery_sequence,
+                                            now,
+                                            ready_at: None,
+                                            expires_at: None,
+                                            expected_composer: Some(stale_composer),
+                                            expected_composer_raw: None,
+                                            screen: screen.as_ref(),
+                                            composer_matches: Some(true),
+                                            retries_remaining: Some(retries_remaining),
+                                            queue_entries_total,
+                                            other_queue_entries: queue_entries_total
+                                                .saturating_sub(1),
+                                            action,
+                                        },
+                                    );
+                                };
+                                if pane_is_focused {
+                                    log_stale_decision("stale_injection_focused_notification");
+                                    queue.pop_front();
+                                    focused_notifications.push((
+                                        pane_id,
+                                        message,
+                                        Some(retries_remaining),
+                                    ));
+                                    self.dirty = true;
+                                    continue;
+                                }
+                                if screen
+                                    .as_ref()
+                                    .is_some_and(|state| state.can_submit_injected_message)
+                                {
+                                    if write_input_to_pane(pane, b"\r", false).is_ok() {
+                                        log_stale_decision("stale_injection_submitted");
+                                        codex_peer_injected_composers.remove(&pane_id);
+                                        if contains_current {
+                                            queue.pop_front();
+                                            if queue.is_empty() {
+                                                empty_panes.push(pane_id);
+                                            }
+                                        }
+                                        self.dirty = true;
+                                    } else {
+                                        log_stale_decision("stale_injection_enter_write_failed");
+                                    }
+                                } else {
+                                    log_stale_decision("stale_injection_waiting_until_idle");
+                                }
+                                continue;
+                            }
                             if screen.as_ref().and_then(|state| state.has_draft) == Some(true) {
                                 if pane_is_focused {
                                     log_decision("draft_has_draft_focused_notification", false);
@@ -2748,7 +2885,6 @@ impl App {
                                 }
                                 continue;
                             }
-                            let payload_text = format_codex_peer_message(&message);
                             if screen.as_ref().is_some_and(|state| state.can_queue_message)
                                 && screen.as_ref().and_then(|state| state.has_draft) != Some(true)
                             {
@@ -2761,8 +2897,12 @@ impl App {
                                 if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
                                     let ready_at = now + CODEX_PEER_NUDGE_COMMIT_DELAY;
                                     let expires_at = now + CODEX_PEER_NUDGE_COMMIT_TIMEOUT;
-                                    let expected_composer =
-                                        normalize_codex_composer_expected(&payload_text);
+                                    let expected_composer = current_expected_composer.clone();
+                                    remember_codex_peer_injected_composer(
+                                        codex_peer_injected_composers,
+                                        pane_id,
+                                        &expected_composer,
+                                    );
                                     if let Some(path) = codex_peer_debug_log_path.as_deref() {
                                         log_codex_peer_decision(
                                             path,
@@ -2814,8 +2954,12 @@ impl App {
                                 if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
                                     let ready_at = now + CODEX_PEER_NUDGE_COMMIT_DELAY;
                                     let expires_at = now + CODEX_PEER_NUDGE_COMMIT_TIMEOUT;
-                                    let expected_composer =
-                                        normalize_codex_composer_expected(&payload_text);
+                                    let expected_composer = current_expected_composer.clone();
+                                    remember_codex_peer_injected_composer(
+                                        codex_peer_injected_composers,
+                                        pane_id,
+                                        &expected_composer,
+                                    );
                                     if let Some(path) = codex_peer_debug_log_path.as_deref() {
                                         log_codex_peer_decision(
                                             path,
@@ -2962,6 +3106,7 @@ impl App {
                                         .expect("codex peer submit payload");
                                 if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
                                     log_decision("submit_at_enter_pressed", false);
+                                    codex_peer_injected_composers.remove(&pane_id);
                                     queue.pop_front();
                                     if queue.is_empty() {
                                         empty_panes.push(pane_id);
@@ -2992,6 +3137,9 @@ impl App {
                             // for the initial paint, not evidence of user input or delivery.
                             let diverged = composer.is_some_and(|text| !text.is_empty())
                                 && !ours
+                                && screen
+                                    .as_ref()
+                                    .is_some_and(|state| state.composer_end_visible)
                                 && has_draft != Some(false);
                             // A growing normalized prefix is Codex drawing our injected
                             // text. Refresh before expiry, with a fixed total lifetime.
@@ -3028,6 +3176,7 @@ impl App {
                                         .is_some_and(|state| state.composer_end_visible)
                                 {
                                     if write_input_to_pane(pane, b"\x15", false).is_ok() {
+                                        codex_peer_injected_composers.remove(&pane_id);
                                         log_decision(
                                             "submit_at_expired_cleared_and_requeued",
                                             false,
@@ -3112,7 +3261,9 @@ impl App {
                             if now >= expires_at {
                                 if pane_is_focused {
                                     if composer_matches {
-                                        let _ = write_input_to_pane(pane, b"\x15", false);
+                                        if write_input_to_pane(pane, b"\x15", false).is_ok() {
+                                            codex_peer_injected_composers.remove(&pane_id);
+                                        }
                                         log_decision(
                                             "focused_queue_expired_cleared_and_notified",
                                             false,
@@ -3133,7 +3284,9 @@ impl App {
                                     continue;
                                 }
                                 if composer_matches {
-                                    let _ = write_input_to_pane(pane, b"\x15", false);
+                                    if write_input_to_pane(pane, b"\x15", false).is_ok() {
+                                        codex_peer_injected_composers.remove(&pane_id);
+                                    }
                                     log_decision("expired_cleared_and_requeued", false);
                                 } else {
                                     log_decision("expired_discarded_without_ctrl_u", false);
@@ -3180,7 +3333,9 @@ impl App {
                                 .is_some_and(|state| state.can_submit_injected_message)
                                 && pane_is_focused
                             {
-                                let _ = write_input_to_pane(pane, b"\x15", false);
+                                if write_input_to_pane(pane, b"\x15", false).is_ok() {
+                                    codex_peer_injected_composers.remove(&pane_id);
+                                }
                                 log_decision(
                                     "focused_queue_enter_blocked_cleared_and_notified",
                                     false,
@@ -3202,6 +3357,7 @@ impl App {
                             };
                             if write_input_to_pane(pane, payload, false).is_ok() {
                                 log_decision(success_action, false);
+                                codex_peer_injected_composers.remove(&pane_id);
                                 queue.pop_front();
                                 self.dirty = true;
                             } else {
@@ -3214,6 +3370,9 @@ impl App {
                             delivery_sequence,
                         } => {
                             let queue_entries_total = queue.len();
+                            let current_expected_composer = normalize_codex_composer_expected(
+                                &format_codex_peer_message(&message),
+                            );
                             let mut log_decision = |action, only_if_changed| {
                                 let Some(path) = codex_peer_debug_log_path.as_deref() else {
                                     return;
@@ -3243,6 +3402,83 @@ impl App {
                                     log_codex_peer_decision(path, decision);
                                 }
                             };
+                            let stale_composer = screen
+                                .as_ref()
+                                .filter(|state| state.composer_end_visible)
+                                .and_then(|state| state.composer.as_deref())
+                                .and_then(|composer| {
+                                    exact_codex_peer_injected_concatenation(
+                                        composer,
+                                        codex_peer_injected_composers.get(&pane_id),
+                                        &current_expected_composer,
+                                    )
+                                    .map(|contains_current| (composer, contains_current))
+                                });
+                            if let Some((stale_composer, contains_current)) = stale_composer {
+                                let log_stale_decision = |action| {
+                                    let Some(path) = codex_peer_debug_log_path.as_deref() else {
+                                        return;
+                                    };
+                                    log_codex_peer_decision(
+                                        path,
+                                        CodexPeerDecision {
+                                            pane_id,
+                                            delivery_sequence,
+                                            now,
+                                            ready_at: None,
+                                            expires_at: None,
+                                            expected_composer: Some(stale_composer),
+                                            expected_composer_raw: None,
+                                            screen: screen.as_ref(),
+                                            composer_matches: Some(true),
+                                            retries_remaining: Some(retries_remaining),
+                                            queue_entries_total,
+                                            other_queue_entries: queue_entries_total
+                                                .saturating_sub(1),
+                                            action,
+                                        },
+                                    );
+                                };
+                                if pane_is_focused {
+                                    log_stale_decision("stale_injection_focused_notification");
+                                    queue.pop_front();
+                                    focused_notifications.push((
+                                        pane_id,
+                                        message,
+                                        (retries_remaining > 0).then_some(retries_remaining),
+                                    ));
+                                    self.dirty = true;
+                                    continue;
+                                }
+                                if screen
+                                    .as_ref()
+                                    .is_some_and(|state| state.can_submit_injected_message)
+                                {
+                                    if write_input_to_pane(pane, b"\r", false).is_ok() {
+                                        log_stale_decision("stale_injection_submitted");
+                                        codex_peer_injected_composers.remove(&pane_id);
+                                        queue.pop_front();
+                                        if contains_current {
+                                            if queue.is_empty() {
+                                                empty_panes.push(pane_id);
+                                            }
+                                        } else {
+                                            queue.push_front(PendingCodexPeerDelivery::Draft {
+                                                message,
+                                                retries_remaining,
+                                                stalled_since: now,
+                                                delivery_sequence,
+                                            });
+                                        }
+                                        self.dirty = true;
+                                    } else {
+                                        log_stale_decision("stale_injection_enter_write_failed");
+                                    }
+                                } else {
+                                    log_stale_decision("stale_injection_waiting_until_idle");
+                                }
+                                continue;
+                            }
                             if pane_is_focused {
                                 log_decision("await_focus_focused_notification", false);
                                 queue.pop_front();

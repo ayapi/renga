@@ -83,6 +83,7 @@ impl App {
             peer_handover_generations: HashMap::new(),
             next_peer_delivery_id: 1,
             pending_codex_peer_messages: HashMap::new(),
+            codex_peer_injected_composers: HashMap::new(),
             codex_peer_delivery_sequences: HashMap::new(),
             codex_peer_debug_observations: HashMap::new(),
             codex_peer_notification: None,

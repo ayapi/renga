@@ -62,6 +62,7 @@ impl App {
                 self.peer_handover_generations.remove(pid);
                 self.peer_inbox_debug_sequences.remove(pid);
                 self.pending_codex_peer_messages.remove(pid);
+                self.codex_peer_injected_composers.remove(pid);
                 self.codex_peer_delivery_sequences.remove(pid);
                 self.codex_peer_debug_observations.remove(pid);
             }
@@ -325,6 +326,7 @@ impl App {
         self.peer_handover_generations.remove(&pane_id);
         self.peer_inbox_debug_sequences.remove(&pane_id);
         self.pending_codex_peer_messages.remove(&pane_id);
+        self.codex_peer_injected_composers.remove(&pane_id);
         self.codex_peer_delivery_sequences.remove(&pane_id);
         self.codex_peer_debug_observations.remove(&pane_id);
         if self

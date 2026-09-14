@@ -514,11 +514,14 @@ fn closing_pane_discards_its_pre_registration_queue() {
     assert!(app.pending_peer_inbox.contains_key(&sibling_id));
     app.handle_peer_subscriber_arrived(sibling_id);
     assert!(app.peer_live_subscribers.contains(&sibling_id));
+    app.codex_peer_injected_composers
+        .insert(sibling_id, VecDeque::from(["oldnudge".to_string()]));
 
     app.handle_close(&ipc::PaneRef::Id(sibling_id))
         .expect("close sibling");
     assert!(!app.pending_peer_inbox.contains_key(&sibling_id));
     assert!(!app.peer_live_subscribers.contains(&sibling_id));
+    assert!(!app.codex_peer_injected_composers.contains_key(&sibling_id));
     app.shutdown();
 }
 
@@ -543,9 +546,12 @@ fn shutdown_discards_all_pre_registration_queues() {
     )
     .expect("queued send");
     app.handle_peer_subscriber_arrived(sibling_id);
+    app.codex_peer_injected_composers
+        .insert(sibling_id, VecDeque::from(["oldnudge".to_string()]));
     app.shutdown();
     assert!(app.pending_peer_inbox.is_empty());
     assert!(app.peer_live_subscribers.is_empty());
+    assert!(app.codex_peer_injected_composers.is_empty());
 }
 
 #[test]
@@ -569,11 +575,14 @@ fn closing_tab_discards_its_pre_registration_queues() {
     )
     .expect("queued send");
     app.handle_peer_subscriber_arrived(sibling_id);
+    app.codex_peer_injected_composers
+        .insert(sibling_id, VecDeque::from(["oldnudge".to_string()]));
 
     let closing_tab = app.active_tab;
     app.close_tab(closing_tab);
     assert!(!app.pending_peer_inbox.contains_key(&sibling_id));
     assert!(!app.peer_live_subscribers.contains(&sibling_id));
+    assert!(!app.codex_peer_injected_composers.contains_key(&sibling_id));
     app.shutdown();
 }
 
@@ -1567,6 +1576,7 @@ fn focused_codex_notification_accept_with_empty_composer_submits_nudge() {
             .and_then(|queue| queue.front()),
         Some(PendingCodexPeerDelivery::SubmitAt { .. })
     ));
+    assert!(app.codex_peer_injected_composers.contains_key(&sibling_id));
 
     seed_expected_codex_peer_composer(&mut app, sibling_id, sender_id);
     app.ws_mut()
@@ -1582,6 +1592,7 @@ fn focused_codex_notification_accept_with_empty_composer_submits_nudge() {
         b"\r"
     );
     assert!(!app.pending_codex_peer_messages.contains_key(&sibling_id));
+    assert!(!app.codex_peer_injected_composers.contains_key(&sibling_id));
     app.shutdown();
 }
 
@@ -2619,6 +2630,7 @@ fn unfocused_busy_codex_without_draft_queues_nudge_natively() {
         matches!(pending, Some(PendingCodexPeerDelivery::QueueAt { .. })),
         "busy Codex nudge should advance to native queue stage: {pending:?}"
     );
+    assert!(app.codex_peer_injected_composers.contains_key(&sibling_id));
 
     let expected = format_codex_peer_message(&PendingCodexPeerMessage {
         from_pane: sender_id,
@@ -2658,6 +2670,7 @@ fn unfocused_busy_codex_without_draft_queues_nudge_natively() {
         app.ws().panes.get(&sibling_id).expect("pane").test_input(),
         b"\t"
     );
+    assert!(!app.codex_peer_injected_composers.contains_key(&sibling_id));
     app.shutdown();
 }
 
@@ -3651,6 +3664,7 @@ fn unfocused_idle_codex_without_draft_advances_to_submit_stage() {
             .and_then(|q| q.front()),
         Some(PendingCodexPeerDelivery::SubmitAt { .. })
     ));
+    assert!(app.codex_peer_injected_composers.contains_key(&sibling_id));
     app.shutdown();
 }
 
@@ -4443,7 +4457,7 @@ fn refocusing_unfocused_codex_with_existing_draft_shows_pending_overlay() {
 }
 
 #[test]
-fn focused_codex_pending_queue_auto_submits_after_draft_clears_to_unknown_placeholder() {
+fn focused_codex_pending_queue_protects_unknown_normal_text_at_editable_start() {
     let mut app = App::new(40, 80).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
     let codex_id = app
@@ -4478,13 +4492,12 @@ fn focused_codex_pending_queue_auto_submits_after_draft_clears_to_unknown_placeh
     );
     app.flush_pending_codex_peer_messages();
 
-    assert!(app.visible_codex_peer_notification().is_none());
-    assert!(matches!(
-        app.pending_codex_peer_messages
-            .get(&codex_id)
-            .and_then(|q| q.front()),
-        Some(PendingCodexPeerDelivery::SubmitAt { .. })
-    ));
+    assert!(app.visible_codex_peer_notification().is_some());
+    assert!(app
+        .pending_codex_peer_messages
+        .get(&codex_id)
+        .and_then(|q| q.front())
+        .is_none());
     app.shutdown();
 }
 #[test]
@@ -4640,13 +4653,13 @@ fn similarly_worded_codex_draft_without_dim_remains_protected() {
 }
 
 #[test]
-fn unknown_codex_placeholder_at_prompt_is_not_a_draft_without_dim() {
+fn unknown_normal_text_at_prompt_is_protected_without_dim() {
     let mut parser = vt100::Parser::new(40, 80, 0);
     parser.process(b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Write tests for @filename\x1b[1;3H");
 
     assert_eq!(
         codex_composer_has_draft_on_screen(parser.screen()),
-        Some(false)
+        Some(true)
     );
 }
 #[test]
@@ -4666,6 +4679,17 @@ fn colored_codex_placeholder_is_not_a_draft_when_cursor_is_at_prompt() {
 fn codex_composer_draft_uses_cursor_position_on_prompt_row() {
     let mut parser = vt100::Parser::new(40, 80, 0);
     parser.process(b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA typed draft\x1b[1;15H");
+
+    assert_eq!(
+        codex_composer_has_draft_on_screen(parser.screen()),
+        Some(true)
+    );
+}
+
+#[test]
+fn codex_composer_text_at_editable_start_is_still_a_draft() {
+    let mut parser = vt100::Parser::new(40, 80, 0);
+    parser.process(b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA retained nudge\x1b[1;3H");
 
     assert_eq!(
         codex_composer_has_draft_on_screen(parser.screen()),
@@ -6828,5 +6852,393 @@ fn submit_commit_slow_render_survives_null_scrape_between_progress_ticks() {
     app.flush_pending_codex_peer_messages();
     assert_eq!(app.ws().panes[&pane_id].test_input(), b"\r");
     assert_eq!(app.pending_peer_message_count(pane_id), 0);
+    app.shutdown();
+}
+
+fn stale_test_message(from_pane: usize, from_name: Option<&str>) -> PendingCodexPeerMessage {
+    PendingCodexPeerMessage {
+        from_pane,
+        from_name: from_name.map(str::to_string),
+        from_kind: Some(PeerClientKind::Claude),
+    }
+}
+
+fn normalized_stale_test_message(message: &PendingCodexPeerMessage) -> String {
+    format_codex_peer_message(message)
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
+}
+
+fn queue_stale_test_delivery(
+    app: &mut App,
+    pane_id: usize,
+    delivery: PendingCodexPeerDelivery,
+    injected: &[String],
+) {
+    app.pending_codex_peer_messages
+        .insert(pane_id, VecDeque::from([delivery]));
+    app.codex_peer_injected_composers
+        .insert(pane_id, injected.iter().cloned().collect());
+    app.ws_mut()
+        .panes
+        .get_mut(&pane_id)
+        .unwrap()
+        .clear_test_input();
+}
+
+fn stale_test_draft(message: PendingCodexPeerMessage) -> PendingCodexPeerDelivery {
+    PendingCodexPeerDelivery::Draft {
+        message,
+        retries_remaining: CODEX_PEER_NUDGE_MAX_RETRIES,
+        stalled_since: Instant::now(),
+        delivery_sequence: Some(700),
+    }
+}
+
+fn stale_test_await_focus(message: PendingCodexPeerMessage) -> PendingCodexPeerDelivery {
+    PendingCodexPeerDelivery::AwaitFocus {
+        message,
+        retries_remaining: 0,
+        delivery_sequence: Some(701),
+    }
+}
+
+#[test]
+fn released_leftover_is_submitted_by_the_next_draft() {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+    app.codex_peer_injected_composers
+        .insert(pane_id, VecDeque::from([expected.clone()]));
+    seed_codex_idle_composer(&mut app, pane_id, &expected[..44]);
+    app.flush_pending_codex_peer_messages();
+    seed_codex_busy_placeholder(&mut app, pane_id);
+    elapse_codex_submit(&mut app, pane_id, CODEX_PEER_NUDGE_COMMIT_TIMEOUT);
+    app.flush_pending_codex_peer_messages();
+    assert!(!app.pending_codex_peer_messages.contains_key(&pane_id));
+    let focused_id = app
+        .handle_split(
+            &PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split focus away from stale pane");
+    assert_eq!(app.ws().focused_pane_id, focused_id);
+
+    let next = stale_test_message(999, None);
+    queue_stale_test_delivery(
+        &mut app,
+        pane_id,
+        stale_test_draft(next),
+        std::slice::from_ref(&expected),
+    );
+    seed_codex_idle_composer(&mut app, pane_id, &expected);
+    app.flush_pending_codex_peer_messages();
+
+    assert_eq!(app.ws().panes[&pane_id].test_input(), b"\r");
+    assert!(!app.pending_codex_peer_messages.contains_key(&pane_id));
+    assert!(!app.codex_peer_injected_composers.contains_key(&pane_id));
+    assert!(app.codex_peer_notification.is_none());
+    app.shutdown();
+}
+
+#[test]
+fn draft_submits_two_concatenated_own_injections_once() {
+    let (mut app, _sender_id, pane_id) = setup_unfocused_registered_codex();
+    let message = stale_test_message(11, Some("worker"));
+    let expected = normalized_stale_test_message(&message);
+    queue_stale_test_delivery(
+        &mut app,
+        pane_id,
+        stale_test_draft(message),
+        std::slice::from_ref(&expected),
+    );
+    seed_codex_idle_composer(&mut app, pane_id, &format!("{expected}{expected}"));
+
+    app.flush_pending_codex_peer_messages();
+    for _ in 0..3 {
+        app.flush_pending_codex_peer_messages();
+    }
+
+    assert_eq!(app.ws().panes[&pane_id].test_input(), b"\r");
+    assert!(!app.pending_codex_peer_messages.contains_key(&pane_id));
+    app.shutdown();
+}
+
+#[test]
+fn await_focus_submits_two_concatenated_own_injections_once() {
+    let (mut app, _sender_id, pane_id) = setup_unfocused_registered_codex();
+    let message = stale_test_message(11, Some("worker"));
+    let expected = normalized_stale_test_message(&message);
+    queue_stale_test_delivery(
+        &mut app,
+        pane_id,
+        stale_test_await_focus(message),
+        std::slice::from_ref(&expected),
+    );
+    seed_pane_screen(&mut app, pane_id, b"\x1b[2J\x1b[H");
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages[&pane_id].front(),
+        Some(PendingCodexPeerDelivery::AwaitFocus { .. })
+    ));
+    seed_codex_idle_composer(&mut app, pane_id, &format!("{expected}{expected}"));
+
+    app.flush_pending_codex_peer_messages();
+    for _ in 0..3 {
+        app.flush_pending_codex_peer_messages();
+    }
+
+    assert_eq!(app.ws().panes[&pane_id].test_input(), b"\r");
+    assert!(!app.pending_codex_peer_messages.contains_key(&pane_id));
+    app.shutdown();
+}
+
+#[test]
+fn different_sender_leftover_submits_before_current_draft_writes_once() {
+    let (mut app, _sender_id, pane_id) = setup_unfocused_registered_codex();
+    let old_message = stale_test_message(14, Some("old-worker"));
+    let current_message = stale_test_message(23, Some("current-worker"));
+    let old_expected = normalized_stale_test_message(&old_message);
+    let current_payload = format_codex_peer_message(&current_message);
+    queue_stale_test_delivery(
+        &mut app,
+        pane_id,
+        stale_test_draft(current_message),
+        std::slice::from_ref(&old_expected),
+    );
+    seed_codex_idle_composer(&mut app, pane_id, &old_expected);
+
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(app.ws().panes[&pane_id].test_input(), b"\r");
+    assert!(matches!(
+        app.pending_codex_peer_messages[&pane_id].front(),
+        Some(PendingCodexPeerDelivery::Draft { .. })
+    ));
+    app.ws_mut()
+        .panes
+        .get_mut(&pane_id)
+        .unwrap()
+        .clear_test_input();
+    seed_codex_live_ready_placeholder(&mut app, pane_id);
+    app.flush_pending_codex_peer_messages();
+
+    assert_eq!(
+        app.ws().panes[&pane_id].test_input(),
+        current_payload.as_bytes()
+    );
+    assert!(matches!(
+        app.pending_codex_peer_messages[&pane_id].front(),
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn draft_submits_mixed_recorded_injections_when_current_text_is_present() {
+    let (mut app, _sender_id, pane_id) = setup_unfocused_registered_codex();
+    let old_message = stale_test_message(14, Some("old-worker"));
+    let current_message = stale_test_message(23, Some("current-worker"));
+    let old_expected = normalized_stale_test_message(&old_message);
+    let current_expected = normalized_stale_test_message(&current_message);
+    queue_stale_test_delivery(
+        &mut app,
+        pane_id,
+        stale_test_draft(current_message),
+        &[old_expected.clone(), current_expected.clone()],
+    );
+    seed_codex_idle_composer(
+        &mut app,
+        pane_id,
+        &format!("{current_expected}{old_expected}{current_expected}"),
+    );
+
+    app.flush_pending_codex_peer_messages();
+
+    assert_eq!(app.ws().panes[&pane_id].test_input(), b"\r");
+    assert!(!app.pending_codex_peer_messages.contains_key(&pane_id));
+    app.shutdown();
+}
+
+#[test]
+fn differing_user_draft_is_never_submitted_and_still_reaches_await_focus() {
+    let (mut app, _sender_id, pane_id) = setup_unfocused_registered_codex();
+    let message = stale_test_message(7, Some("advisor"));
+    let expected = normalized_stale_test_message(&message);
+    queue_stale_test_delivery(
+        &mut app,
+        pane_id,
+        stale_test_draft(message),
+        std::slice::from_ref(&expected),
+    );
+    seed_codex_idle_composer(&mut app, pane_id, &format!("{expected}usertext"));
+    app.flush_pending_codex_peer_messages();
+    assert!(app.ws().panes[&pane_id].test_input().is_empty());
+    if let Some(PendingCodexPeerDelivery::Draft { stalled_since, .. }) = app
+        .pending_codex_peer_messages
+        .get_mut(&pane_id)
+        .unwrap()
+        .front_mut()
+    {
+        *stalled_since -= CODEX_PEER_DRAFT_STALL_TIMEOUT;
+    }
+    seed_pane_screen(&mut app, pane_id, b"\x1b[2J\x1b[H");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages[&pane_id].front(),
+        Some(PendingCodexPeerDelivery::AwaitFocus { .. })
+    ));
+    assert!(app.codex_peer_injected_composers.contains_key(&pane_id));
+    assert!(app.ws().panes[&pane_id].test_input().is_empty());
+    app.shutdown();
+}
+
+#[test]
+fn idle_bare_prompt_with_stale_text_never_enters_await_focus() {
+    let (mut app, _sender_id, pane_id) = setup_unfocused_registered_codex();
+    let message = stale_test_message(7, None);
+    let expected = normalized_stale_test_message(&message);
+    queue_stale_test_delivery(
+        &mut app,
+        pane_id,
+        stale_test_draft(message),
+        std::slice::from_ref(&expected),
+    );
+    seed_codex_idle_composer(&mut app, pane_id, &expected);
+
+    app.flush_pending_codex_peer_messages();
+
+    assert_eq!(app.ws().panes[&pane_id].test_input(), b"\r");
+    assert!(!app.pending_codex_peer_messages.contains_key(&pane_id));
+    assert!(app.codex_peer_notification.is_none());
+    app.shutdown();
+}
+
+#[test]
+fn end_invisible_exact_text_never_triggers_stale_enter_or_clear() {
+    let (mut app, _sender_id, pane_id) = setup_unfocused_registered_codex();
+    let message = stale_test_message(7, None);
+    let expected = normalized_stale_test_message(&message);
+    queue_stale_test_delivery(
+        &mut app,
+        pane_id,
+        stale_test_draft(message),
+        std::slice::from_ref(&expected),
+    );
+    let (rows, _) = app.ws().panes[&pane_id]
+        .parser
+        .lock()
+        .unwrap()
+        .screen()
+        .size();
+    let screen = format!(
+        "\x1b[2J\x1b[{};1H\u{203a} {}\x1b[{rows};1H  {}\x1b[{rows};10H",
+        rows - 1,
+        &expected[..20],
+        &expected[20..]
+    );
+    seed_pane_screen(&mut app, pane_id, screen.as_bytes());
+
+    app.flush_pending_codex_peer_messages();
+
+    assert!(app.ws().panes[&pane_id].test_input().is_empty());
+    assert!(app.codex_peer_injected_composers.contains_key(&pane_id));
+    assert!(app.pending_codex_peer_messages.contains_key(&pane_id));
+    app.shutdown();
+}
+
+#[test]
+fn end_invisible_other_sender_row_does_not_diverge_submit_at() {
+    let (mut app, pane_id, expected) = setup_slow_codex_submit();
+    app.codex_peer_injected_composers
+        .insert(pane_id, VecDeque::from([expected.clone()]));
+    let other = normalized_stale_test_message(&stale_test_message(14, Some("other")));
+    let (rows, _) = app.ws().panes[&pane_id]
+        .parser
+        .lock()
+        .unwrap()
+        .screen()
+        .size();
+    let screen = format!(
+        "\x1b[2J\x1b[{};1H\u{203a} {}\x1b[{rows};1H  {}\x1b[{rows};10H",
+        rows - 1,
+        &other[..20],
+        &other[20..44]
+    );
+    seed_pane_screen(&mut app, pane_id, screen.as_bytes());
+
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages[&pane_id].front(),
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
+    ));
+    assert!(app.ws().panes[&pane_id].test_input().is_empty());
+    assert!(app.codex_peer_injected_composers.contains_key(&pane_id));
+    seed_codex_idle_composer(&mut app, pane_id, &expected);
+    app.flush_pending_codex_peer_messages();
+
+    assert_eq!(app.ws().panes[&pane_id].test_input(), b"\r");
+    assert!(!app.pending_codex_peer_messages.contains_key(&pane_id));
+    app.shutdown();
+}
+
+#[test]
+fn stale_submission_trace_includes_expected_and_screen_composer() {
+    let _guard = crate::DEBUG_CODEX_PEER_ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "renga-codex-peer-stale-{}-{unique}.jsonl",
+        std::process::id()
+    ));
+    set_codex_peer_debug_log_path_test_override(Some(Some(path.as_os_str().to_owned())));
+    let (mut app, _sender_id, pane_id) = setup_unfocused_registered_codex();
+    let message = stale_test_message(7, Some("advisor"));
+    let expected = normalized_stale_test_message(&message);
+    queue_stale_test_delivery(
+        &mut app,
+        pane_id,
+        stale_test_draft(message),
+        std::slice::from_ref(&expected),
+    );
+    seed_codex_idle_composer(&mut app, pane_id, &expected);
+
+    app.flush_pending_codex_peer_messages();
+    app.shutdown();
+    set_codex_peer_debug_log_path_test_override(Some(None));
+
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .expect("stale trace JSONL")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("trace record"))
+        .collect();
+    let record = records
+        .iter()
+        .find(|record| record["action"] == "stale_injection_submitted")
+        .expect("stale submission trace");
+    assert_eq!(record["expected_composer"], expected);
+    assert_eq!(record["screen_composer"], expected);
+    assert_eq!(record["composer_matches"], true);
+    assert_eq!(record["composer_end_visible"], true);
+    std::fs::remove_file(path).expect("remove stale trace JSONL");
+}
+
+#[test]
+fn subscriber_gone_forgets_injected_composer_text() {
+    let (mut app, _sender_id, pane_id) = setup_unfocused_registered_codex();
+    app.peer_live_subscribers.insert(pane_id);
+    app.codex_peer_injected_composers
+        .insert(pane_id, VecDeque::from(["oldnudge".to_string()]));
+
+    app.handle_peer_subscriber_gone(pane_id, "test_disconnect");
+
+    assert!(!app.codex_peer_injected_composers.contains_key(&pane_id));
     app.shutdown();
 }
