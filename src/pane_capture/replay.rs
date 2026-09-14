@@ -1044,6 +1044,62 @@ fn re_review_full_new_row_with_old_tail_is_partial_overwrite() {
 }
 
 #[test]
+fn reference_screen_applies_resize_clear_between_invisible_reads() {
+    let old = b"old";
+    let hide = b"\x1b[?25l";
+    let show = b"\x1b[?25h";
+    let resize_offset = old.len() + hide.len();
+    let binary = [old.as_slice(), hide, show].concat();
+    let records = vec![
+        serde_json::json!({"sequence":0,"elapsed_us":0,"event":"metadata","version":1,"rows":3,"cols":20}),
+        serde_json::json!({"sequence":1,"elapsed_us":0,"event":"read","bin_offset":0,"read_len":old.len()}),
+        serde_json::json!({"sequence":2,"elapsed_us":0,"event":"parser_apply","bin_offset":0,"byte_len":old.len(),"applied_offset":old.len()}),
+        serde_json::json!({"sequence":3,"elapsed_us":50000,"event":"read","bin_offset":old.len(),"read_len":hide.len()}),
+        serde_json::json!({"sequence":4,"elapsed_us":50000,"event":"parser_apply","bin_offset":old.len(),"byte_len":hide.len(),"applied_offset":resize_offset}),
+        serde_json::json!({"sequence":5,"elapsed_us":51000,"event":"resize","rows":3,"cols":21,"clear":true,"applied_offset":resize_offset}),
+        serde_json::json!({"sequence":6,"elapsed_us":52000,"event":"read","bin_offset":resize_offset,"read_len":show.len()}),
+        serde_json::json!({"sequence":7,"elapsed_us":52000,"event":"parser_apply","bin_offset":resize_offset,"byte_len":show.len(),"applied_offset":binary.len()}),
+    ];
+    let report = replay(&binary, &records, DEFAULT_BURST_GAP_US).unwrap();
+    assert!(
+        report.contains(
+            "raw burst=2 before_equals_after=false third_states=0/1 change=cleared (full clear)"
+        ),
+        "{report}"
+    );
+}
+
+#[test]
+fn erase_released_alone_retains_cleared_draw_and_burst_class() {
+    let old = b"old";
+    let erase = b"\x1b[2J\x1b[H";
+    let binary = [old.as_slice(), erase].concat();
+    let records = vec![
+        serde_json::json!({"sequence":0,"elapsed_us":0,"event":"metadata","version":1,"rows":3,"cols":20}),
+        serde_json::json!({"sequence":1,"elapsed_us":0,"event":"read","bin_offset":0,"read_len":old.len()}),
+        serde_json::json!({"sequence":2,"elapsed_us":0,"event":"parser_apply","bin_offset":0,"byte_len":old.len(),"applied_offset":old.len()}),
+        serde_json::json!({"sequence":3,"elapsed_us":0,"event":"app_draw","drawn":true,"applied_offset":old.len(),"scrollback":0}),
+        serde_json::json!({"sequence":4,"elapsed_us":50000,"event":"transition","kind":"erase_hold","action":"open","bin_offset":old.len()}),
+        serde_json::json!({"sequence":5,"elapsed_us":50000,"event":"read","bin_offset":old.len(),"read_len":erase.len()}),
+        serde_json::json!({"sequence":6,"elapsed_us":90000,"event":"transition","kind":"erase_hold","action":"close","bin_offset":binary.len(),"reason":"tick_release"}),
+        serde_json::json!({"sequence":7,"elapsed_us":90000,"event":"parser_apply","bin_offset":old.len(),"byte_len":erase.len(),"applied_offset":binary.len()}),
+        serde_json::json!({"sequence":8,"elapsed_us":91000,"event":"app_draw","drawn":true,"applied_offset":binary.len(),"scrollback":0}),
+    ];
+    let report = replay(&binary, &records, DEFAULT_BURST_GAP_US).unwrap();
+    assert!(
+        report.contains(
+            "drawn burst=2 before_equals_after=false third_states=0/1 change=cleared (full clear)"
+        ),
+        "{report}"
+    );
+    let draw = report
+        .lines()
+        .find(|line| line.starts_with("draw seq=8 "))
+        .unwrap();
+    assert!(draw.contains("class=cleared (full clear)"), "{draw}");
+}
+
+#[test]
 fn shifted_class_requires_three_matches_and_more_than_unchanged_rows() {
     let screen = |rows: &[&str]| Screen(rows.iter().map(|row| (*row).into()).collect());
     let pre = screen(&["a", "b", "c", "d", "footer"]);
