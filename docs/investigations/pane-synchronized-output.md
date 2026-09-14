@@ -56,7 +56,7 @@ a frame has no synchronization effect. All marker bytes still reach vt100.
 
 ## Measured scope
 
-The same capture forced a full-pane clear and rewrite of about 2.7 KiB. That
-large repaint was not enclosed by DEC 2026 markers. This change makes marked
-synchronized-output frames atomic; large unmarked repaints remain applied per
-read and are tracked separately.
+A later capture with forced resizes observed full-pane clears and rewrites of
+about 2.7 KiB. Those large repaints were not enclosed by DEC 2026 markers. This
+change makes marked synchronized-output frames atomic; large unmarked repaints
+remain applied per read and are tracked separately.

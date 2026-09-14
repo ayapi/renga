@@ -737,7 +737,9 @@ because downstream is required to read the `[code]` token for branching.
 Applying a DEC private mode 2026 frame to the pane parser in one update is an
 internal timing change. `inspect_pane` may now keep returning the last complete
 screen while such a frame is in progress, then expose the completed frame all
-at once. The response schema and snapshot meaning are unchanged.
+at once. A partially applied frame was never a documented snapshot outcome, so
+this uses section 3 of `docs/semver-policy.md` for undocumented or deferred
+behavior changes. The response schema and snapshot meaning are unchanged.
 
 Delaying an internal push-client readiness declaration during startup is not a
 semantic change under the policy in `docs/semver-policy.md` section 3: the same

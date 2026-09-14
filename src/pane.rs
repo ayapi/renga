@@ -2218,6 +2218,26 @@ mod tests {
                 "reader emitted an event before the synchronized frame completed"
             );
         }
+
+        fn finish_with_eof(&mut self) {
+            let input = self.input.take().expect("reader input available");
+            input.send(Vec::new()).expect("send fake PTY EOF");
+            drop(input);
+            self.join_reader();
+        }
+
+        fn finish_with_error(&mut self) {
+            drop(self.input.take().expect("reader input available"));
+            self.join_reader();
+        }
+
+        fn join_reader(&mut self) {
+            self.handle
+                .take()
+                .expect("reader thread available")
+                .join()
+                .expect("join fake PTY reader");
+        }
     }
 
     impl Drop for ReaderHarness {
@@ -2304,6 +2324,40 @@ mod tests {
         );
         assert_eq!(harness.recv_output(), b" resumed".len());
         assert!(harness.screen().starts_with("stalled resumed"));
+    }
+
+    #[test]
+    fn synchronized_output_flushes_buffer_before_eof_event() {
+        let mut harness = ReaderHarness::new();
+        let data = b"\x1b[?2026hbuffered at eof";
+        harness.send(data);
+        harness.assert_no_event();
+
+        harness.finish_with_eof();
+
+        assert_eq!(harness.recv_output(), data.len());
+        assert!(harness.screen().starts_with("buffered at eof"));
+        assert!(matches!(
+            harness.events.recv_timeout(Duration::from_secs(1)),
+            Ok(AppEvent::PtyEof(4242))
+        ));
+    }
+
+    #[test]
+    fn synchronized_output_flushes_buffer_before_read_error_exit() {
+        let mut harness = ReaderHarness::new();
+        let data = b"\x1b[?2026hbuffered at error";
+        harness.send(data);
+        harness.assert_no_event();
+
+        harness.finish_with_error();
+
+        assert_eq!(harness.recv_output(), data.len());
+        assert!(harness.screen().starts_with("buffered at error"));
+        assert!(matches!(
+            harness.events.recv_timeout(Duration::from_millis(40)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 
     #[test]
@@ -2443,6 +2497,31 @@ mod tests {
         harness.send(SYNCHRONIZED_OUTPUT_END);
         harness.recv_output();
         harness.assert_no_event();
+    }
+
+    #[test]
+    fn synchronized_output_runs_detectors_for_reads_wholly_inside_frame() {
+        let harness = ReaderHarness::new();
+        harness.send(b"\x1b[?2026hheld");
+        harness.assert_no_event();
+
+        harness.send(b"\x1b]7;file://host/c/Users/color/inside-frame\x07");
+        let cwd = harness
+            .events
+            .recv_timeout(Duration::from_secs(1))
+            .expect("OSC 7 detector should run before the frame closes");
+        assert!(matches!(
+            cwd,
+            AppEvent::CwdChanged(4242, ref path)
+                if path.ends_with(PathBuf::from("inside-frame"))
+        ));
+        assert!(harness.prompt_seen.load(Ordering::Acquire));
+        assert!(harness.screen().trim().is_empty());
+        harness.assert_no_event();
+
+        harness.send(SYNCHRONIZED_OUTPUT_END);
+        harness.recv_output();
+        assert!(harness.screen().starts_with("held"));
     }
 
     #[test]
