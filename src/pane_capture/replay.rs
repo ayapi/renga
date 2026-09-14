@@ -62,7 +62,7 @@ fn class(before: &Screen, after: &Screen) -> String {
 fn partial_overwrite_chars(pre: &str, post: &str, current: &str) -> Option<usize> {
     let pre: Vec<_> = pre.chars().collect();
     let post: Vec<_> = post.chars().collect();
-    (1..post.len()).find(|&k| {
+    (1..=post.len()).find(|&k| {
         post[..k]
             .iter()
             .chain(pre.iter().skip(k))
@@ -128,6 +128,7 @@ struct Snapshot {
     offset: usize,
     screen: Screen,
     scrollback: usize,
+    resize_clear: bool,
 }
 
 fn number(value: &Value, key: &str) -> Result<u64> {
@@ -161,10 +162,11 @@ fn advance_raw(
     resizes: &[&Value],
     next_resize: &mut usize,
     end: usize,
+    include_end: bool,
 ) -> Result<()> {
     while let Some(record) = resizes.get(*next_resize) {
         let position = usize::try_from(number(record, "applied_offset")?)?;
-        if position > end {
+        if position > end || (position == end && !include_end) {
             break;
         }
         ensure!(
@@ -359,6 +361,40 @@ fn erase_hold_close(records: &[Value], erase_offset: usize) -> Option<(usize, &V
         .find(|(_, record)| is_transition(record, "close"))
 }
 
+struct EraseCluster {
+    span: std::ops::Range<usize>,
+    first_end: usize,
+    commands: usize,
+}
+
+fn erase_clusters(
+    erases: Vec<std::ops::Range<usize>>,
+    payloads: &[usize],
+    resize_cuts: &[usize],
+) -> Vec<EraseCluster> {
+    let mut clusters: Vec<EraseCluster> = Vec::new();
+    for erase in erases {
+        if let Some(previous) = clusters.last_mut() {
+            let next_payload =
+                payloads.get(payloads.partition_point(|&offset| offset < previous.span.end));
+            let has_resize = resize_cuts
+                .iter()
+                .any(|&offset| offset >= previous.span.end && offset <= erase.start);
+            if next_payload.is_none_or(|&offset| offset >= erase.start) && !has_resize {
+                previous.span.end = erase.end;
+                previous.commands += 1;
+                continue;
+            }
+        }
+        clusters.push(EraseCluster {
+            first_end: erase.end,
+            span: erase,
+            commands: 1,
+        });
+    }
+    clusters
+}
+
 /// Link erase-only bursts to the later payload burst. This is an association
 /// table, not a change to the 40 ms burst definition used by the other tables.
 fn erase_rewrite_table(
@@ -370,6 +406,18 @@ fn erase_rewrite_table(
     gap_us: u64,
 ) -> Result<()> {
     let (erases, payloads) = repaint_tokens(binary);
+    let resize_cuts: Vec<_> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| record["event"] == "resize" && record["clear"] == true)
+        .map(|(sequence, _)| {
+            reads
+                .iter()
+                .find(|read| read.record > sequence)
+                .map_or(binary.len(), |read| read.offset)
+        })
+        .collect();
+    let clusters = erase_clusters(erases, &payloads, &resize_cuts);
     let mut bursts = Vec::new();
     let mut start = 0;
     while start < reads.len() {
@@ -381,14 +429,15 @@ fn erase_rewrite_table(
         start = end;
     }
     let has_draws = records.iter().any(|record| record["event"] == "app_draw");
-    for (erase_index, erase) in erases.iter().enumerate() {
-        // A split erase is recognized when its final byte arrives.
-        let erase_read = reads.partition_point(|read| read.offset + read.len < erase.end);
+    for (erase_index, cluster) in clusters.iter().enumerate() {
+        let erase = &cluster.span;
+        // Time the first erase, but search for payload after the entire cluster.
+        let erase_read = reads.partition_point(|read| read.offset + read.len < cluster.first_end);
         let burst = bursts.partition_point(|range| range.end <= erase_read);
         let read = &reads[erase_read];
-        let next_erase = erases
+        let next_erase = clusters
             .get(erase_index + 1)
-            .map_or(binary.len(), |range| range.start);
+            .map_or(binary.len(), |cluster| cluster.span.start);
         // A resize injects another clear and ends attribution to this raw erase.
         let next_resize = records
             .iter()
@@ -438,6 +487,7 @@ fn erase_rewrite_table(
                         .iter()
                         .filter(|draw| {
                             draw.scrollback == 0
+                                && !draw.resize_clear
                                 && draw.offset > offset
                                 && draw.offset < end
                                 && next_resize.is_none_or(|sequence| draw.record < sequence)
@@ -465,7 +515,7 @@ fn erase_rewrite_table(
                     "none".into(),
                 )
             };
-        writeln!(out, "erase_rewrite kind=PTY_ERASE burst={} erase_offset={} erase_read={} erase_elapsed_us={} first_rewrite_delay_us={delay} hold_close_reason={reason} closed_before_rewrite={before} rewrite_span={span} rewrite_bytes={rewrite_bytes} rewrite_reads={rewrite_reads} draws_inside_rewrite={inside_draws}", burst + 1, erase.start, erase_read + 1, read.time).unwrap();
+        writeln!(out, "erase_rewrite kind=PTY_ERASE burst={} erase_offset={} erase_read={} erase_elapsed_us={} first_rewrite_delay_us={delay} hold_close_reason={reason} closed_before_rewrite={before} rewrite_span={span} rewrite_bytes={rewrite_bytes} rewrite_reads={rewrite_reads} draws_inside_rewrite={inside_draws} erase_commands={} cluster_span=[{},{})", burst + 1, erase.start, erase_read + 1, read.time, cluster.commands, erase.start, erase.end).unwrap();
     }
     for (sequence, record) in records
         .iter()
@@ -497,6 +547,7 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
     let mut draws = Vec::<Snapshot>::new();
     let mut raw_offset = 0;
     let mut applied_offset = 0;
+    let mut pending_resize_clear = false;
     let mut out = String::new();
     let mut last_draw = Screen::of(&applied);
     for (index, record) in records.iter().enumerate() {
@@ -522,6 +573,7 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                     &resizes,
                     &mut next_resize,
                     offset,
+                    true,
                 )?;
                 let pre = Screen::of(&raw);
                 advance_raw(
@@ -531,6 +583,7 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                     &resizes,
                     &mut next_resize,
                     end,
+                    false,
                 )?;
                 reads.push(Read {
                     record: index,
@@ -553,12 +606,16 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                     "invalid apply range at record {index}"
                 );
                 applied.process(&binary[offset..end]);
+                if end > offset {
+                    pending_resize_clear = false;
+                }
                 applied_offset = end;
                 applies.push(Snapshot {
                     record: index,
                     offset: end,
                     screen: Screen::of(&applied),
                     scrollback: 0,
+                    resize_clear: pending_resize_clear,
                 });
             }
             "resize" => {
@@ -567,6 +624,7 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                     "resize offset mismatch"
                 );
                 apply_resize(&mut applied, record)?;
+                pending_resize_clear |= record["clear"] == true;
             }
             "app_draw" => {
                 ensure!(
@@ -588,6 +646,8 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                 applied.screen_mut().set_scrollback(0);
                 let change = if scrollback > 0 {
                     format!("scrolled_view scrollback={scrollback}")
+                } else if pending_resize_clear {
+                    "resize_clear".into()
                 } else {
                     class(&last_draw, &screen)
                 };
@@ -600,6 +660,7 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                     offset: applied_offset,
                     screen,
                     scrollback,
+                    resize_clear: pending_resize_clear,
                 });
             }
             "app_tick_release" | "reader_exit" => {}
@@ -639,10 +700,32 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
             .map(|pair| pair[1].time.saturating_sub(pair[0].time))
             .max()
             .unwrap_or(0);
-        writeln!(out, "burst={burst} kind={kind} reads={} bytes={} duration_us={} largest_gap_us={largest_gap} {}", end - start, bytes.len(), last.time.saturating_sub(first.time), scrolling_counts(bytes)).unwrap();
         let record_end = reads.get(end).map_or(records.len(), |read| read.record);
+        let resize_clears = records[first.record..record_end]
+            .iter()
+            .filter(|record| record["event"] == "resize" && record["clear"] == true)
+            .count();
+        let resize_clear_draws = draws
+            .iter()
+            .filter(|snapshot| {
+                snapshot.resize_clear
+                    && snapshot.scrollback == 0
+                    && snapshot.record >= first.record
+                    && snapshot.record < record_end
+            })
+            .count();
+        let resize_clear_applies = applies
+            .iter()
+            .filter(|snapshot| {
+                snapshot.resize_clear
+                    && snapshot.record >= first.record
+                    && snapshot.record < record_end
+            })
+            .count();
+        writeln!(out, "burst={burst} kind={kind} reads={} bytes={} duration_us={} largest_gap_us={largest_gap} {} resize_clears={resize_clears} resize_clear_draws={resize_clear_draws} resize_clear_applies={resize_clear_applies}", end - start, bytes.len(), last.time.saturating_sub(first.time), scrolling_counts(bytes)).unwrap();
         let in_window = |snapshot: &&Snapshot| {
             snapshot.scrollback == 0
+                && !snapshot.resize_clear
                 && snapshot.record >= first.record
                 && snapshot.record < record_end
         };
@@ -665,7 +748,11 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
             &last.post,
             &applies
                 .iter()
-                .filter(|snapshot| snapshot.offset > first.offset && snapshot.offset <= byte_end)
+                .filter(|snapshot| {
+                    !snapshot.resize_clear
+                        && snapshot.offset > first.offset
+                        && snapshot.offset <= byte_end
+                })
                 .map(|snapshot| &snapshot.screen)
                 .collect::<Vec<_>>(),
         );
@@ -702,7 +789,10 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                 draws
                     .iter()
                     .filter(|draw| {
-                        draw.scrollback == 0 && draw.offset > hide && draw.offset < envelope_end
+                        draw.scrollback == 0
+                            && !draw.resize_clear
+                            && draw.offset > hide
+                            && draw.offset < envelope_end
                     })
                     .count()
                     .to_string()
@@ -832,6 +922,128 @@ fn review_mid_row_overwrite_preserves_top_prefix_signature() {
 }
 
 #[test]
+fn re_review_adjacent_erases_with_same_read_payload_are_one_cluster() {
+    let bytes = b"\x1b[2J\x1b[3J\x1b[Hrow";
+    let records = vec![
+        serde_json::json!({"sequence":0,"elapsed_us":0,"event":"metadata","version":1,"rows":4,"cols":20}),
+        serde_json::json!({"sequence":1,"elapsed_us":1500,"event":"transition","kind":"erase_hold","action":"open","bin_offset":0}),
+        serde_json::json!({"sequence":2,"elapsed_us":1500,"event":"read","bin_offset":0,"read_len":bytes.len()}),
+        serde_json::json!({"sequence":3,"elapsed_us":41500,"event":"transition","kind":"erase_hold","action":"close","bin_offset":bytes.len(),"reason":"tick_release"}),
+        serde_json::json!({"sequence":4,"elapsed_us":41500,"event":"parser_apply","bin_offset":0,"byte_len":bytes.len(),"applied_offset":bytes.len()}),
+    ];
+    let report = replay(bytes, &records, DEFAULT_BURST_GAP_US).unwrap();
+    let rows: Vec<_> = report
+        .lines()
+        .filter(|line| line.starts_with("erase_rewrite kind=PTY_ERASE"))
+        .collect();
+    assert_eq!(rows.len(), 1, "{report}");
+    assert!(
+        rows[0].contains(
+            "first_rewrite_delay_us=0 hold_close_reason=tick_release closed_before_rewrite=false"
+        ),
+        "{}",
+        rows[0]
+    );
+    assert!(rows[0].contains("rewrite_bytes=3 rewrite_reads=1"));
+}
+
+fn resize_after_repaint_fixture() -> (Vec<u8>, Vec<Value>) {
+    let chunks: &[&[u8]] = &[b"old", b"\x1b[?25l", b"\x1b[Hnew", b"!"];
+    let mut records = Vec::new();
+    let mut add = |time: u64, mut record: Value| {
+        record["sequence"] = records.len().into();
+        record["elapsed_us"] = time.into();
+        records.push(record);
+    };
+    add(
+        0,
+        serde_json::json!({"event":"metadata","version":1,"rows":3,"cols":20}),
+    );
+    let mut offset = 0;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let time = [0, 50_000, 51_000, 100_000][index];
+        let end = offset + chunk.len();
+        add(
+            time,
+            serde_json::json!({"event":"read","bin_offset":offset,"read_len":chunk.len()}),
+        );
+        add(
+            time,
+            serde_json::json!({"event":"parser_apply","bin_offset":offset,"byte_len":chunk.len(),"applied_offset":end}),
+        );
+        add(
+            time,
+            serde_json::json!({"event":"app_draw","drawn":true,"applied_offset":end,"scrollback":0}),
+        );
+        if index == 2 {
+            add(
+                52_000,
+                serde_json::json!({"event":"resize","rows":3,"cols":21,"clear":true,"applied_offset":end}),
+            );
+            add(
+                52_500,
+                serde_json::json!({"event":"parser_apply","bin_offset":end,"byte_len":0,"applied_offset":end}),
+            );
+            for time in [53_000, 54_000] {
+                add(
+                    time,
+                    serde_json::json!({"event":"app_draw","drawn":true,"applied_offset":end,"scrollback":0}),
+                );
+            }
+        }
+        offset = end;
+    }
+    (chunks.concat(), records)
+}
+
+#[test]
+fn re_review_resize_at_read_end_does_not_clear_previous_burst() {
+    let (binary, records) = resize_after_repaint_fixture();
+    let report = replay(&binary, &records, DEFAULT_BURST_GAP_US).unwrap();
+    let raw = report
+        .lines()
+        .find(|line| line.starts_with("raw burst=2 "))
+        .unwrap();
+    assert!(
+        raw.contains("third_states=0/1 change=rows_changed(1)"),
+        "{report}"
+    );
+    assert!(report.contains("applied burst=2 before_equals_after=false third_states=0/2"));
+}
+
+#[test]
+fn re_review_post_resize_snapshots_are_separate_from_repaint_thirds() {
+    let (binary, records) = resize_after_repaint_fixture();
+    let report = replay(&binary, &records, DEFAULT_BURST_GAP_US).unwrap();
+    assert!(
+        report.contains("resize_clears=1 resize_clear_draws=2 resize_clear_applies=1"),
+        "{report}"
+    );
+    assert!(report.contains("drawn burst=2 before_equals_after=false third_states=0/2"));
+    assert_eq!(
+        report
+            .lines()
+            .filter(|line| line.starts_with("draw ") && line.contains("class=resize_clear"))
+            .count(),
+        2
+    );
+    assert!(report.contains("drawn burst=3 before_equals_after=false third_states=0/1"));
+}
+
+#[test]
+fn re_review_full_new_row_with_old_tail_is_partial_overwrite() {
+    let screen = |rows: &[&str]| Screen(rows.iter().map(|row| (*row).into()).collect());
+    let pre = screen(&["alpha", "bravo", "charlie", "echo", "footer"]);
+    let post = screen(&["bravo", "charlie", "delta", "foxtrot", "footer"]);
+    let current = screen(&["bravo", "charlie", "deltaie", "echo", "footer"]);
+    let result = composition(&pre, &post, &current);
+    assert!(
+        result.contains("top_prefix=true partial_row=2 partial_chars=5"),
+        "{result}"
+    );
+}
+
+#[test]
 fn shifted_class_requires_three_matches_and_more_than_unchanged_rows() {
     let screen = |rows: &[&str]| Screen(rows.iter().map(|row| (*row).into()).collect());
     let pre = screen(&["a", "b", "c", "d", "footer"]);
@@ -929,9 +1141,9 @@ fn synthetic_replay_tracks_resize_split_envelope_and_read_only_input() {
     );
     let binary = [a.as_slice(), b].concat();
     let report = replay(&binary, &records, DEFAULT_BURST_GAP_US).unwrap();
-    assert!(report.contains("class=cleared (full clear)"));
+    assert!(report.contains("class=resize_clear"));
     assert!(
-        report.contains("spans_multiple_reads=true duration_us=5000 draws=2"),
+        report.contains("spans_multiple_reads=true duration_us=5000 draws=1"),
         "{report}"
     );
     records.retain(|record| record["event"] != "app_draw");

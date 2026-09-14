@@ -226,6 +226,9 @@ precede those held bytes in raw replay, even though their read records have
 already arrived. Actual applied/drawn replay retains file order and performs
 the resize at its record, matching the live parser. This prevents a delayed
 resize clear from manufacturing a false raw post-screen or third state.
+A resize exactly at a read's exclusive end is applied before the next read,
+after the preceding read's post-screen has been sampled. It must not turn a
+completed burst into a cleared screen just because the resize record follows it.
 Each table prints `before_equals_after` and `third_states=X/Y`: a third state
 differs from **both** pre and post. `raw` samples after reads 1 through n-1,
 reproducing the original "5 of 9" form; `applied` samples each actual parser
@@ -234,6 +237,13 @@ draws from its first read record until the next burst's first read record.
 A draw with nonzero scrollback is labeled `scrolled_view` and excluded from
 third-state samples and partial-envelope/rewrite draw counts. It does not
 replace the previous live-view screen used for the next live draw comparison.
+After a resize clear, live draws are labeled `resize_clear` until the next
+positive-length parser application. These draws, and any zero-byte application
+snapshots in that interval, are excluded from repaint third-state and partial
+envelope/rewrite counts. Burst rows separately report `resize_clears`,
+`resize_clear_draws`, and `resize_clear_applies` over their record window. The
+black frames remain visible in the report without being attributed to PTY
+rewriting. Ordinary repaint sampling resumes when PTY bytes are applied.
 A release triggered by a later read is therefore still assigned to the bytes
 it applied. Delayed or suppressed draws can produce fewer samples.
 
@@ -248,14 +258,17 @@ Each draw and table snapshot also reports its change from the previous screen:
 - `rows_changed(n)`: other changes, with the number of differing rows.
 - `scrolled_view scrollback=n`: a user-scrolled view; excluded from repaint
   comparisons as described above.
+- `resize_clear`: a live view after a parser-injected clear, before another
+  PTY byte is applied; counted separately from repaint intermediates.
 
 Every third state prints mutually exclusive `post_only`, `pre_only`, `both`,
 and `neither` row counts. `top_prefix=true` means post-only rows precede
 pre-only rows, with both sets present; rows equal to both are neutral. At most
 one neither row may sit between those sets if it is a partial overwrite:
-for some character count `0 < k < len(post[j])`, it equals
+for some character count `0 < k <= len(post[j])`, it equals
 `post[j][..k] + pre[j][k..]` (an exhausted old suffix is empty). For example,
-writing `del` over `charlie` towards `delta` leaves `delrlie`. The table prints
+writing `del` over `charlie` towards `delta` leaves `delrlie`; writing all of
+`delta` before the line erase leaves `deltaie`, which also qualifies. The table prints
 its zero-based `partial_row` and `partial_chars=k`, or `none` for both when
 the split falls between rows. Matching uses Unicode characters, not bytes.
 Any other neither row makes the flag false. The mutually exclusive row counts
@@ -271,11 +284,17 @@ ends at the last indexed byte and prints `complete=false`. Burst rows also
 count DECSTBM, SU, SD, IL, DL, RI, EL (`ESC[K`), and ED (`ESC[J`), including
 numeric CSI parameters, to identify scrolling operations.
 
-The additional `erase_rewrite` table follows each raw erase into its later
-rewrite, even when a long gap places the rewrite in a separate 40 ms burst.
+The additional `erase_rewrite` table follows each raw erase cluster into its
+later rewrite, even when a long gap places it in a separate 40 ms burst.
+Consecutive erase commands with no printable payload between them form one
+cluster: `ESC[2J ESC[3J` (without the space) produces one row. Its rewrite search
+starts after the final command, avoiding a false early-close row for the first
+erase. `erase_commands` and `cluster_span` describe the group. An intervening
+resize clear ends the group and its attribution.
 `kind=PTY_ERASE` rows name the erase's burst, byte offset, recognition read,
-and timestamp; a split erase is recognized by the read containing its final
-byte. `first_rewrite_delay_us` is the time from that read to the read containing
+and timestamp using the first command in the cluster; a split first command
+is recognized by the read containing its final byte. `first_rewrite_delay_us`
+is the time from that read to the read containing
 the first printable payload byte after the erase. Cursor positioning, style,
 cursor visibility, and OSC/DCS/control strings are skipped when finding that
 payload; spaces count as payload. Thus an erase followed only by a home command
@@ -294,6 +313,10 @@ counts the raw span, including its intervening/trailing controls;
 true draws whose applied offset is strictly inside the span, before any next
 resize clear and with scrollback zero; it is `n/a` without draw records. This association is an explicit
 measurement rule, not proof that arbitrary later text belongs to a repaint.
+The accepted attribution rule deliberately stops at a resize clear: the raw
+erase is not credited with subsequent rewrite reads after that separate clear.
+For the reviewed A1 trace this yields `rewrite_reads=1`; the resize has its own
+row rather than being silently folded into the earlier erase episode.
 
 Parser-injected resize clears appear as separate `kind=RESIZE_CLEAR` rows,
 with their sequence, timestamp, applied offset, and seven injected clear/home
