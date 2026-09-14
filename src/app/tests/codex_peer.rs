@@ -5864,11 +5864,80 @@ fn expired_submit_at_stays_counted_and_is_requeued_on_flush() {
 #[test]
 fn empty_reconcile_after_reregister_reports_each_unconsumed_codex_handover() {
     let (mut app, sender, target, delivery_id, rx) = retain_one_codex_handover();
+    app.handle_peer_subscriber_gone(target, "event_bus_closed");
     app.handle_peer_register_client(target, PeerClientKind::Codex)
         .unwrap();
     app.handle_peer_inbox_reconcile(target, &[], &[], 0, 0)
         .unwrap();
     assert_one_loss_notice(&rx, delivery_id, sender, target, "peer_restarted");
+    app.shutdown();
+}
+
+#[test]
+fn refused_claude_register_preserves_codex_handover_generation_and_ledger() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (_sub_id, rx) = app.event_bus.subscribe();
+    let sender = app.ws().focused_pane_id;
+    let target = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split target");
+    app.handle_peer_register_client(target, PeerClientKind::Codex)
+        .expect("register Codex");
+    app.handle_peer_subscriber_arrived(target);
+    let generation = app.peer_handover_generations[&target];
+    let message = PendingPeerInboxMessage {
+        from_pane: sender,
+        from_name: None,
+        from_kind: None,
+        body: "arrived after reconcile snapshot".into(),
+        ts_ms: 0,
+        debug_peer_inbox_sequence: None,
+        requeued_delivery_id: None,
+        requeued_nudge: None,
+        system_generated: false,
+    };
+    app.track_peer_handover(target, 9999, &message);
+
+    app.handle_peer_register_client(target, PeerClientKind::Claude)
+        .expect("refuse nested Claude registration");
+    app.handle_peer_inbox_reconcile(target, &[], &[], 0, 0)
+        .expect("reconcile Codex snapshot");
+
+    assert_eq!(app.peer_handover_generations[&target], generation);
+    assert!(app.peer_handovers[&target]
+        .iter()
+        .any(|entry| entry.delivery_id == 9999));
+    assert!(rx
+        .try_iter()
+        .all(|event| !matches!(event, ipc::Event::PeerMessageLost { .. })));
+    app.shutdown();
+}
+
+#[test]
+fn refused_claude_register_preserves_handover_disconnect_deadline() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let pane_id = app.ws().focused_pane_id;
+    app.handle_peer_register_client(pane_id, PeerClientKind::Codex)
+        .expect("register Codex");
+    app.handle_peer_subscriber_arrived(pane_id);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    app.peer_handover_disconnect_deadlines
+        .insert(pane_id, deadline);
+
+    app.handle_peer_register_client(pane_id, PeerClientKind::Claude)
+        .expect("refuse nested Claude registration");
+
+    assert_eq!(
+        app.peer_handover_disconnect_deadlines.get(&pane_id),
+        Some(&deadline)
+    );
     app.shutdown();
 }
 

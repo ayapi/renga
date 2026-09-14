@@ -1136,7 +1136,7 @@ impl App {
         kind: PeerClientKind,
         update_path: &'static str,
         pane_title_seen: Option<(bool, bool)>,
-    ) -> PeerClientKind {
+    ) -> (PeerClientKind, bool) {
         let old_kind = self.peer_client_kinds.get(&pane_id).copied();
         if old_kind == Some(PeerClientKind::Codex)
             && kind == PeerClientKind::Claude
@@ -1149,11 +1149,11 @@ impl App {
                 update_path,
                 pane_title_seen,
             );
-            return PeerClientKind::Codex;
+            return (PeerClientKind::Codex, false);
         }
         let old_kind = self.peer_client_kinds.insert(pane_id, kind);
         log_codex_peer_kind_update(pane_id, old_kind, kind, update_path, pane_title_seen);
-        kind
+        (kind, true)
     }
 
     #[cfg(test)]
@@ -2124,10 +2124,13 @@ impl App {
                 .get(&resolved_pane_id)
                 .map(|pane| (pane.codex_ever_seen(), pane.claude_ever_seen()))
         });
-        self.peer_handover_disconnect_deadlines.remove(&pane_id);
-        let generation = self.peer_handover_generations.entry(pane_id).or_default();
-        *generation = generation.saturating_add(1);
-        self.update_peer_client_kind(pane_id, kind, "register", pane_title_seen);
+        let (_, accepted) =
+            self.update_peer_client_kind(pane_id, kind, "register", pane_title_seen);
+        if accepted {
+            self.peer_handover_disconnect_deadlines.remove(&pane_id);
+            let generation = self.peer_handover_generations.entry(pane_id).or_default();
+            *generation = generation.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -2171,7 +2174,7 @@ impl App {
         // observed before this post-ack request. A register racing the final
         // disconnect can still see the old liveness state; the next register
         // self-corrects that pre-existing stale-kind window.
-        let effective_kind =
+        let (effective_kind, _) =
             self.update_peer_client_kind(pane_id, kind, "set_ready", pane_title_seen);
         self.peer_delivery_ready.insert(pane_id);
         let messages = self.pending_peer_inbox.remove(&pane_id);
