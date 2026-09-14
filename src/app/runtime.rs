@@ -2,6 +2,21 @@ use super::*;
 
 impl App {
     pub fn drain_pty_events(&mut self) -> bool {
+        self.drain_pty_events_at(Instant::now())
+    }
+
+    pub(crate) fn drain_pty_events_at(&mut self, now: Instant) -> bool {
+        // Erase-keyed output produces no event while held, so this pass must
+        // run independently of `dirty` and before draining the channel. Its
+        // generated PtyOutput is then counted and gated exactly like reader
+        // output in the same UI iteration.
+        let event_tx = self.event_tx.clone();
+        for workspace in &self.workspaces {
+            for pane in workspace.panes.values() {
+                pane.flush_expired_output_at(now, &event_tx);
+            }
+        }
+
         let mut had_events = false;
         // Track state-changing events (pane exit, cwd update) separately
         // from raw PTY output. When `ime_freeze_panes_on_overlay` is on

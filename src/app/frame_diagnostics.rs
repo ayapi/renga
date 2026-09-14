@@ -186,6 +186,34 @@ pub(crate) fn record_app_event(pty_output: Option<(usize, usize)>) {
     });
 }
 
+#[cfg(test)]
+pub(crate) fn begin_test_frame(started_at: Instant) {
+    STATE.with(|state| {
+        state.borrow_mut().frame = Some(FrameData {
+            started_at: Some(started_at),
+            preview_kind: "none",
+            ..FrameData::default()
+        });
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn output_bytes_for_test(pane_id: usize) -> usize {
+    STATE.with(|state| {
+        state
+            .borrow()
+            .frame
+            .as_ref()
+            .and_then(|frame| frame.output_bytes_by_pane.get(&pane_id).copied())
+            .unwrap_or_default()
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_frame() {
+    STATE.with(|state| state.borrow_mut().frame = None);
+}
+
 pub(crate) fn record_ipc_command(
     kind: &'static str,
     pane_id: Option<usize>,

@@ -347,6 +347,17 @@ parser in one update. An incomplete frame is released on the first later PTY
 read after 350 ms, when its buffered payload exceeds 1 MiB, or when the reader
 exits.
 
+Outside an open DEC 2026 frame, `ESC[2J` and `ESC[3J` begin an erase-keyed
+snapshot hold. Its bytes reach the parser together on the first later PTY read
+or UI iteration at or after 40 ms, when the shared 1 MiB cap is exceeded, or
+when the reader exits. The UI iteration can add up to one polling interval:
+about 33 ms at the default 30 fps and up to 1 second at `--fps 1`. A DEC 2026
+frame that begins during the hold retains its own atomicity if the erase hold
+closes first. `ESC[H` alone does not start a hold and ordinary output retains
+one parser update and `PtyOutput` notification per PTY read. This extends the
+stable snapshot guarantee as a backward-compatible bug fix under
+[`semver-policy.md` section 3](./semver-policy.md#3-what-counts-as-a-breaking-change).
+
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `target` | string | yes | |

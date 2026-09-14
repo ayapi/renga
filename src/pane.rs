@@ -17,6 +17,10 @@ const MOUSE_PROTOCOL_CACHE_TTL: Duration = Duration::from_secs(2);
 /// the next PTY read flushes it and returns the pane to pass-through mode.
 const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_millis(350);
 
+/// Minimum age of an erase-keyed repaint hold before a later PTY read or UI
+/// iteration may release it. The byte cap or reader exit can release it sooner.
+const ERASE_OUTPUT_HOLD: Duration = Duration::from_millis(40);
+
 /// Maximum byte count retained for one DEC synchronized-output frame before it
 /// is flushed and the pane returns to pass-through mode.
 const SYNCHRONIZED_OUTPUT_BYTE_CAP: usize = 1024 * 1024;
@@ -59,6 +63,7 @@ pub struct Pane {
     #[cfg(test)]
     raw_read_capture: Option<Arc<Mutex<TestRawReadCapture>>>,
     pub parser: Arc<Mutex<vt100::Parser>>,
+    synchronized_output: Arc<Mutex<SynchronizedOutputStream>>,
     child: Option<Box<dyn Child + Send + Sync>>,
     _reader_handle: Option<thread::JoinHandle<()>>,
     last_rows: u16,
@@ -234,6 +239,7 @@ impl Pane {
             test_input: Vec::new(),
             raw_read_capture: None,
             parser: Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10000))),
+            synchronized_output: Arc::new(Mutex::new(SynchronizedOutputStream::default())),
             child: None,
             _reader_handle: None,
             last_rows: rows,
@@ -355,6 +361,7 @@ impl Pane {
 
         // Scrollback buffer: 10000 lines of history
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10000)));
+        let synchronized_output = Arc::new(Mutex::new(SynchronizedOutputStream::default()));
         let pane_title = Arc::new(Mutex::new(String::new()));
 
         let reader = pair
@@ -363,6 +370,7 @@ impl Pane {
             .context("Failed to clone PTY reader")?;
 
         let parser_clone = Arc::clone(&parser);
+        let synchronized_output_clone = Arc::clone(&synchronized_output);
         let title_clone = Arc::clone(&pane_title);
         let scrollback_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let scrollback_clone = Arc::clone(&scrollback_counter);
@@ -383,6 +391,7 @@ impl Pane {
             pty_reader_thread(
                 reader,
                 parser_clone,
+                synchronized_output_clone,
                 title_clone,
                 scrollback_clone,
                 prompt_seen_clone,
@@ -392,6 +401,8 @@ impl Pane {
                 alternate_scroll_mode_clone,
                 id,
                 event_tx,
+                #[cfg(test)]
+                Arc::new(Instant::now),
                 #[cfg(test)]
                 raw_read_capture_clone,
             );
@@ -406,6 +417,7 @@ impl Pane {
             #[cfg(test)]
             raw_read_capture,
             parser,
+            synchronized_output,
             child: Some(child),
             _reader_handle: Some(reader_handle),
             last_rows: rows,
@@ -977,6 +989,37 @@ impl Pane {
         }
         Ok(false)
     }
+
+    /// Release an erase-keyed hold on the first UI iteration at or after its
+    /// hard cap. The generated `PtyOutput` is consumed by the caller's normal
+    /// event-drain pass, preserving repaint gating and byte diagnostics.
+    pub(crate) fn flush_expired_output_at(&self, now: Instant, event_tx: &Sender<AppEvent>) {
+        process_synchronized_output(
+            &self.synchronized_output,
+            &self.parser,
+            &self.mouse_protocol_cache,
+            self.id,
+            event_tx,
+            |stream| stream.flush_expired_erase_hold(now),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_test_output_at(
+        &self,
+        data: &[u8],
+        now: Instant,
+        event_tx: &Sender<AppEvent>,
+    ) {
+        process_synchronized_output(
+            &self.synchronized_output,
+            &self.parser,
+            &self.mouse_protocol_cache,
+            self.id,
+            event_tx,
+            |stream| stream.push(data, now),
+        );
+    }
 }
 
 fn startup_command_data(cmd: &str) -> Vec<u8> {
@@ -1227,83 +1270,135 @@ fn detect_alternate_scroll_toggle(data: &[u8]) -> Option<bool> {
 
 const SYNCHRONIZED_OUTPUT_BEGIN: &[u8] = b"\x1b[?2026h";
 const SYNCHRONIZED_OUTPUT_END: &[u8] = b"\x1b[?2026l";
+const ERASE_DISPLAY: &[u8] = b"\x1b[2J";
+const ERASE_SCROLLBACK: &[u8] = b"\x1b[3J";
 
 struct SynchronizedOutputFrame {
     started_at: Instant,
     bytes: Vec<u8>,
 }
 
+struct EraseOutputHold {
+    started_at: Instant,
+    bytes: Vec<u8>,
+    unmatched_synchronized_begin: Option<(usize, Instant)>,
+}
+
+enum DeferredOutput {
+    Synchronized(SynchronizedOutputFrame),
+    Erase(EraseOutputHold),
+}
+
 #[derive(Default)]
 struct SynchronizedOutputStream {
     marker_tail: Vec<u8>,
-    frame: Option<SynchronizedOutputFrame>,
+    deferred: Option<DeferredOutput>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
-enum SynchronizedOutputMarker {
-    Begin,
-    End,
+enum OutputMarker {
+    SynchronizedBegin,
+    SynchronizedEnd,
+    Erase,
+}
+
+#[derive(Copy, Clone)]
+struct OutputMarkerMatch {
+    start: usize,
+    end: usize,
+    prefix_in_tail: usize,
+    marker: OutputMarker,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum DeferredOutputKind {
+    Synchronized,
+    Erase,
 }
 
 impl SynchronizedOutputStream {
     fn push(&mut self, data: &[u8], now: Instant) -> Vec<Vec<u8>> {
         let mut flushed = Vec::new();
 
-        if self.frame.as_ref().is_some_and(|frame| {
-            now.duration_since(frame.started_at) >= SYNCHRONIZED_OUTPUT_TIMEOUT
-        }) {
-            self.flush_frame(&mut flushed);
-        }
+        self.flush_expired_for_read(now, &mut flushed);
 
         let markers = self.markers_in(data);
         let mut pass_through = Vec::new();
         let mut cursor = 0;
-        for (marker_start, marker_end, marker) in markers {
-            self.append_bytes(&data[cursor..marker_start], &mut pass_through, &mut flushed);
-            match marker {
-                SynchronizedOutputMarker::Begin => {
-                    if self.frame.is_none() {
-                        if !pass_through.is_empty() {
-                            flushed.push(std::mem::take(&mut pass_through));
-                        }
-                        self.frame = Some(SynchronizedOutputFrame {
-                            started_at: now,
-                            bytes: Vec::new(),
-                        });
-                    }
-                    self.append_bytes(
-                        &data[marker_start..marker_end],
-                        &mut pass_through,
-                        &mut flushed,
-                    );
+        for marker_match in markers {
+            self.append_bytes(
+                &data[cursor..marker_match.start],
+                &mut pass_through,
+                &mut flushed,
+            );
+            let marker_bytes = &data[marker_match.start..marker_match.end];
+            match (self.deferred_kind(), marker_match.marker) {
+                (None, OutputMarker::SynchronizedBegin) => {
+                    Self::flush_pass_through(&mut pass_through, &mut flushed);
+                    self.deferred = Some(DeferredOutput::Synchronized(SynchronizedOutputFrame {
+                        started_at: now,
+                        bytes: Vec::new(),
+                    }));
+                    self.append_bytes(marker_bytes, &mut pass_through, &mut flushed);
                 }
-                SynchronizedOutputMarker::End => {
-                    if self.frame.is_some() {
-                        self.append_bytes(
-                            &data[marker_start..marker_end],
-                            &mut pass_through,
-                            &mut flushed,
-                        );
-                        self.flush_frame(&mut flushed);
-                    } else {
-                        pass_through.extend_from_slice(&data[marker_start..marker_end]);
+                (None, OutputMarker::Erase) => {
+                    Self::flush_pass_through(&mut pass_through, &mut flushed);
+                    self.deferred = Some(DeferredOutput::Erase(EraseOutputHold {
+                        started_at: now,
+                        bytes: Vec::new(),
+                        unmatched_synchronized_begin: None,
+                    }));
+                    self.append_bytes(marker_bytes, &mut pass_through, &mut flushed);
+                }
+                (Some(DeferredOutputKind::Synchronized), OutputMarker::SynchronizedEnd) => {
+                    self.append_bytes(marker_bytes, &mut pass_through, &mut flushed);
+                    self.flush_all_deferred(&mut flushed);
+                }
+                (Some(DeferredOutputKind::Erase), OutputMarker::SynchronizedBegin) => {
+                    if let Some(DeferredOutput::Erase(hold)) = self.deferred.as_mut() {
+                        if hold.unmatched_synchronized_begin.is_none() {
+                            let marker_offset =
+                                hold.bytes.len().saturating_sub(marker_match.prefix_in_tail);
+                            hold.unmatched_synchronized_begin = Some((marker_offset, now));
+                        }
                     }
+                    self.append_bytes(marker_bytes, &mut pass_through, &mut flushed);
+                }
+                (Some(DeferredOutputKind::Erase), OutputMarker::SynchronizedEnd) => {
+                    if let Some(DeferredOutput::Erase(hold)) = self.deferred.as_mut() {
+                        hold.unmatched_synchronized_begin = None;
+                    }
+                    self.append_bytes(marker_bytes, &mut pass_through, &mut flushed);
+                }
+                _ => {
+                    self.append_bytes(marker_bytes, &mut pass_through, &mut flushed);
                 }
             }
-            cursor = marker_end;
+            cursor = marker_match.end;
         }
         self.append_bytes(&data[cursor..], &mut pass_through, &mut flushed);
 
-        if !pass_through.is_empty() {
-            flushed.push(pass_through);
-        }
+        Self::flush_pass_through(&mut pass_through, &mut flushed);
         flushed
     }
 
     fn finish(&mut self) -> Vec<Vec<u8>> {
+        let bytes = match self.deferred.take() {
+            Some(DeferredOutput::Synchronized(frame)) => frame.bytes,
+            Some(DeferredOutput::Erase(hold)) => hold.bytes,
+            None => return Vec::new(),
+        };
+        if bytes.is_empty() {
+            Vec::new()
+        } else {
+            vec![bytes]
+        }
+    }
+
+    fn flush_expired_erase_hold(&mut self, now: Instant) -> Vec<Vec<u8>> {
         let mut flushed = Vec::new();
-        if self.frame.is_some() {
-            self.flush_frame(&mut flushed);
+        if self.erase_hold_expired(now) {
+            self.flush_erase_hold(&mut flushed);
         }
         flushed
     }
@@ -1314,53 +1409,152 @@ impl SynchronizedOutputStream {
         pass_through: &mut Vec<u8>,
         flushed: &mut Vec<Vec<u8>>,
     ) {
-        if let Some(frame) = self.frame.as_mut() {
-            frame.bytes.extend_from_slice(data);
-            if frame.bytes.len() > SYNCHRONIZED_OUTPUT_BYTE_CAP {
-                self.flush_frame(flushed);
+        match self.deferred.as_mut() {
+            Some(DeferredOutput::Synchronized(frame)) => frame.bytes.extend_from_slice(data),
+            Some(DeferredOutput::Erase(hold)) => hold.bytes.extend_from_slice(data),
+            None => {
+                pass_through.extend_from_slice(data);
+                return;
             }
-        } else {
-            pass_through.extend_from_slice(data);
+        }
+
+        self.enforce_byte_cap(flushed);
+    }
+
+    fn enforce_byte_cap(&mut self, flushed: &mut Vec<Vec<u8>>) {
+        loop {
+            let over_cap = match self.deferred.as_ref() {
+                Some(DeferredOutput::Synchronized(frame)) => {
+                    frame.bytes.len() > SYNCHRONIZED_OUTPUT_BYTE_CAP
+                }
+                Some(DeferredOutput::Erase(hold)) => {
+                    hold.bytes.len() > SYNCHRONIZED_OUTPUT_BYTE_CAP
+                }
+                None => false,
+            };
+            if !over_cap {
+                break;
+            }
+            match self.deferred_kind() {
+                Some(DeferredOutputKind::Erase) => self.flush_erase_hold(flushed),
+                Some(DeferredOutputKind::Synchronized) => self.flush_all_deferred(flushed),
+                None => break,
+            }
         }
     }
 
-    fn flush_frame(&mut self, flushed: &mut Vec<Vec<u8>>) {
-        if let Some(frame) = self.frame.take() {
-            if !frame.bytes.is_empty() {
-                flushed.push(frame.bytes);
+    fn flush_expired_for_read(&mut self, now: Instant, flushed: &mut Vec<Vec<u8>>) {
+        loop {
+            let expired = match self.deferred.as_ref() {
+                Some(DeferredOutput::Synchronized(frame)) => {
+                    now.saturating_duration_since(frame.started_at) >= SYNCHRONIZED_OUTPUT_TIMEOUT
+                }
+                Some(DeferredOutput::Erase(hold)) => {
+                    now.saturating_duration_since(hold.started_at) >= ERASE_OUTPUT_HOLD
+                }
+                None => false,
+            };
+            if !expired {
+                break;
+            }
+            match self.deferred_kind() {
+                Some(DeferredOutputKind::Erase) => self.flush_erase_hold(flushed),
+                Some(DeferredOutputKind::Synchronized) => self.flush_all_deferred(flushed),
+                None => break,
             }
         }
     }
 
-    fn markers_in(&mut self, data: &[u8]) -> Vec<(usize, usize, SynchronizedOutputMarker)> {
+    fn erase_hold_expired(&self, now: Instant) -> bool {
+        matches!(
+            self.deferred.as_ref(),
+            Some(DeferredOutput::Erase(hold))
+                if now.saturating_duration_since(hold.started_at) >= ERASE_OUTPUT_HOLD
+        )
+    }
+
+    fn flush_erase_hold(&mut self, flushed: &mut Vec<Vec<u8>>) {
+        let Some(DeferredOutput::Erase(mut hold)) = self.deferred.take() else {
+            return;
+        };
+        if let Some((offset, started_at)) = hold.unmatched_synchronized_begin {
+            let synchronized_bytes = hold.bytes.split_off(offset.min(hold.bytes.len()));
+            if !hold.bytes.is_empty() {
+                flushed.push(hold.bytes);
+            }
+            self.deferred = Some(DeferredOutput::Synchronized(SynchronizedOutputFrame {
+                started_at,
+                bytes: synchronized_bytes,
+            }));
+        } else if !hold.bytes.is_empty() {
+            flushed.push(hold.bytes);
+        }
+    }
+
+    fn flush_all_deferred(&mut self, flushed: &mut Vec<Vec<u8>>) {
+        let bytes = match self.deferred.take() {
+            Some(DeferredOutput::Synchronized(frame)) => frame.bytes,
+            Some(DeferredOutput::Erase(hold)) => hold.bytes,
+            None => return,
+        };
+        if !bytes.is_empty() {
+            flushed.push(bytes);
+        }
+    }
+
+    fn flush_pass_through(pass_through: &mut Vec<u8>, flushed: &mut Vec<Vec<u8>>) {
+        if !pass_through.is_empty() {
+            flushed.push(std::mem::take(pass_through));
+        }
+    }
+
+    fn deferred_kind(&self) -> Option<DeferredOutputKind> {
+        match self.deferred.as_ref() {
+            Some(DeferredOutput::Synchronized(_)) => Some(DeferredOutputKind::Synchronized),
+            Some(DeferredOutput::Erase(_)) => Some(DeferredOutputKind::Erase),
+            None => None,
+        }
+    }
+
+    fn markers_in(&mut self, data: &[u8]) -> Vec<OutputMarkerMatch> {
         let tail_len = self.marker_tail.len();
         let mut combined = std::mem::take(&mut self.marker_tail);
         combined.extend_from_slice(data);
         let mut markers = Vec::new();
 
         for index in 0..combined.len() {
-            let marker = if combined[index..].starts_with(SYNCHRONIZED_OUTPUT_BEGIN) {
-                Some(SynchronizedOutputMarker::Begin)
+            let (marker, marker_len) = if combined[index..].starts_with(SYNCHRONIZED_OUTPUT_BEGIN) {
+                (
+                    OutputMarker::SynchronizedBegin,
+                    SYNCHRONIZED_OUTPUT_BEGIN.len(),
+                )
             } else if combined[index..].starts_with(SYNCHRONIZED_OUTPUT_END) {
-                Some(SynchronizedOutputMarker::End)
+                (OutputMarker::SynchronizedEnd, SYNCHRONIZED_OUTPUT_END.len())
+            } else if combined[index..].starts_with(ERASE_DISPLAY) {
+                (OutputMarker::Erase, ERASE_DISPLAY.len())
+            } else if combined[index..].starts_with(ERASE_SCROLLBACK) {
+                (OutputMarker::Erase, ERASE_SCROLLBACK.len())
             } else {
-                None
-            };
-            let Some(marker) = marker else {
                 continue;
             };
-            let combined_end = index + SYNCHRONIZED_OUTPUT_BEGIN.len();
+            let combined_end = index + marker_len;
             if combined_end <= tail_len {
                 continue;
             }
-            markers.push((
-                index.saturating_sub(tail_len),
-                combined_end - tail_len,
+            markers.push(OutputMarkerMatch {
+                start: index.saturating_sub(tail_len),
+                end: combined_end - tail_len,
+                prefix_in_tail: tail_len.saturating_sub(index),
                 marker,
-            ));
+            });
         }
 
-        let keep = combined.len().min(SYNCHRONIZED_OUTPUT_BEGIN.len() - 1);
+        let longest_marker = SYNCHRONIZED_OUTPUT_BEGIN
+            .len()
+            .max(SYNCHRONIZED_OUTPUT_END.len())
+            .max(ERASE_DISPLAY.len())
+            .max(ERASE_SCROLLBACK.len());
+        let keep = combined.len().min(longest_marker - 1);
         self.marker_tail
             .extend_from_slice(&combined[combined.len() - keep..]);
         markers
@@ -1396,11 +1590,34 @@ fn process_pty_output(
     let _ = event_tx.send(AppEvent::PtyOutput(pane_id, data.len()));
 }
 
+fn process_synchronized_output(
+    synchronized_output: &Arc<Mutex<SynchronizedOutputStream>>,
+    parser: &Arc<Mutex<vt100::Parser>>,
+    mouse_protocol_cache: &Arc<Mutex<Option<CachedMouseProtocol>>>,
+    pane_id: usize,
+    event_tx: &Sender<AppEvent>,
+    update: impl FnOnce(&mut SynchronizedOutputStream) -> Vec<Vec<u8>>,
+) {
+    // Both the reader and UI thread use this order. Keep the stream lock
+    // through parser mutation so a later read cannot overtake a UI-side
+    // timed flush. Never call this while already holding the parser lock.
+    let mut stream = synchronized_output
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for data in update(&mut stream) {
+        process_pty_output(&data, parser, mouse_protocol_cache, pane_id, event_tx);
+    }
+}
+
+#[cfg(test)]
+type PtyOutputClock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
 /// Background thread that reads PTY output and feeds it to vt100 parser.
 #[allow(clippy::too_many_arguments)]
 fn pty_reader_thread(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
+    synchronized_output: Arc<Mutex<SynchronizedOutputStream>>,
     title: Arc<Mutex<String>>,
     scrollback_count: Arc<std::sync::atomic::AtomicUsize>,
     prompt_seen: Arc<AtomicBool>,
@@ -1410,6 +1627,7 @@ fn pty_reader_thread(
     alternate_scroll_mode: Arc<AtomicBool>,
     pane_id: usize,
     event_tx: Sender<AppEvent>,
+    #[cfg(test)] output_clock: PtyOutputClock,
     #[cfg(test)] raw_read_capture: Option<Arc<Mutex<TestRawReadCapture>>>,
 ) {
     // Rolling tail of the most recent bytes read from the PTY. Used to
@@ -1420,7 +1638,6 @@ fn pty_reader_thread(
     let mut osc7_stream = Osc7Stream::new();
     let mut control_tail: Vec<u8> = Vec::with_capacity(64);
     let mut osc52_tail: Vec<u8> = Vec::with_capacity(4096);
-    let mut synchronized_output = SynchronizedOutputStream::default();
     #[cfg(test)]
     let mut prompt_capture_tail: Vec<u8> = Vec::with_capacity(TAIL_CAP * 2);
     #[cfg(test)]
@@ -1430,9 +1647,14 @@ fn pty_reader_thread(
     loop {
         match reader.read(&mut buf) {
             Ok(0) => {
-                for data in synchronized_output.finish() {
-                    process_pty_output(&data, &parser, &mouse_protocol_cache, pane_id, &event_tx);
-                }
+                process_synchronized_output(
+                    &synchronized_output,
+                    &parser,
+                    &mouse_protocol_cache,
+                    pane_id,
+                    &event_tx,
+                    SynchronizedOutputStream::finish,
+                );
                 let _ = event_tx.send(AppEvent::PtyEof(pane_id));
                 break;
             }
@@ -1564,20 +1786,28 @@ fn pty_reader_thread(
                 // on the next read. A producer that goes silent mid-frame leaves
                 // the last complete screen visible until it writes again or the
                 // PTY closes; both exit paths flush the buffered bytes below.
-                for complete_data in synchronized_output.push(data, Instant::now()) {
-                    process_pty_output(
-                        &complete_data,
-                        &parser,
-                        &mouse_protocol_cache,
-                        pane_id,
-                        &event_tx,
-                    );
-                }
+                #[cfg(test)]
+                let now = output_clock();
+                #[cfg(not(test))]
+                let now = Instant::now();
+                process_synchronized_output(
+                    &synchronized_output,
+                    &parser,
+                    &mouse_protocol_cache,
+                    pane_id,
+                    &event_tx,
+                    |stream| stream.push(data, now),
+                );
             }
             Err(_) => {
-                for data in synchronized_output.finish() {
-                    process_pty_output(&data, &parser, &mouse_protocol_cache, pane_id, &event_tx);
-                }
+                process_synchronized_output(
+                    &synchronized_output,
+                    &parser,
+                    &mouse_protocol_cache,
+                    pane_id,
+                    &event_tx,
+                    SynchronizedOutputStream::finish,
+                );
                 break;
             }
         }
@@ -2119,8 +2349,12 @@ mod tests {
 
     struct ReaderHarness {
         input: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+        event_tx: Option<std::sync::mpsc::Sender<AppEvent>>,
         events: std::sync::mpsc::Receiver<AppEvent>,
         parser: Arc<Mutex<vt100::Parser>>,
+        synchronized_output: Arc<Mutex<SynchronizedOutputStream>>,
+        mouse_protocol_cache: Arc<Mutex<Option<CachedMouseProtocol>>>,
+        read_times: Arc<Mutex<std::collections::VecDeque<Instant>>>,
         title: Arc<Mutex<String>>,
         scrollback_count: Arc<std::sync::atomic::AtomicUsize>,
         prompt_seen: Arc<AtomicBool>,
@@ -2140,15 +2374,21 @@ mod tests {
             let claude_seen = Arc::new(AtomicBool::new(false));
             let codex_seen = Arc::new(AtomicBool::new(false));
             let mouse_protocol_cache = Arc::new(Mutex::new(None));
+            let synchronized_output = Arc::new(Mutex::new(SynchronizedOutputStream::default()));
             let alternate_scroll_mode = Arc::new(AtomicBool::new(false));
+            let read_times = Arc::new(Mutex::new(std::collections::VecDeque::new()));
 
             let handle = {
                 let parser = Arc::clone(&parser);
+                let synchronized_output = Arc::clone(&synchronized_output);
                 let title = Arc::clone(&title);
                 let scrollback_count = Arc::clone(&scrollback_count);
                 let prompt_seen = Arc::clone(&prompt_seen);
                 let codex_seen = Arc::clone(&codex_seen);
+                let mouse_protocol_cache = Arc::clone(&mouse_protocol_cache);
                 let alternate_scroll_mode_for_reader = Arc::clone(&alternate_scroll_mode);
+                let read_times_for_reader = Arc::clone(&read_times);
+                let event_tx_for_reader = event_tx.clone();
                 thread::spawn(move || {
                     pty_reader_thread(
                         Box::new(ChannelReader {
@@ -2157,6 +2397,7 @@ mod tests {
                             offset: 0,
                         }),
                         parser,
+                        synchronized_output,
                         title,
                         scrollback_count,
                         prompt_seen,
@@ -2165,7 +2406,14 @@ mod tests {
                         mouse_protocol_cache,
                         alternate_scroll_mode_for_reader,
                         4242,
-                        event_tx,
+                        event_tx_for_reader,
+                        Arc::new(move || {
+                            read_times_for_reader
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .pop_front()
+                                .expect("fake reader time queued before input")
+                        }),
                         None,
                     );
                 })
@@ -2173,8 +2421,12 @@ mod tests {
 
             Self {
                 input: Some(input),
+                event_tx: Some(event_tx),
                 events,
                 parser,
+                synchronized_output,
+                mouse_protocol_cache,
+                read_times,
                 title,
                 scrollback_count,
                 prompt_seen,
@@ -2185,11 +2437,53 @@ mod tests {
         }
 
         fn send(&self, data: &[u8]) {
+            self.send_at(data, Instant::now());
+        }
+
+        fn send_at(&self, data: &[u8], now: Instant) {
+            let read_count = data.len().div_ceil(4096).max(1);
+            self.read_times
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .extend(std::iter::repeat_n(now, read_count));
             self.input
                 .as_ref()
                 .expect("reader input available")
                 .send(data.to_vec())
                 .expect("send fake PTY bytes");
+        }
+
+        fn tick_at(&self, now: Instant) {
+            process_synchronized_output(
+                &self.synchronized_output,
+                &self.parser,
+                &self.mouse_protocol_cache,
+                4242,
+                self.event_tx.as_ref().expect("event sender available"),
+                |stream| stream.flush_expired_erase_hold(now),
+            );
+        }
+
+        fn wait_for_buffered_len(&self, minimum: usize) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let len = {
+                    let stream = self
+                        .synchronized_output
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    match stream.deferred.as_ref() {
+                        Some(DeferredOutput::Synchronized(frame)) => frame.bytes.len(),
+                        Some(DeferredOutput::Erase(hold)) => hold.bytes.len(),
+                        None => 0,
+                    }
+                };
+                if len >= minimum {
+                    return;
+                }
+                std::thread::yield_now();
+            }
+            panic!("timed out waiting for {minimum} buffered bytes");
         }
 
         fn screen(&self) -> String {
@@ -2237,6 +2531,7 @@ mod tests {
                 .expect("reader thread available")
                 .join()
                 .expect("join fake PTY reader");
+            drop(self.event_tx.take());
         }
     }
 
@@ -2248,6 +2543,7 @@ mod tests {
             if let Some(handle) = self.handle.take() {
                 handle.join().expect("join fake PTY reader");
             }
+            drop(self.event_tx.take());
         }
     }
 
@@ -2313,17 +2609,281 @@ mod tests {
     #[test]
     fn synchronized_output_timeout_flushes_on_next_read() {
         let harness = ReaderHarness::new();
-        harness.send(b"\x1b[?2026hstalled");
+        let started = Instant::now();
+        harness.send_at(b"\x1b[?2026hstalled", started);
+        harness.wait_for_buffered_len(SYNCHRONIZED_OUTPUT_BEGIN.len() + b"stalled".len());
         harness.assert_no_event();
-        thread::sleep(SYNCHRONIZED_OUTPUT_TIMEOUT + Duration::from_millis(20));
 
-        harness.send(b" resumed");
+        harness.send_at(b" resumed", started + SYNCHRONIZED_OUTPUT_TIMEOUT);
         assert_eq!(
             harness.recv_output(),
             SYNCHRONIZED_OUTPUT_BEGIN.len() + b"stalled".len()
         );
         assert_eq!(harness.recv_output(), b" resumed".len());
         assert!(harness.screen().starts_with("stalled resumed"));
+    }
+
+    #[test]
+    fn erase_hold_hides_intermediate_screen_until_injected_cap_tick() {
+        let harness = ReaderHarness::new();
+        let started = Instant::now();
+        harness.send_at(b"before", started);
+        assert_eq!(harness.recv_output(), b"before".len());
+
+        harness.send_at(ERASE_DISPLAY, started);
+        harness.wait_for_buffered_len(ERASE_DISPLAY.len());
+        harness.tick_at(started + Duration::from_millis(10));
+        assert!(harness.screen().starts_with("before"));
+        harness.assert_no_event();
+
+        let rewrite = b"\x1b[Hafter";
+        harness.send_at(rewrite, started + Duration::from_millis(30));
+        harness.wait_for_buffered_len(ERASE_DISPLAY.len() + rewrite.len());
+        assert!(harness.screen().starts_with("before"));
+        harness.tick_at(started + ERASE_OUTPUT_HOLD);
+
+        assert_eq!(harness.recv_output(), ERASE_DISPLAY.len() + rewrite.len());
+        assert!(harness.screen().starts_with("after"));
+        harness.assert_no_event();
+    }
+
+    #[test]
+    fn erase_hold_cap_tick_is_not_extended_by_continuing_reads() {
+        let harness = ReaderHarness::new();
+        let started = Instant::now();
+        harness.send_at(ERASE_SCROLLBACK, started);
+        harness.wait_for_buffered_len(ERASE_SCROLLBACK.len());
+        for (millis, chunk) in [(10, b"one".as_slice()), (25, b"two"), (39, b"three")] {
+            harness.send_at(chunk, started + Duration::from_millis(millis));
+        }
+        let total = ERASE_SCROLLBACK.len() + b"onetwothree".len();
+        harness.wait_for_buffered_len(total);
+
+        harness.tick_at(started + ERASE_OUTPUT_HOLD);
+        assert_eq!(harness.recv_output(), total);
+        assert!(harness.screen().starts_with("onetwothree"));
+    }
+
+    #[test]
+    fn cursor_home_only_remains_one_output_event_per_read() {
+        let harness = ReaderHarness::new();
+        let started = Instant::now();
+        let reads: [&[u8]; 3] = [b"first", b"\x1b[Hsecond", b" third"];
+        for (index, read) in reads.into_iter().enumerate() {
+            harness.send_at(read, started + Duration::from_millis(index as u64));
+            assert_eq!(harness.recv_output(), read.len());
+        }
+        harness.assert_no_event();
+    }
+
+    #[test]
+    fn erase_inside_open_synchronized_frame_does_not_open_hold() {
+        let harness = ReaderHarness::new();
+        let started = Instant::now();
+        let first = b"\x1b[?2026h\x1b[2J\x1b[Hhalf";
+        harness.send_at(first, started);
+        harness.wait_for_buffered_len(first.len());
+        harness.tick_at(started + ERASE_OUTPUT_HOLD);
+        harness.assert_no_event();
+
+        harness.send_at(SYNCHRONIZED_OUTPUT_END, started + Duration::from_millis(50));
+        assert_eq!(
+            harness.recv_output(),
+            first.len() + SYNCHRONIZED_OUTPUT_END.len()
+        );
+        assert!(harness.screen().starts_with("half"));
+    }
+
+    #[test]
+    fn complete_synchronized_frame_inside_erase_hold_does_not_release_it() {
+        let harness = ReaderHarness::new();
+        let started = Instant::now();
+        harness.send_at(b"before", started);
+        harness.recv_output();
+
+        harness.send_at(ERASE_DISPLAY, started);
+        harness.wait_for_buffered_len(ERASE_DISPLAY.len());
+        let framed_rewrite = b"\x1b[?2026h\x1b[Hafter\x1b[?2026l";
+        harness.send_at(framed_rewrite, started + Duration::from_millis(1));
+        let total = ERASE_DISPLAY.len() + framed_rewrite.len();
+        harness.wait_for_buffered_len(total);
+
+        harness.tick_at(started + Duration::from_millis(10));
+        assert!(harness.screen().starts_with("before"));
+        harness.assert_no_event();
+        harness.tick_at(started + ERASE_OUTPUT_HOLD);
+
+        assert_eq!(harness.recv_output(), total);
+        assert!(harness.screen().starts_with("after"));
+        harness.assert_no_event();
+    }
+
+    #[test]
+    fn unmatched_synchronized_begin_survives_erase_hold_close() {
+        let harness = ReaderHarness::new();
+        let started = Instant::now();
+        harness.send_at(b"before", started);
+        harness.recv_output();
+
+        let mut held = b"\x1b[2J\x1b[Hrewrite".to_vec();
+        held.extend_from_slice(SYNCHRONIZED_OUTPUT_BEGIN);
+        held.extend_from_slice(b"\x1b[2;1Hhalf");
+        harness.send_at(&held, started);
+        harness.wait_for_buffered_len(held.len());
+        harness.tick_at(started + ERASE_OUTPUT_HOLD);
+
+        let synchronized_offset = held
+            .windows(SYNCHRONIZED_OUTPUT_BEGIN.len())
+            .position(|window| window == SYNCHRONIZED_OUTPUT_BEGIN)
+            .expect("synchronized begin in held bytes");
+        assert_eq!(harness.recv_output(), synchronized_offset);
+        assert!(harness.screen().starts_with("rewrite"));
+        assert!(!harness.screen().contains("half"));
+        harness.assert_no_event();
+
+        let mut end = b"-whole".to_vec();
+        end.extend_from_slice(SYNCHRONIZED_OUTPUT_END);
+        harness.send_at(&end, started + Duration::from_millis(45));
+        assert_eq!(
+            harness.recv_output(),
+            held.len() - synchronized_offset + end.len()
+        );
+        assert!(harness.screen().contains("half-whole"));
+    }
+
+    #[test]
+    fn erase_at_end_of_read_is_not_redetected_from_marker_tail() {
+        let mut stream = SynchronizedOutputStream::default();
+        let started = Instant::now();
+        let first = b"prefix\x1b[2J";
+        assert_eq!(stream.push(first, started), vec![b"prefix".to_vec()]);
+        assert_eq!(
+            stream.flush_expired_erase_hold(started + ERASE_OUTPUT_HOLD),
+            vec![ERASE_DISPLAY.to_vec()]
+        );
+
+        let short_next_read = b"abc";
+        assert_eq!(
+            stream.push(short_next_read, started + ERASE_OUTPUT_HOLD),
+            vec![short_next_read.to_vec()]
+        );
+        assert_eq!(stream.deferred_kind(), None);
+    }
+
+    #[test]
+    fn reader_expiry_closes_first_hold_before_later_erase_opens_second() {
+        let mut stream = SynchronizedOutputStream::default();
+        let started = Instant::now();
+        let repaint_a = b"\x1b[2J\x1b[Hrepaint-a";
+        assert!(stream.push(repaint_a, started).is_empty());
+        assert!(stream
+            .push(b"-done", started + Duration::from_millis(30))
+            .is_empty());
+
+        assert_eq!(
+            stream.push(ERASE_SCROLLBACK, started + Duration::from_millis(45)),
+            vec![b"\x1b[2J\x1b[Hrepaint-a-done".to_vec()]
+        );
+        assert_eq!(stream.deferred_kind(), Some(DeferredOutputKind::Erase));
+        assert!(stream
+            .flush_expired_erase_hold(started + Duration::from_millis(60))
+            .is_empty());
+        assert_eq!(
+            stream.flush_expired_erase_hold(started + Duration::from_millis(85)),
+            vec![ERASE_SCROLLBACK.to_vec()]
+        );
+    }
+
+    #[test]
+    fn reader_uses_injected_clock_before_scanning_later_erase() {
+        let harness = ReaderHarness::new();
+        let started = Instant::now() + Duration::from_secs(60);
+        let repaint_a = b"\x1b[2J\x1b[Hrepaint-a";
+        harness.send_at(repaint_a, started);
+        harness.wait_for_buffered_len(repaint_a.len());
+        harness.send_at(b"-done", started + Duration::from_millis(30));
+        harness.wait_for_buffered_len(repaint_a.len() + b"-done".len());
+
+        harness.send_at(ERASE_SCROLLBACK, started + Duration::from_millis(45));
+        assert_eq!(harness.recv_output(), repaint_a.len() + b"-done".len());
+        assert!(harness.screen().starts_with("repaint-a-done"));
+        harness.wait_for_buffered_len(ERASE_SCROLLBACK.len());
+        harness.tick_at(started + Duration::from_millis(60));
+        harness.assert_no_event();
+    }
+
+    #[test]
+    fn erase_hold_byte_cap_releases_accumulated_bytes() {
+        let mut stream = SynchronizedOutputStream::default();
+        let started = Instant::now();
+        assert!(stream.push(ERASE_DISPLAY, started).is_empty());
+        let payload = vec![b'x'; SYNCHRONIZED_OUTPUT_BYTE_CAP + 1];
+        let flushed = stream.push(&payload, started);
+
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].len(), ERASE_DISPLAY.len() + payload.len());
+        assert!(flushed[0].starts_with(ERASE_DISPLAY));
+        assert!(flushed[0].ends_with(&payload));
+        assert_eq!(stream.deferred_kind(), None);
+        assert_eq!(stream.push(b"tail", started), vec![b"tail".to_vec()]);
+    }
+
+    #[test]
+    fn erase_hold_flushes_before_eof_event() {
+        let mut harness = ReaderHarness::new();
+        let started = Instant::now();
+        let data = b"\x1b[2J\x1b[Hbuffered at eof";
+        harness.send_at(data, started);
+        harness.wait_for_buffered_len(data.len());
+        harness.finish_with_eof();
+
+        assert_eq!(harness.recv_output(), data.len());
+        assert!(harness.screen().starts_with("buffered at eof"));
+        assert!(matches!(
+            harness.events.recv_timeout(Duration::from_secs(1)),
+            Ok(AppEvent::PtyEof(4242))
+        ));
+    }
+
+    #[test]
+    fn erase_hold_flushes_before_read_error_exit() {
+        let mut harness = ReaderHarness::new();
+        let started = Instant::now();
+        let data = b"\x1b[3J\x1b[Hbuffered at error";
+        harness.send_at(data, started);
+        harness.wait_for_buffered_len(data.len());
+        harness.finish_with_error();
+
+        assert_eq!(harness.recv_output(), data.len());
+        assert!(harness.screen().starts_with("buffered at error"));
+        assert!(matches!(
+            harness.events.recv_timeout(Duration::from_millis(40)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn no_erase_reads_preserve_exact_event_lengths_and_bytes() {
+        let harness = ReaderHarness::new();
+        let started = Instant::now();
+        let reads: [&[u8]; 4] = [b"one", b"\r\ntwo", b"\x1b[2;4Hthree", b"\x1b[31m!\x1b[0m"];
+        let mut direct = vt100::Parser::new(8, 80, 100);
+        for (index, read) in reads.into_iter().enumerate() {
+            direct.process(read);
+            harness.send_at(read, started + Duration::from_millis(index as u64));
+            assert_eq!(harness.recv_output(), read.len());
+        }
+        harness.assert_no_event();
+
+        let parser = harness
+            .parser
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(parser.screen().contents(), direct.screen().contents());
+        assert_eq!(
+            parser.screen().cursor_position(),
+            direct.screen().cursor_position()
+        );
     }
 
     #[test]

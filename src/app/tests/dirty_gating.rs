@@ -6,7 +6,9 @@
 //! CwdChanged) punch through regardless of tab, exactly like they
 //! punch through the IME freeze gate.
 
-use crate::app::{App, AppEvent};
+use std::time::{Duration, Instant};
+
+use crate::app::{frame_diagnostics, App, AppEvent};
 
 /// Drain until the freshly spawned shells stop emitting startup
 /// output, so live PtyOutput can't race the synthetic events these
@@ -62,6 +64,60 @@ fn pty_output_from_background_tab_pane_does_not_dirty() {
         !app.dirty,
         "background-tab output must not repaint the visible tab"
     );
+    app.shutdown();
+}
+
+#[test]
+fn expired_erase_hold_flushes_for_background_pane_and_records_bytes() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let pane_tab0 = app.ws().focused_pane_id;
+    app.new_tab().expect("new_tab");
+    assert_eq!(app.active_tab, 1, "new tab becomes active");
+
+    let started = Instant::now();
+    let event_tx = app.event_tx.clone();
+    let pane = app.workspaces[0]
+        .panes
+        .get(&pane_tab0)
+        .expect("background pane");
+    pane.process_test_output_at(b"before", started, &event_tx);
+    app.drain_pty_events_at(started);
+
+    let held = b"\x1b[2J\x1b[Hafter";
+    let pane = app.workspaces[0]
+        .panes
+        .get(&pane_tab0)
+        .expect("background pane");
+    pane.process_test_output_at(held, started, &event_tx);
+    assert!(pane
+        .parser
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .screen()
+        .contents()
+        .starts_with("before"));
+
+    app.dirty = false;
+    frame_diagnostics::begin_test_frame(started);
+    assert!(app.drain_pty_events_at(started + Duration::from_millis(40)));
+
+    let pane = app.workspaces[0]
+        .panes
+        .get(&pane_tab0)
+        .expect("background pane");
+    assert!(pane
+        .parser
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .screen()
+        .contents()
+        .starts_with("after"));
+    assert_eq!(
+        frame_diagnostics::output_bytes_for_test(pane_tab0),
+        held.len()
+    );
+    assert!(!app.dirty, "background output must retain dirty gating");
+    frame_diagnostics::clear_test_frame();
     app.shutdown();
 }
 
