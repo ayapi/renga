@@ -263,6 +263,28 @@ struct ExactCodexPeerInjectedConcatenation {
     matched_injections: Vec<String>,
 }
 
+#[cfg(test)]
+mod injected_concatenation_tests {
+    use std::collections::VecDeque;
+
+    use super::exact_codex_peer_injected_concatenation;
+
+    #[test]
+    fn matched_injections_preserve_non_palindromic_composer_order() {
+        let old = "older injection".to_string();
+        let expected = "current injection".to_string();
+        let recorded = VecDeque::from([expected.clone(), old.clone()]);
+        let composer = format!("{old}{expected}");
+
+        let matched =
+            exact_codex_peer_injected_concatenation(&composer, Some(&recorded), &expected)
+                .expect("recorded injections should reconstruct the composer");
+
+        assert!(matched.contains_current);
+        assert_eq!(matched.matched_injections, [old, expected]);
+    }
+}
+
 impl PendingCodexPeerDelivery {
     fn delivery_sequence(&self) -> Option<u64> {
         match self {
@@ -486,6 +508,7 @@ fn looks_like_codex_placeholder(text: &str) -> bool {
     [
         "Ask Codex anything",
         "Ask Codex to do anything",
+        "Ask a follow-up question",
         "Explain this codebase",
         "Summarize recent commits",
         "Implement {feature}",
@@ -514,6 +537,7 @@ mod placeholder_tests {
             "ask codex anything...",
             "ASK CODEX TO DO ANYTHING",
             "ask codex to do anything…",
+            "Ask a follow-up question",
             "Explain this codebase",
             "Summarize recent commits",
             "Implement {feature}",

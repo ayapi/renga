@@ -541,4 +541,4 @@ SubmitAt Enter、QueueAt Enter/Tab、stale Enter、成功した Ctrl-U、subscri
 
 未知の非 dim placeholder は下書きとして扱い、そのペインの nudge を focus まで
 `has_draft` 経路で保留する。この失敗方向を選ぶのは、ユーザー下書きの上書きより安全だからである。
-7 件の既知 placeholder のうち `Ask Codex to do anything` は Codex 0.154.0 の installed binary で確認し、残る 6 件は 2026 年 7 月の renga-f85 実機記録（`Write tests for @filename` を含む）と Codex source に由来するため、一覧と完全一致するユーザー下書きも現在の `Ask Codex to do anything` と同様に空と判定される trade-off を受け入れる。
+9 件の既知 placeholder のうち `Ask Codex to do anything` と `Ask a follow-up question` は Codex 0.154.0 の installed binary で確認し、残る 7 件のうち 6 件は 2026 年 7 月の renga-f85 実機記録（`Write tests for @filename` を含む）と Codex source に由来する。残る 1 件は従来から認識している `Ask Codex anything` である。一覧と完全一致するユーザー下書きも placeholder と同様に空と判定される trade-off を受け入れる。

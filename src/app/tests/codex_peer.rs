@@ -4457,7 +4457,7 @@ fn refocusing_unfocused_codex_with_existing_draft_shows_pending_overlay() {
 }
 
 #[test]
-fn focused_codex_pending_queue_protects_unknown_normal_text_at_editable_start() {
+fn focused_codex_pending_queue_auto_submits_after_draft_clears_to_unknown_placeholder() {
     let mut app = App::new(40, 80).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
     let codex_id = app
@@ -4657,6 +4657,7 @@ fn similarly_worded_codex_draft_without_dim_remains_protected() {
 fn codex_rotating_placeholders_at_editable_start_are_not_drafts() {
     for placeholder in [
         "Ask Codex to do anything",
+        "Ask a follow-up question",
         "Explain this codebase",
         "Summarize recent commits",
         "Implement {feature}",
@@ -4676,7 +4677,24 @@ fn codex_rotating_placeholders_at_editable_start_are_not_drafts() {
 }
 
 #[test]
-fn unknown_normal_text_at_prompt_is_protected_without_dim() {
+fn codex_placeholder_prefixes_with_user_text_remain_drafts_at_editable_start() {
+    for draft in [
+        "Explain this codebase to me",
+        "Write tests for @filename now",
+    ] {
+        let mut parser = vt100::Parser::new(40, 80, 0);
+        parser.process(format!("\x1b[?25h\x1b[2J\x1b[H\u{203a} {draft}\x1b[1;3H").as_bytes());
+
+        assert_eq!(
+            codex_composer_has_draft_on_screen(parser.screen()),
+            Some(true),
+            "expected placeholder-prefixed user input to remain a draft: {draft:?}"
+        );
+    }
+}
+
+#[test]
+fn unknown_codex_placeholder_at_prompt_is_not_a_draft_without_dim() {
     let mut parser = vt100::Parser::new(40, 80, 0);
     parser.process(b"\x1b[?25h\x1b[2J\x1b[H\xE2\x80\xBA Write tests for @filename\x1b[1;3H");
 
