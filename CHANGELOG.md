@@ -9,6 +9,18 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ## [Unreleased]
 
+### Debug
+
+- **Opt-in pane capture and offline replay for repaint investigations.**
+  `RENGA_DEBUG_PANE_CAPTURE` records raw PTY reads, output holds, parser
+  applications, resize clears, and actual/skipped pane draws in isolated
+  per-TUI session directories. The ignored `replay_capture` test prints raw,
+  applied, and drawn burst tables, shifted rows, partial top-to-bottom
+  rewrites, and cursor-hide/show envelopes. Capture is absent by default and
+  does not change the output hold policy. See the
+  [field capture guide](docs/investigations/pane-synchronized-output.md#field-capture-and-replay).
+  (renga-gou)
+
 ### Changed
 
 - **Claude monitor wake coalescing traces now describe normal worker behavior.**

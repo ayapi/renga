@@ -11,6 +11,7 @@ mod layout_config;
 mod macos_tip;
 mod mcp_peer;
 mod pane;
+mod pane_capture;
 mod preview;
 mod ui;
 mod version_check;
@@ -267,6 +268,7 @@ fn main() -> Result<()> {
 }
 
 fn run_tui(cli: cli::Cli) -> Result<()> {
+    let _pane_capture_shutdown = pane_capture::startup();
     // Install panic hook to restore terminal state on crash
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {

@@ -96,6 +96,19 @@ fn syntax_rgb_to_ansi_color(r: u8, g: u8, b: u8) -> Color {
 // ─── Main render ──────────────────────────────────────────
 
 pub fn render(app: &mut App, frame: &mut Frame) {
+    render_captured(app, frame);
+    if crate::pane_capture::enabled() {
+        for workspace in &app.workspaces {
+            for pane in workspace.panes.values() {
+                if let Some(capture) = &pane.capture {
+                    capture.finish_draw();
+                }
+            }
+        }
+    }
+}
+
+fn render_captured(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
     app.last_term_size = (area.width, area.height);
     // Cleared every frame; re-populated below only on conpty when a caret is
@@ -1083,6 +1096,10 @@ fn render_terminal_content(
     let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
     crate::app::frame_diagnostics::record_lock_wait(pane.id, lock_started);
     let screen = parser.screen();
+
+    if let Some(capture) = &pane.capture {
+        capture.draw(true, screen.scrollback());
+    }
 
     let rows = area.height as usize;
     let cols = area.width as usize;

@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 use crate::app::AppEvent;
+use crate::pane_capture::{Capture, Data as CaptureData, DeferredState};
 
 const MOUSE_PROTOCOL_CACHE_TTL: Duration = Duration::from_secs(2);
 
@@ -63,6 +64,7 @@ pub struct Pane {
     #[cfg(test)]
     raw_read_capture: Option<Arc<Mutex<TestRawReadCapture>>>,
     pub parser: Arc<Mutex<vt100::Parser>>,
+    pub(crate) capture: Option<Arc<Capture>>,
     synchronized_output: Arc<Mutex<SynchronizedOutputStream>>,
     child: Option<Box<dyn Child + Send + Sync>>,
     _reader_handle: Option<thread::JoinHandle<()>>,
@@ -232,6 +234,7 @@ impl Pane {
         let work_dir =
             cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
+        let capture = Capture::for_pane(id, None, rows, cols);
         Self {
             id,
             master: None,
@@ -239,7 +242,11 @@ impl Pane {
             test_input: Vec::new(),
             raw_read_capture: None,
             parser: Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10000))),
-            synchronized_output: Arc::new(Mutex::new(SynchronizedOutputStream::default())),
+            synchronized_output: Arc::new(Mutex::new(SynchronizedOutputStream {
+                capture: capture.clone(),
+                ..Default::default()
+            })),
+            capture,
             child: None,
             _reader_handle: None,
             last_rows: rows,
@@ -361,7 +368,11 @@ impl Pane {
 
         // Scrollback buffer: 10000 lines of history
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10000)));
-        let synchronized_output = Arc::new(Mutex::new(SynchronizedOutputStream::default()));
+        let capture = Capture::for_pane(id, child.process_id(), rows, cols);
+        let synchronized_output = Arc::new(Mutex::new(SynchronizedOutputStream {
+            capture: capture.clone(),
+            ..Default::default()
+        }));
         let pane_title = Arc::new(Mutex::new(String::new()));
 
         let reader = pair
@@ -418,6 +429,7 @@ impl Pane {
             raw_read_capture,
             parser,
             synchronized_output,
+            capture,
             child: Some(child),
             _reader_handle: Some(reader_handle),
             last_rows: rows,
@@ -533,6 +545,9 @@ impl Pane {
         // The TUI app (e.g. Claude Code) receives SIGWINCH and will redraw.
         // A brief blank frame is preferable to overlapping garbled output.
         parser.process(b"\x1b[2J\x1b[H");
+        if let Some(capture) = &self.capture {
+            capture.resize(rows, cols);
+        }
         Ok(true)
     }
 
@@ -1293,6 +1308,12 @@ enum DeferredOutput {
 struct SynchronizedOutputStream {
     marker_tail: Vec<u8>,
     deferred: Option<DeferredOutput>,
+    capture: Option<Arc<Capture>>,
+    capture_offset: u64,
+    capture_cursor: u64,
+    capture_now: Option<Instant>,
+    capture_nested_begin: Option<u64>,
+    capture_exit_pending: bool,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -1308,6 +1329,7 @@ struct OutputMarkerMatch {
     end: usize,
     prefix_in_tail: usize,
     marker: OutputMarker,
+    name: &'static str,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1317,7 +1339,50 @@ enum DeferredOutputKind {
 }
 
 impl SynchronizedOutputStream {
+    fn capture_state(&self) -> DeferredState {
+        let (kind, started, buffered_len) = match &self.deferred {
+            Some(DeferredOutput::Synchronized(frame)) => {
+                ("dec2026", Some(frame.started_at), frame.bytes.len())
+            }
+            Some(DeferredOutput::Erase(hold)) => {
+                ("erase_hold", Some(hold.started_at), hold.bytes.len())
+            }
+            None => ("none", None, 0),
+        };
+        DeferredState {
+            kind,
+            opened_at_elapsed_us: started
+                .and_then(|at| self.capture.as_ref().map(|capture| capture.elapsed_us(at))),
+            buffered_len,
+        }
+    }
+
+    fn capture_transition(
+        &self,
+        action: &'static str,
+        kind: &'static str,
+        marker: Option<&'static str>,
+        offset: u64,
+        reason: Option<&'static str>,
+    ) {
+        if let Some(capture) = self.capture.as_ref().filter(|capture| capture.is_enabled()) {
+            capture.event(
+                self.capture_now.unwrap_or_else(Instant::now),
+                CaptureData::Transition {
+                    action,
+                    kind,
+                    marker,
+                    bin_offset: offset,
+                    reason,
+                },
+                action == "close",
+            );
+        }
+    }
+
     fn push(&mut self, data: &[u8], now: Instant) -> Vec<Vec<u8>> {
+        self.capture_now = Some(now);
+        self.capture_cursor = self.capture_offset;
         let mut flushed = Vec::new();
 
         self.flush_expired_for_read(now, &mut flushed);
@@ -1332,8 +1397,24 @@ impl SynchronizedOutputStream {
                 &mut flushed,
             );
             let marker_bytes = &data[marker_match.start..marker_match.end];
+            let marker_offset = (self.capture_offset + marker_match.start as u64)
+                .saturating_sub(marker_match.prefix_in_tail as u64);
+            self.capture_transition(
+                "marker",
+                "marker",
+                Some(marker_match.name),
+                marker_offset,
+                None,
+            );
             match (self.deferred_kind(), marker_match.marker) {
                 (None, OutputMarker::SynchronizedBegin) => {
+                    self.capture_transition(
+                        "open",
+                        "dec2026",
+                        Some(marker_match.name),
+                        marker_offset,
+                        None,
+                    );
                     Self::flush_pass_through(&mut pass_through, &mut flushed);
                     self.deferred = Some(DeferredOutput::Synchronized(SynchronizedOutputFrame {
                         started_at: now,
@@ -1342,6 +1423,13 @@ impl SynchronizedOutputStream {
                     self.append_bytes(marker_bytes, &mut pass_through, &mut flushed);
                 }
                 (None, OutputMarker::Erase) => {
+                    self.capture_transition(
+                        "open",
+                        "erase_hold",
+                        Some(marker_match.name),
+                        marker_offset,
+                        None,
+                    );
                     Self::flush_pass_through(&mut pass_through, &mut flushed);
                     self.deferred = Some(DeferredOutput::Erase(EraseOutputHold {
                         started_at: now,
@@ -1352,19 +1440,41 @@ impl SynchronizedOutputStream {
                 }
                 (Some(DeferredOutputKind::Synchronized), OutputMarker::SynchronizedEnd) => {
                     self.append_bytes(marker_bytes, &mut pass_through, &mut flushed);
-                    self.flush_all_deferred(&mut flushed);
+                    self.flush_all_deferred(&mut flushed, "end_marker");
                 }
                 (Some(DeferredOutputKind::Erase), OutputMarker::SynchronizedBegin) => {
+                    let mut opened = false;
                     if let Some(DeferredOutput::Erase(hold)) = self.deferred.as_mut() {
                         if hold.unmatched_synchronized_begin.is_none() {
+                            opened = true;
+                            self.capture_nested_begin = Some(marker_offset);
                             let marker_offset =
                                 hold.bytes.len().saturating_sub(marker_match.prefix_in_tail);
                             hold.unmatched_synchronized_begin = Some((marker_offset, now));
                         }
                     }
+                    if opened {
+                        self.capture_transition(
+                            "open",
+                            "dec2026",
+                            Some(marker_match.name),
+                            marker_offset,
+                            Some("inside_erase_hold"),
+                        );
+                    }
                     self.append_bytes(marker_bytes, &mut pass_through, &mut flushed);
                 }
                 (Some(DeferredOutputKind::Erase), OutputMarker::SynchronizedEnd) => {
+                    if self.capture_nested_begin.is_some() {
+                        self.capture_transition(
+                            "close",
+                            "dec2026",
+                            Some(marker_match.name),
+                            self.capture_offset + marker_match.end as u64,
+                            Some("end_marker"),
+                        );
+                    }
+                    self.capture_nested_begin = None;
                     if let Some(DeferredOutput::Erase(hold)) = self.deferred.as_mut() {
                         hold.unmatched_synchronized_begin = None;
                     }
@@ -1379,15 +1489,43 @@ impl SynchronizedOutputStream {
         self.append_bytes(&data[cursor..], &mut pass_through, &mut flushed);
 
         Self::flush_pass_through(&mut pass_through, &mut flushed);
+        if let Some(capture) = self.capture.as_ref().filter(|capture| capture.is_enabled()) {
+            capture.read(now, self.capture_offset, data, self.capture_state());
+        }
+        self.capture_offset += data.len() as u64;
         flushed
     }
 
     fn finish(&mut self) -> Vec<Vec<u8>> {
+        self.capture_now = Some(Instant::now());
+        self.capture_exit_pending = true;
+        if self.capture_nested_begin.take().is_some() {
+            self.capture_transition(
+                "close",
+                "dec2026",
+                None,
+                self.capture_offset,
+                Some("reader_exit"),
+            );
+        }
+        if self.deferred.is_some() {
+            self.capture_transition(
+                "close",
+                self.capture_state().kind,
+                None,
+                self.capture_offset,
+                Some("reader_exit"),
+            );
+        }
         let bytes = match self.deferred.take() {
             Some(DeferredOutput::Synchronized(frame)) => frame.bytes,
             Some(DeferredOutput::Erase(hold)) => hold.bytes,
-            None => return Vec::new(),
+            None => Vec::new(),
         };
+        if let Some(capture) = self.capture.as_ref().filter(|capture| capture.is_enabled()) {
+            let deferred = self.capture_state();
+            capture.set_deferred(deferred);
+        }
         if bytes.is_empty() {
             Vec::new()
         } else {
@@ -1396,9 +1534,22 @@ impl SynchronizedOutputStream {
     }
 
     fn flush_expired_erase_hold(&mut self, now: Instant) -> Vec<Vec<u8>> {
+        self.capture_now = Some(now);
         let mut flushed = Vec::new();
         if self.erase_hold_expired(now) {
-            self.flush_erase_hold(&mut flushed);
+            self.flush_erase_hold(&mut flushed, "tick_release");
+            if let Some(capture) = self.capture.as_ref().filter(|capture| capture.is_enabled()) {
+                let deferred = self.capture_state();
+                capture.set_deferred(deferred.clone());
+                capture.event(
+                    now,
+                    CaptureData::AppTickRelease {
+                        released_len: flushed.iter().map(Vec::len).sum(),
+                        deferred,
+                    },
+                    true,
+                );
+            }
         }
         flushed
     }
@@ -1409,6 +1560,7 @@ impl SynchronizedOutputStream {
         pass_through: &mut Vec<u8>,
         flushed: &mut Vec<Vec<u8>>,
     ) {
+        self.capture_cursor += data.len() as u64;
         match self.deferred.as_mut() {
             Some(DeferredOutput::Synchronized(frame)) => frame.bytes.extend_from_slice(data),
             Some(DeferredOutput::Erase(hold)) => hold.bytes.extend_from_slice(data),
@@ -1436,8 +1588,10 @@ impl SynchronizedOutputStream {
                 break;
             }
             match self.deferred_kind() {
-                Some(DeferredOutputKind::Erase) => self.flush_erase_hold(flushed),
-                Some(DeferredOutputKind::Synchronized) => self.flush_all_deferred(flushed),
+                Some(DeferredOutputKind::Erase) => self.flush_erase_hold(flushed, "byte_cap"),
+                Some(DeferredOutputKind::Synchronized) => {
+                    self.flush_all_deferred(flushed, "byte_cap")
+                }
                 None => break,
             }
         }
@@ -1458,8 +1612,10 @@ impl SynchronizedOutputStream {
                 break;
             }
             match self.deferred_kind() {
-                Some(DeferredOutputKind::Erase) => self.flush_erase_hold(flushed),
-                Some(DeferredOutputKind::Synchronized) => self.flush_all_deferred(flushed),
+                Some(DeferredOutputKind::Erase) => self.flush_erase_hold(flushed, "timeout"),
+                Some(DeferredOutputKind::Synchronized) => {
+                    self.flush_all_deferred(flushed, "timeout")
+                }
                 None => break,
             }
         }
@@ -1473,11 +1629,26 @@ impl SynchronizedOutputStream {
         )
     }
 
-    fn flush_erase_hold(&mut self, flushed: &mut Vec<Vec<u8>>) {
+    fn flush_erase_hold(&mut self, flushed: &mut Vec<Vec<u8>>, reason: &'static str) {
+        self.capture_transition(
+            "close",
+            "erase_hold",
+            None,
+            self.capture_cursor,
+            Some(reason),
+        );
         let Some(DeferredOutput::Erase(mut hold)) = self.deferred.take() else {
             return;
         };
         if let Some((offset, started_at)) = hold.unmatched_synchronized_begin {
+            self.capture_transition(
+                "promote",
+                "dec2026",
+                Some("dec2026_begin"),
+                self.capture_nested_begin.unwrap_or(self.capture_cursor),
+                Some("erase_conversion"),
+            );
+            self.capture_nested_begin = None;
             let synchronized_bytes = hold.bytes.split_off(offset.min(hold.bytes.len()));
             if !hold.bytes.is_empty() {
                 flushed.push(hold.bytes);
@@ -1491,7 +1662,16 @@ impl SynchronizedOutputStream {
         }
     }
 
-    fn flush_all_deferred(&mut self, flushed: &mut Vec<Vec<u8>>) {
+    fn flush_all_deferred(&mut self, flushed: &mut Vec<Vec<u8>>, reason: &'static str) {
+        if self.deferred.is_some() {
+            self.capture_transition(
+                "close",
+                self.capture_state().kind,
+                None,
+                self.capture_cursor,
+                Some(reason),
+            );
+        }
         let bytes = match self.deferred.take() {
             Some(DeferredOutput::Synchronized(frame)) => frame.bytes,
             Some(DeferredOutput::Erase(hold)) => hold.bytes,
@@ -1546,6 +1726,14 @@ impl SynchronizedOutputStream {
                 end: combined_end - tail_len,
                 prefix_in_tail: tail_len.saturating_sub(index),
                 marker,
+                name: match marker {
+                    OutputMarker::SynchronizedBegin => "dec2026_begin",
+                    OutputMarker::SynchronizedEnd => "dec2026_end",
+                    OutputMarker::Erase if combined[index..].starts_with(ERASE_DISPLAY) => {
+                        "erase_display"
+                    }
+                    OutputMarker::Erase => "erase_scrollback",
+                },
             });
         }
 
@@ -1567,6 +1755,7 @@ fn process_pty_output(
     mouse_protocol_cache: &Arc<Mutex<Option<CachedMouseProtocol>>>,
     pane_id: usize,
     event_tx: &Sender<AppEvent>,
+    capture: Option<&Capture>,
 ) {
     if data.is_empty() {
         return;
@@ -1574,6 +1763,9 @@ fn process_pty_output(
 
     let mut parser = parser.lock().unwrap_or_else(|error| error.into_inner());
     parser.process(data);
+    if let Some(capture) = capture {
+        capture.applied(data.len());
+    }
     let screen = parser.screen();
     let mode = screen.mouse_protocol_mode();
     if !matches!(mode, vt100::MouseProtocolMode::None) {
@@ -1605,7 +1797,32 @@ fn process_synchronized_output(
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     for data in update(&mut stream) {
-        process_pty_output(&data, parser, mouse_protocol_cache, pane_id, event_tx);
+        process_pty_output(
+            &data,
+            parser,
+            mouse_protocol_cache,
+            pane_id,
+            event_tx,
+            stream.capture.as_deref(),
+        );
+    }
+    if std::mem::take(&mut stream.capture_exit_pending) {
+        if let Some(capture) = stream
+            .capture
+            .as_ref()
+            .filter(|capture| capture.is_enabled())
+        {
+            capture.event(
+                Instant::now(),
+                CaptureData::ReaderExit {
+                    deferred: stream.capture_state(),
+                },
+                true,
+            );
+        }
+    }
+    if let Some(capture) = &stream.capture {
+        capture.finish_update();
     }
 }
 
@@ -2374,7 +2591,10 @@ mod tests {
             let claude_seen = Arc::new(AtomicBool::new(false));
             let codex_seen = Arc::new(AtomicBool::new(false));
             let mouse_protocol_cache = Arc::new(Mutex::new(None));
-            let synchronized_output = Arc::new(Mutex::new(SynchronizedOutputStream::default()));
+            let synchronized_output = Arc::new(Mutex::new(SynchronizedOutputStream {
+                capture: Capture::for_pane(4242, None, 8, 80),
+                ..Default::default()
+            }));
             let alternate_scroll_mode = Arc::new(AtomicBool::new(false));
             let read_times = Arc::new(Mutex::new(std::collections::VecDeque::new()));
 
@@ -2434,6 +2654,15 @@ mod tests {
                 alternate_scroll_mode,
                 handle: Some(handle),
             }
+        }
+
+        fn capture(&self) -> Arc<Capture> {
+            self.synchronized_output
+                .lock()
+                .unwrap()
+                .capture
+                .clone()
+                .expect("capture enabled by creator")
         }
 
         fn send(&self, data: &[u8]) {
@@ -2533,6 +2762,148 @@ mod tests {
                 .expect("join fake PTY reader");
             drop(self.event_tx.take());
         }
+    }
+
+    #[test]
+    fn debug_capture_scripted_reader_records_offsets_clock_and_tick_release() {
+        use crate::pane_capture::{test_config, with_test_config};
+        let origin = Instant::now();
+        let config = test_config("reader", origin);
+        let mut harness = with_test_config(Some(config.clone()), ReaderHarness::new);
+        let capture = harness.capture();
+        harness.send_at(b"seed", origin);
+        assert_eq!(harness.recv_output(), 4);
+        let held = b"\x1b[2J\x1b[Htop";
+        harness.send_at(held, origin + Duration::from_millis(1));
+        harness.wait_for_buffered_len(held.len());
+        harness.tick_at(origin + Duration::from_millis(41));
+        assert_eq!(harness.recv_output(), held.len());
+        harness.send_at(b"bottom", origin + Duration::from_millis(42));
+        assert_eq!(harness.recv_output(), 6);
+        harness.input.take();
+        harness.handle.take().unwrap().join().unwrap();
+        capture.flush();
+        let binary = std::fs::read(config.directory.join("pane-4242.bin")).unwrap();
+        assert_eq!(binary, [b"seed".as_slice(), held, b"bottom"].concat());
+        let records: Vec<serde_json::Value> =
+            std::fs::read_to_string(config.directory.join("pane-4242.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        let reads: Vec<_> = records
+            .iter()
+            .filter(|record| record["event"] == "read")
+            .collect();
+        assert_eq!(reads.len(), 3);
+        for (record, (offset, len, time, kind)) in reads.iter().zip([
+            (0, 4, 0, "none"),
+            (4, held.len(), 1000, "erase_hold"),
+            (4 + held.len(), 6, 42000, "none"),
+        ]) {
+            assert_eq!(record["bin_offset"], offset);
+            assert_eq!(record["read_len"], len);
+            assert_eq!(record["elapsed_us"], time);
+            assert_eq!(record["timestamp_unix_ms"], 1000 + time / 1000);
+            assert_eq!(record["deferred"]["kind"], kind);
+            assert_eq!(record["process_id"], std::process::id());
+        }
+        assert_eq!(reads[1]["deferred"]["opened_at_elapsed_us"], 1000);
+        assert_eq!(reads[1]["deferred"]["buffered_len"], held.len());
+        let transitions: Vec<_> = records
+            .iter()
+            .filter(|record| record["event"] == "transition" && record["action"] != "marker")
+            .collect();
+        assert_eq!(transitions.len(), 2);
+        assert_eq!(transitions[0]["action"], "open");
+        assert_eq!(transitions[0]["marker"], "erase_display");
+        assert_eq!(transitions[0]["bin_offset"], 4);
+        assert_eq!(transitions[1]["reason"], "tick_release");
+        assert_eq!(transitions[1]["elapsed_us"], 41000);
+        let tick = records
+            .iter()
+            .find(|record| record["event"] == "app_tick_release")
+            .unwrap();
+        assert_eq!(tick["released_len"], held.len());
+        assert_eq!(tick["elapsed_us"], 41000);
+        assert_eq!(records.last().unwrap()["event"], "reader_exit");
+    }
+
+    #[test]
+    fn debug_capture_unwritable_path_preserves_reader_output() {
+        use crate::pane_capture::{test_config, with_test_config};
+        let config = test_config("unwritable", Instant::now());
+        std::fs::write(&config.directory, b"regular file").unwrap();
+        let failures = crate::pane_capture::failure_count();
+        let mut harness = with_test_config(Some(config.clone()), ReaderHarness::new);
+        let capture = harness.capture();
+        capture.flush();
+        assert!(!capture.is_enabled());
+        assert!(crate::pane_capture::failure_count() > failures);
+        harness.send(b"unchanged");
+        assert_eq!(harness.recv_output(), 9);
+        assert_eq!(harness.screen(), "unchanged");
+        harness.input.take();
+        harness.handle.take().unwrap().join().unwrap();
+        assert!(config.directory.is_file());
+        assert!(!config.directory.join("pane-4242.bin").exists());
+    }
+
+    #[test]
+    fn debug_capture_records_split_frames_conversion_and_all_close_reasons() {
+        use crate::pane_capture::test_config;
+        let origin = Instant::now();
+        let config = test_config("transitions", origin);
+        let capture = Capture::create(config.clone(), 9, None, 8, 80).unwrap();
+        let mut stream = SynchronizedOutputStream {
+            capture: Some(capture.clone()),
+            ..Default::default()
+        };
+        stream.push(b"x\x1b[?20", origin);
+        stream.push(b"26hy\x1b[?2026l", origin);
+        stream.push(SYNCHRONIZED_OUTPUT_BEGIN, origin);
+        stream.push(b"timeout", origin + SYNCHRONIZED_OUTPUT_TIMEOUT);
+        stream.push(
+            SYNCHRONIZED_OUTPUT_BEGIN,
+            origin + SYNCHRONIZED_OUTPUT_TIMEOUT,
+        );
+        stream.push(
+            &vec![b'x'; SYNCHRONIZED_OUTPUT_BYTE_CAP + 1],
+            origin + SYNCHRONIZED_OUTPUT_TIMEOUT,
+        );
+        stream.push(b"\x1b[2J\x1b[?2026h", origin + Duration::from_secs(1));
+        stream.flush_expired_erase_hold(origin + Duration::from_secs(1) + ERASE_OUTPUT_HOLD);
+        stream.finish();
+        capture.flush();
+        let records: Vec<serde_json::Value> =
+            std::fs::read_to_string(config.directory.join("pane-9.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        let opens: Vec<_> = records
+            .iter()
+            .filter(|record| record["action"] == "open")
+            .collect();
+        assert_eq!(opens[0]["bin_offset"], 1);
+        assert_eq!(opens[0]["marker"], "dec2026_begin");
+        for reason in [
+            "end_marker",
+            "timeout",
+            "byte_cap",
+            "tick_release",
+            "reader_exit",
+        ] {
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record["action"] == "close" && record["reason"] == reason),
+                "missing {reason}"
+            );
+        }
+        assert!(records
+            .iter()
+            .any(|record| record["action"] == "promote" && record["reason"] == "erase_conversion"));
     }
 
     impl Drop for ReaderHarness {

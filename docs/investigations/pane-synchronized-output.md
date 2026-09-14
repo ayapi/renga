@@ -112,3 +112,176 @@ same half-applied paint, rarer. An additional erase arriving inside the first
 hold's 40 ms is likewise governed by that original fixed cap. The measured
 scope is erase repaints and idle Codex; this investigation does not claim that
 the field-observed sweep is gone before the separate live field check.
+
+## Field capture and replay
+
+The working-Codex field symptom is transcript rows flowing from top to bottom.
+The earlier idle measurements do not establish its cause. Set capture for the
+TUI that will run the workload, then reproduce that workload and quit normally:
+
+```powershell
+$env:RENGA_DEBUG_PANE_CAPTURE = 'C:\scratch\renga-pane-capture'
+renga
+Remove-Item Env:RENGA_DEBUG_PANE_CAPTURE
+```
+
+On Unix, use `RENGA_DEBUG_PANE_CAPTURE=/tmp/renga-pane-capture renga`.
+The variable is read once on TUI startup. An absent variable creates no capture
+directory, file, writer thread, or capture handle. Tests use a creator-thread
+override that defaults to disabled, irrespective of inherited environment.
+
+Each TUI creates a unique `session-<TUI-pid>-<start-token>` subdirectory with
+`pane-<id>.bin` and `pane-<id>.jsonl`. Files use exclusive creation, so multiple
+TUIs and restarted sessions cannot interleave their bytes. `.bin` contains
+every positive-length raw PTY read in arrival order, without interpretation;
+it includes the pane's transcript and any application output. Preserve both
+files when sharing a capture. Capture records data; it changes no hold policy.
+
+Run replay from the matching source checkout:
+
+```powershell
+$env:RENGA_DEBUG_CODEX_PEER_LOG = "$PWD\target\replay-test-peer.jsonl"
+$env:RENGA_PANE_REPLAY = 'C:\scratch\renga-pane-capture\session-123-456\pane-1.jsonl'
+cargo test --bin renga pane_capture::replay::replay_capture -- --ignored --exact --nocapture
+```
+
+`RENGA_PANE_REPLAY_GAP_US` optionally changes the default **40,000 us** burst
+gap. Keep the default when comparing to the swk/1fz measurements. Replay needs
+metadata and read records; parser application, draw, and tick-release records
+are optional for converted historical captures. A metadata/read/parser-apply
+capture prints its raw and applied tables with no drawn samples and envelope
+`draws=n/a`.
+
+### File schema (version 1)
+
+Each UTF-8 JSONL line is an object. Common fields are `sequence` (zero-based,
+contiguous per pane), `timestamp_unix_ms`, `elapsed_us`, `pane_id`, `process_id`
+(the **TUI** process), `child_process_id` (PTY child or null), and `event`.
+The process-wide origin is sampled once; Unix timestamps are that origin's
+Unix milliseconds plus the event's monotonic elapsed time. They do not jump
+when the wall clock is adjusted. Read timestamps use the exact instant passed
+to the output stream; tick releases use the App's tick instant; actual draws
+sample their instant under the parser lock. The writer never samples event
+timestamps. Tests can inject both the origin and reader clock.
+
+**File/channel sequence is authoritative. Do not sort by time.** A tick can
+sample its instant before waiting behind a reader, so its timestamp can be
+earlier than a preceding record. The parser's `applied_offset` changes under
+the same parser lock as `parser.process`, and actual draws read that offset
+under their existing parser lock. It is the exclusive end of the raw-byte
+prefix already applied to vt100, starting at zero.
+
+| Event | Additional fields and meaning |
+|---|---|
+| `metadata` | First record: `version: 1`, initial `rows`, `cols`, `origin_unix_ms`. |
+| `read` | `bin_offset` (zero-based start), positive `read_len`, `deferred` after this read. Consecutive read ranges cover the binary stream. |
+| `transition` | `action`: `marker`, `open`, `close`, or `promote`; `kind`: `marker`, `dec2026`, or `erase_hold`; `marker`: `dec2026_begin`, `dec2026_end`, `erase_display`, `erase_scrollback`, or null; `bin_offset`; `reason` or null. Marker/open offsets include marker prefixes split across reads. Close offsets identify the consumed position at the release decision. |
+| `parser_apply` | `bin_offset`, `byte_len`, `applied_offset`. Applies that raw range, which starts at the previous applied offset. Ranges can end partway through a read or combine several reads. |
+| `app_tick_release` | `released_len`, resulting `deferred`; the actual App-side erase release, including its own tick timestamp. |
+| `app_draw` | `drawn`, `applied_offset`, `scrollback`, `deferred`. True means terminal content was copied into this App frame; false means this pane was skipped. A draw is an App buffer render, not confirmation of host-terminal presentation. |
+| `resize` | `rows`, `cols`, `clear: true`, `applied_offset`. At this parser position, call `set_size`, then process `ESC[2J ESC[H` (with no intervening space). These injected bytes are not raw PTY bytes and do not advance the applied offset. |
+| `reader_exit` | Resulting `deferred`; emitted after applying the reader's final released bytes, for EOF or a read error. |
+
+`deferred` is `{ "kind": "none|dec2026|erase_hold",
+"opened_at_elapsed_us": null|integer, "buffered_len": integer }`.
+Draws carry the latest completed reader/tick deferred snapshot; the applied
+offset identifies the parser state actually copied. A frame inside an erase
+hold gets its own open/end-marker close records. An unmatched frame that
+survives the erase release has action `promote`, reason `erase_conversion`;
+its original begin instant remains in the subsequent deferred state.
+Close reasons are `end_marker`, `timeout` (reader-side age check), `byte_cap`,
+`reader_exit`, and `tick_release`. Open reason `inside_erase_hold` identifies
+a frame whose bytes are still retained by an erase hold.
+
+For example, the following minimal converter output corresponds to binary
+bytes `abc`. The replay helper accepts these common fields without requiring
+the optional child PID:
+
+```jsonl
+{"sequence":0,"timestamp_unix_ms":1000,"elapsed_us":0,"pane_id":1,"process_id":123,"event":"metadata","version":1,"rows":40,"cols":120,"origin_unix_ms":1000}
+{"sequence":1,"timestamp_unix_ms":1001,"elapsed_us":1000,"pane_id":1,"process_id":123,"event":"read","bin_offset":0,"read_len":3,"deferred":{"kind":"none","opened_at_elapsed_us":null,"buffered_len":0}}
+{"sequence":2,"timestamp_unix_ms":1001,"elapsed_us":1000,"pane_id":1,"process_id":123,"event":"parser_apply","bin_offset":0,"byte_len":3,"applied_offset":3}
+```
+
+Replay validates sequences, dimensions, and read/apply ranges. An unindexed
+binary tail is reported and ignored, allowing analysis of complete records
+from a capture interrupted between binary and JSON writes. A malformed or
+partial JSONL line is an error; preserve the original and remove only its
+incomplete final line from an analysis copy if a process was forcibly killed.
+
+### Reading the replay tables
+
+A burst is a maximal run of consecutive reads with each internal gap **less
+than 40,000 us**. Each row reports reads, bytes, duration, largest internal
+gap, and a byte-based kind: `ERASE` if it contains `ESC[2J` or `ESC[3J`, otherwise
+`H-OPEN` if it contains `ESC[2m ESC[H` (without a space), otherwise `other`.
+A bare `ESC[H` does not count as an H-OPEN repaint.
+
+Screen comparisons use vt100 `contents()` text, with each row trimmed at the
+end and blank rows retained to the screen height. The burst's `pre` is the raw
+screen before its first read; `post` is the raw screen after its last read.
+Each table prints `before_equals_after` and `third_states=X/Y`: a third state
+differs from **both** pre and post. `raw` samples after reads 1 through n-1,
+reproducing the original "5 of 9" form; `applied` samples each actual parser
+application ending within the burst's byte range; `drawn` samples actual pane
+draws from its first read record until the next burst's first read record.
+A release triggered by a later read is therefore still assigned to the bytes
+it applied. Delayed or suppressed draws can produce fewer samples.
+
+Each draw and table snapshot also reports its change from the previous screen:
+
+- `identical (none)`: all rows match; this includes identical rewrites.
+- `cleared (full clear)`: the later screen is entirely blank.
+- `shifted(k) matches=m (scrolled)`: for k from 1 through rows-1, maximize
+  the number of nonblank later rows equal to earlier row i+k. At least three
+  rows must match and this count must exceed the unchanged nonblank count.
+  Ties choose the smallest k. A fixed footer does not exclude a shifted body.
+- `rows_changed(n)`: other changes, with the number of differing rows.
+
+Every third state prints mutually exclusive `post_only`, `pre_only`, `both`,
+and `neither` row counts. `top_prefix=true` means post-only rows precede
+pre-only rows, both sets exist, and no neither rows occur; rows equal to both
+are neutral. This measures a partial top-to-bottom replacement directly.
+
+Every cursor envelope beginning in a burst, from `ESC[?25l` through the next
+`ESC[?25h`, reports its half-open byte span, completion, first/last read indexes
+(one-based across the capture), read count, whether it spans multiple reads,
+and duration. `draws` counts true draw records whose applied offset is strictly
+inside that span; these are the draws that could expose a partial envelope.
+No extra record is made for every idle App iteration. An incomplete envelope
+ends at the last indexed byte and prints `complete=false`. Burst rows also
+count DECSTBM, SU, SD, IL, DL, RI, EL (`ESC[K`), and ED (`ESC[J`), including
+numeric CSI parameters, to identify scrolling operations.
+
+These text classes diagnose parser visibility. They do not compare colors,
+cursor-only changes, host-terminal flush completion, or the physical screen.
+Draw scrollback offsets and parser resize clear injections are replayed.
+
+### Cost, errors, and flushing
+
+The creator resolves capture and passes the handle into the reader's shared
+stream. Under the stream lock the reader enqueues raw bytes and typed records;
+parser applications additionally hold the existing parser lock. Draw/resize
+records use that parser lock and a short capture-state lock; they never
+acquire the stream lock. Serialization and file IO happen only in the per-pane
+writer thread, using two buffered writers and an unbounded channel. There is
+at most one small draw record per pane per App render, including skipped panes.
+The skipped-pane pass is behind one cached enabled flag. A stalled disk may
+grow the diagnostic queue; enable capture for the workload being investigated.
+
+Both files flush at fixed 100 ms deadlines even under continuous traffic,
+on close/release (including the resulting parser application), reader exit,
+and writer disconnect. A TUI-return guard requests acknowledged flushes with
+one shared deadline of at most one second. It includes writers for panes that
+already closed; capture handles/files remain registered until TUI shutdown.
+Forced termination cannot run that guard. Open, spawn, write, or flush failure
+increments an atomic failure counter and disables that capture; senders check
+disabled before copying raw data. There is no diagnostic stdout/stderr output
+inside the TUI and pane parsing continues unchanged.
+
+As a small synthetic serialization measurement, a true/false draw pair occupied
+248/249 bytes per line (five-digit process ID, short timestamps, no hold).
+At 13 panes and 30 App draws/s, 249 bytes per record projects to approximately
+350 MB/hour of draw JSONL alone; real timestamps and hold state increase that,
+and raw bytes/read/transition records add workload-dependent volume. This is a
+format-size projection, not a measured field throughput or a storage cap.
