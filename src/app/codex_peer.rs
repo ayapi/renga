@@ -207,36 +207,60 @@ fn exact_codex_peer_injected_concatenation(
     composer: &str,
     expected_composers: Option<&VecDeque<String>>,
     current_expected_composer: &str,
-) -> Option<bool> {
+) -> Option<ExactCodexPeerInjectedConcatenation> {
     let expected_composers = expected_composers?;
     if composer.is_empty() || expected_composers.is_empty() {
         return None;
     }
-    let mut reachable = vec![[false; 2]; composer.len() + 1];
-    reachable[0][0] = true;
+    let mut predecessors = vec![[None; 2]; composer.len() + 1];
+    predecessors[0][0] = Some((0, false, 0));
     for offset in 0..composer.len() {
         if !composer.is_char_boundary(offset) {
             continue;
         }
         for used_current in [false, true] {
-            if !reachable[offset][usize::from(used_current)] {
+            if predecessors[offset][usize::from(used_current)].is_none() {
                 continue;
             }
-            for expected in expected_composers {
+            for (expected_index, expected) in expected_composers.iter().enumerate() {
                 if !expected.is_empty() && composer[offset..].starts_with(expected) {
                     let next_used_current = used_current || expected == current_expected_composer;
-                    reachable[offset + expected.len()][usize::from(next_used_current)] = true;
+                    let next =
+                        &mut predecessors[offset + expected.len()][usize::from(next_used_current)];
+                    if next.is_none() {
+                        *next = Some((offset, used_current, expected_index));
+                    }
                 }
             }
         }
     }
-    if reachable[composer.len()][1] {
-        Some(true)
-    } else if reachable[composer.len()][0] {
-        Some(false)
+    let contains_current = if predecessors[composer.len()][1].is_some() {
+        true
+    } else if predecessors[composer.len()][0].is_some() {
+        false
     } else {
-        None
+        return None;
+    };
+    let mut matched_injections = Vec::new();
+    let mut offset = composer.len();
+    let mut used_current = contains_current;
+    while offset > 0 {
+        let (previous_offset, previous_used_current, expected_index) =
+            predecessors[offset][usize::from(used_current)]?;
+        matched_injections.push(expected_composers[expected_index].clone());
+        offset = previous_offset;
+        used_current = previous_used_current;
     }
+    matched_injections.reverse();
+    Some(ExactCodexPeerInjectedConcatenation {
+        contains_current,
+        matched_injections,
+    })
+}
+
+struct ExactCodexPeerInjectedConcatenation {
+    contains_current: bool,
+    matched_injections: Vec<String>,
 }
 
 impl PendingCodexPeerDelivery {
@@ -459,9 +483,18 @@ fn looks_like_codex_placeholder(text: &str) -> bool {
         .or_else(|| normalized.strip_suffix('…'))
         .unwrap_or(normalized)
         .trim_end();
-    ["Ask Codex anything", "Ask Codex to do anything"]
-        .iter()
-        .any(|placeholder| without_trailing_ellipsis.eq_ignore_ascii_case(placeholder))
+    [
+        "Ask Codex anything",
+        "Ask Codex to do anything",
+        "Explain this codebase",
+        "Summarize recent commits",
+        "Implement {feature}",
+        "Find and fix a bug in @filename",
+        "Write tests for @filename",
+        "Improve documentation in @filename",
+    ]
+    .iter()
+    .any(|placeholder| without_trailing_ellipsis.eq_ignore_ascii_case(placeholder))
 }
 
 #[cfg(test)]
@@ -481,6 +514,12 @@ mod placeholder_tests {
             "ask codex anything...",
             "ASK CODEX TO DO ANYTHING",
             "ask codex to do anything…",
+            "Explain this codebase",
+            "Summarize recent commits",
+            "Implement {feature}",
+            "Find and fix a bug in @filename",
+            "Write tests for @filename",
+            "Improve documentation in @filename",
         ] {
             assert!(
                 looks_like_codex_placeholder(placeholder),
@@ -1062,6 +1101,10 @@ fn log_peer_delivery_record(
 }
 
 fn log_codex_peer_decision(path: &std::ffi::OsStr, decision: CodexPeerDecision<'_>) {
+    append_codex_peer_debug_record(path, codex_peer_decision_record(decision));
+}
+
+fn codex_peer_decision_record(decision: CodexPeerDecision<'_>) -> serde_json::Value {
     let CodexPeerDecision {
         pane_id,
         delivery_sequence,
@@ -1085,37 +1128,44 @@ fn log_codex_peer_decision(path: &std::ffi::OsStr, decision: CodexPeerDecision<'
         (None, _) => None,
     };
     let debug = screen.and_then(|state| state.debug.as_ref());
-    append_codex_peer_debug_record(
-        path,
-        serde_json::json!({
-            "pane_id": pane_id,
-            "delivery_sequence": delivery_sequence,
-            "composer_matches": composer_matches,
-            "retries_remaining": retries_remaining,
-            "expected_composer": expected_composer,
-            "expected_composer_raw": expected_composer_raw,
-            "screen_composer": screen.and_then(|state| state.composer.as_deref()),
-            "composer_end_visible": screen.map(|state| state.composer_end_visible),
-            "screen_composer_raw": debug.and_then(|state| state.composer_raw.as_deref()),
-            "has_draft": screen.and_then(|state| state.has_draft),
-            "ready_for_nudge": screen.map(|state| state.ready_for_nudge),
-            "can_queue_message": screen.map(|state| state.can_queue_message),
-            "hide_cursor": screen.map(|state| state.hide_cursor),
-            "native_queue_status_label": screen
-                .and_then(|state| state.native_queue_status_label),
-            "native_queue_busy": screen.map(|state| state.native_queue_busy),
-            "busy_queue_available": screen.map(|state| state.busy_queue_available),
-            "can_submit_injected_message": screen.map(|state| state.can_submit_injected_message),
-            "footer_raw": debug.map(|state| state.footer_raw.as_str()),
-            "status_raw": debug.map(|state| state.status_raw.as_str()),
-            "timing": timing,
-            "now_minus_ready_at_ms": ready_at.map(|target| instant_offset_millis(now, target)),
-            "now_minus_expires_at_ms": expires_at.map(|target| instant_offset_millis(now, target)),
-            "queue_entries_total": queue_entries_total,
-            "other_queue_entries": other_queue_entries,
-            "action": action,
-        }),
-    );
+    serde_json::json!({
+        "pane_id": pane_id,
+        "delivery_sequence": delivery_sequence,
+        "composer_matches": composer_matches,
+        "retries_remaining": retries_remaining,
+        "expected_composer": expected_composer,
+        "expected_composer_raw": expected_composer_raw,
+        "screen_composer": screen.and_then(|state| state.composer.as_deref()),
+        "composer_end_visible": screen.map(|state| state.composer_end_visible),
+        "screen_composer_raw": debug.and_then(|state| state.composer_raw.as_deref()),
+        "has_draft": screen.and_then(|state| state.has_draft),
+        "ready_for_nudge": screen.map(|state| state.ready_for_nudge),
+        "can_queue_message": screen.map(|state| state.can_queue_message),
+        "hide_cursor": screen.map(|state| state.hide_cursor),
+        "native_queue_status_label": screen
+            .and_then(|state| state.native_queue_status_label),
+        "native_queue_busy": screen.map(|state| state.native_queue_busy),
+        "busy_queue_available": screen.map(|state| state.busy_queue_available),
+        "can_submit_injected_message": screen.map(|state| state.can_submit_injected_message),
+        "footer_raw": debug.map(|state| state.footer_raw.as_str()),
+        "status_raw": debug.map(|state| state.status_raw.as_str()),
+        "timing": timing,
+        "now_minus_ready_at_ms": ready_at.map(|target| instant_offset_millis(now, target)),
+        "now_minus_expires_at_ms": expires_at.map(|target| instant_offset_millis(now, target)),
+        "queue_entries_total": queue_entries_total,
+        "other_queue_entries": other_queue_entries,
+        "action": action,
+    })
+}
+
+fn log_codex_peer_stale_decision(
+    path: &std::ffi::OsStr,
+    decision: CodexPeerDecision<'_>,
+    matched_injections: &[String],
+) {
+    let mut record = codex_peer_decision_record(decision);
+    record["matched_injections"] = serde_json::json!(matched_injections);
+    append_codex_peer_debug_record(path, record);
 }
 
 fn log_codex_peer_decision_if_changed(
@@ -1129,6 +1179,20 @@ fn log_codex_peer_decision_if_changed(
     }
     observations.insert(decision.pane_id, observation);
     log_codex_peer_decision(path, decision);
+}
+
+fn log_codex_peer_stale_decision_if_changed(
+    path: &std::ffi::OsStr,
+    observations: &mut HashMap<usize, CodexPeerDebugObservation>,
+    decision: CodexPeerDecision<'_>,
+    matched_injections: &[String],
+) {
+    let observation = CodexPeerDebugObservation::from_decision(&decision);
+    if observations.get(&decision.pane_id) == Some(&observation) {
+        return;
+    }
+    observations.insert(decision.pane_id, observation);
+    log_codex_peer_stale_decision(path, decision, matched_injections);
 }
 
 fn codex_composer_has_draft(pane: &Pane) -> Option<bool> {
@@ -2810,35 +2874,49 @@ impl App {
                                         codex_peer_injected_composers.get(&pane_id),
                                         &current_expected_composer,
                                     )
-                                    .map(|contains_current| (composer, contains_current))
+                                    .map(|stale_match| (composer, stale_match))
                                 });
-                            if let Some((stale_composer, contains_current)) = stale_composer {
-                                let log_stale_decision = |action| {
+                            if let Some((stale_composer, stale_match)) = stale_composer {
+                                let contains_current = stale_match.contains_current;
+                                let mut log_stale_decision = |action, only_if_changed| {
                                     let Some(path) = codex_peer_debug_log_path.as_deref() else {
                                         return;
                                     };
-                                    log_codex_peer_decision(
-                                        path,
-                                        CodexPeerDecision {
-                                            pane_id,
-                                            delivery_sequence,
-                                            now,
-                                            ready_at: None,
-                                            expires_at: None,
-                                            expected_composer: Some(stale_composer),
-                                            expected_composer_raw: None,
-                                            screen: screen.as_ref(),
-                                            composer_matches: Some(true),
-                                            retries_remaining: Some(retries_remaining),
-                                            queue_entries_total,
-                                            other_queue_entries: queue_entries_total
-                                                .saturating_sub(1),
-                                            action,
-                                        },
-                                    );
+                                    let decision = CodexPeerDecision {
+                                        pane_id,
+                                        delivery_sequence,
+                                        now,
+                                        ready_at: None,
+                                        expires_at: None,
+                                        expected_composer: Some(stale_composer),
+                                        expected_composer_raw: None,
+                                        screen: screen.as_ref(),
+                                        composer_matches: Some(true),
+                                        retries_remaining: Some(retries_remaining),
+                                        queue_entries_total,
+                                        other_queue_entries: queue_entries_total.saturating_sub(1),
+                                        action,
+                                    };
+                                    if only_if_changed {
+                                        log_codex_peer_stale_decision_if_changed(
+                                            path,
+                                            codex_peer_debug_observations,
+                                            decision,
+                                            &stale_match.matched_injections,
+                                        );
+                                    } else {
+                                        log_codex_peer_stale_decision(
+                                            path,
+                                            decision,
+                                            &stale_match.matched_injections,
+                                        );
+                                    }
                                 };
                                 if pane_is_focused {
-                                    log_stale_decision("stale_injection_focused_notification");
+                                    log_stale_decision(
+                                        "stale_injection_focused_notification",
+                                        false,
+                                    );
                                     queue.pop_front();
                                     focused_notifications.push((
                                         pane_id,
@@ -2853,7 +2931,7 @@ impl App {
                                     .is_some_and(|state| state.can_submit_injected_message)
                                 {
                                     if write_input_to_pane(pane, b"\r", false).is_ok() {
-                                        log_stale_decision("stale_injection_submitted");
+                                        log_stale_decision("stale_injection_submitted", false);
                                         codex_peer_injected_composers.remove(&pane_id);
                                         if contains_current {
                                             queue.pop_front();
@@ -2863,10 +2941,13 @@ impl App {
                                         }
                                         self.dirty = true;
                                     } else {
-                                        log_stale_decision("stale_injection_enter_write_failed");
+                                        log_stale_decision(
+                                            "stale_injection_enter_write_failed",
+                                            true,
+                                        );
                                     }
                                 } else {
-                                    log_stale_decision("stale_injection_waiting_until_idle");
+                                    log_stale_decision("stale_injection_waiting_until_idle", true);
                                 }
                                 continue;
                             }
@@ -3412,35 +3493,49 @@ impl App {
                                         codex_peer_injected_composers.get(&pane_id),
                                         &current_expected_composer,
                                     )
-                                    .map(|contains_current| (composer, contains_current))
+                                    .map(|stale_match| (composer, stale_match))
                                 });
-                            if let Some((stale_composer, contains_current)) = stale_composer {
-                                let log_stale_decision = |action| {
+                            if let Some((stale_composer, stale_match)) = stale_composer {
+                                let contains_current = stale_match.contains_current;
+                                let mut log_stale_decision = |action, only_if_changed| {
                                     let Some(path) = codex_peer_debug_log_path.as_deref() else {
                                         return;
                                     };
-                                    log_codex_peer_decision(
-                                        path,
-                                        CodexPeerDecision {
-                                            pane_id,
-                                            delivery_sequence,
-                                            now,
-                                            ready_at: None,
-                                            expires_at: None,
-                                            expected_composer: Some(stale_composer),
-                                            expected_composer_raw: None,
-                                            screen: screen.as_ref(),
-                                            composer_matches: Some(true),
-                                            retries_remaining: Some(retries_remaining),
-                                            queue_entries_total,
-                                            other_queue_entries: queue_entries_total
-                                                .saturating_sub(1),
-                                            action,
-                                        },
-                                    );
+                                    let decision = CodexPeerDecision {
+                                        pane_id,
+                                        delivery_sequence,
+                                        now,
+                                        ready_at: None,
+                                        expires_at: None,
+                                        expected_composer: Some(stale_composer),
+                                        expected_composer_raw: None,
+                                        screen: screen.as_ref(),
+                                        composer_matches: Some(true),
+                                        retries_remaining: Some(retries_remaining),
+                                        queue_entries_total,
+                                        other_queue_entries: queue_entries_total.saturating_sub(1),
+                                        action,
+                                    };
+                                    if only_if_changed {
+                                        log_codex_peer_stale_decision_if_changed(
+                                            path,
+                                            codex_peer_debug_observations,
+                                            decision,
+                                            &stale_match.matched_injections,
+                                        );
+                                    } else {
+                                        log_codex_peer_stale_decision(
+                                            path,
+                                            decision,
+                                            &stale_match.matched_injections,
+                                        );
+                                    }
                                 };
                                 if pane_is_focused {
-                                    log_stale_decision("stale_injection_focused_notification");
+                                    log_stale_decision(
+                                        "stale_injection_focused_notification",
+                                        false,
+                                    );
                                     queue.pop_front();
                                     focused_notifications.push((
                                         pane_id,
@@ -3455,7 +3550,7 @@ impl App {
                                     .is_some_and(|state| state.can_submit_injected_message)
                                 {
                                     if write_input_to_pane(pane, b"\r", false).is_ok() {
-                                        log_stale_decision("stale_injection_submitted");
+                                        log_stale_decision("stale_injection_submitted", false);
                                         codex_peer_injected_composers.remove(&pane_id);
                                         queue.pop_front();
                                         if contains_current {
@@ -3472,10 +3567,13 @@ impl App {
                                         }
                                         self.dirty = true;
                                     } else {
-                                        log_stale_decision("stale_injection_enter_write_failed");
+                                        log_stale_decision(
+                                            "stale_injection_enter_write_failed",
+                                            true,
+                                        );
                                     }
                                 } else {
-                                    log_stale_decision("stale_injection_waiting_until_idle");
+                                    log_stale_decision("stale_injection_waiting_until_idle", true);
                                 }
                                 continue;
                             }

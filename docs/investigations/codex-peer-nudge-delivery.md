@@ -501,7 +501,7 @@ gameocr の TUI (pid 16180) で、renga が書いた nudge が composer に残�
 
 | pane / sequence | 実測 |
 |---|---|
-| pane 7, 791 → 792 | 22:25:34.300 に 791 を書き込み、22:25:35.331 に不一致、22:25:36.693 に `submit_at_composer_released`。22:26:45.269 に 792 が残留 791 を draft と判定し、22:26:46.796 に `AwaitFocus`。22:27:35〜22:52:40 に 20 件が後ろで待ち、22:55:05.636 のユーザー操作まで約 30 分停止した。 |
+| pane 7, 791 → 792 | 22:25:34.300 に 791 を書き込み、22:25:35.331 に不一致、22:25:36.693 に `submit_at_composer_released`。22:26:45.269 に 792 が残留 791 を draft と判定し、22:26:46.796 に `AwaitFocus`。20 件の `nudge_arrival_queue_occupied` は 22:27:13.055〜22:52:40.625 に分布し、22:27:35〜22:52:40 の範囲内は 18 件で、22:55:05.636 のユーザー操作まで約 30 分停止した。 |
 | pane 14, 445 → 446 | 22:54:31.583 に 445 を書き込み、22:54:32.617 に release。22:58:24.588 に 446 が完全に残った 445 を draft と判定した。 |
 | pane 11, 378 | 22:38:41.433 の end-invisible repaint を誤って divergence と判定し、47 ms 後に Draft が composer を空と誤認して同じ本文を再度書いた。22:38:42.509 には 2 コピーが連結し、22:58:54 の観測終了まで後続 nudge が待った。 |
 
@@ -528,6 +528,9 @@ composer 末尾が見える frame だけで確定する。末尾が見えない�
 新しい判断は `stale_injection_submitted`、`stale_injection_waiting_until_idle`、
 `stale_injection_focused_notification`、`stale_injection_enter_write_failed` で trace
 され、`expected_composer` と `screen_composer` を既存形式で記録する。注入記録は
+各 `stale_injection_*` record だけに `matched_injections` を追加し、composer を厳密に
+分割した順序どおりの正規化済み注入本文を記録するため、照合に使った履歴を識別できる。
+`expected_composer` と `screen_composer` は従来どおり画面上の composer を記録する。注入記録は
 SubmitAt Enter、QueueAt Enter/Tab、stale Enter、成功した Ctrl-U、subscriber
 切断、pane/tab close、shutdown で消す。`pending_peer_messages` は配送 queue のみを
 数え続けるため、公開 field と `list_panes` / `list_peers` の意味は変わらない。
@@ -535,3 +538,7 @@ SubmitAt Enter、QueueAt Enter/Tab、stale Enter、成功した Ctrl-U、subscri
 この field build e424bd0 は、後の synchronized paint と erase hold の変更を含まない。
 そのため renga-4jj の実機確認では、停止が再現しないことだけを根拠にせず、現行 build
 で上記の新 action が記録されることを確認する必要がある。
+
+未知の非 dim placeholder は下書きとして扱い、そのペインの nudge を focus まで
+`has_draft` 経路で保留する。この失敗方向を選ぶのは、ユーザー下書きの上書きより安全だからである。
+7 件の既知 placeholder のうち `Ask Codex to do anything` は Codex 0.154.0 の installed binary で確認し、残る 6 件は 2026 年 7 月の renga-f85 実機記録（`Write tests for @filename` を含む）と Codex source に由来するため、一覧と完全一致するユーザー下書きも現在の `Ask Codex to do anything` と同様に空と判定される trade-off を受け入れる。
