@@ -57,8 +57,8 @@ An earlier
 `client_kind_resolved` record with `renga_peer_client_kind_state: "absent"`
 also identifies the faulty mcp-peer when its `tui_pid` and `pane_id` correlate
 with that refused record. An actual `client_kind_updated` transition from Codex
-to Claude means the App had already processed `PeerSubscriberGone` for the
-pane.
+to Claude means either the App had already processed `PeerSubscriberGone` for
+the pane or it had not yet processed any `PeerSubscriberArrived` for that pane.
 
 ### `check_messages`
 

@@ -4947,6 +4947,41 @@ fn live_but_not_ready_codex_subscriber_refuses_claude_downgrade() {
 }
 
 #[test]
+fn refused_claude_readiness_flush_attaches_codex_nudge() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let target_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split target");
+    app.handle_peer_register_client(target_id, PeerClientKind::Codex)
+        .expect("register Codex");
+    app.handle_peer_subscriber_arrived(target_id);
+    assert_eq!(
+        app.handle_peer_send(sender_id, &ipc::PaneRef::Id(target_id), "queued".into())
+            .expect("queue before readiness"),
+        ipc::PeerSendOutcome::Queued
+    );
+
+    app.handle_peer_set_ready(target_id, PeerClientKind::Claude, true)
+        .expect("refused Claude kind still flushes readiness");
+
+    let flushed = app
+        .pending_peer_deliveries
+        .values()
+        .find(|pending| pending.target_pane == target_id)
+        .expect("queued message starts delivery");
+    assert!(flushed.nudge.is_some());
+    app.shutdown();
+}
+
+#[test]
 fn delivered_duplicate_replays_delivered_after_disconnect() {
     let mut app = App::new(40, 80).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
