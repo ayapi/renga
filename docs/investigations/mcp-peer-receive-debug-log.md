@@ -40,21 +40,25 @@ absent variable from a value whose endpoint shape could not be parsed. In a
 machine-wide shared trace, correlate `tui_pid` with the TUI records'
 `process_id` before comparing pane ids.
 
-The TUI-side `client_kind_updated` record catalogs every kind write from
-`kind_update_path` (`register` or `set_ready`). Along with the old/new kind and
-receive mode, it records sticky OSC-title evidence as
+The TUI-side `client_kind_updated` record catalogs every actual kind write from
+`kind_update_path` (`register` or `set_ready`). A refused Codex-to-Claude
+downgrade instead writes `client_kind_downgrade_refused` with the same fields
+plus `reason`; it does not also write `client_kind_updated`. Along with the
+old/new kind and receive mode, both records carry sticky OSC-title evidence as
 `pane_title_codex_seen` and `pane_title_claude_seen`. Both are `null` if the
 pane cannot be found. `kind_title_mismatch` is also `null` when the pane cannot
 be found or until either title has been seen, `true` when a Claude update
 conflicts with a seen Codex title or a Codex update conflicts with a
 Claude-only title, and `false` otherwise.
 
-A misregistration is directly identified by a `client_kind_updated` record
-whose `kind_title_mismatch` is `true`. An earlier
+A nested registration that would previously have misregistered a Codex pane is
+identified by `client_kind_downgrade_refused` with `kind_title_mismatch: true`.
+An earlier
 `client_kind_resolved` record with `renga_peer_client_kind_state: "absent"`
 also identifies the faulty mcp-peer when its `tui_pid` and `pane_id` correlate
-with a later `client_kind_updated` record whose `pane_title_codex_seen` is
-`true`.
+with that refused record. An actual `client_kind_updated` transition from Codex
+to Claude means the App had already processed `PeerSubscriberGone` for the
+pane.
 
 ### `check_messages`
 
@@ -242,3 +246,31 @@ counts/overflow; the `check_messages` record also includes
 head but before retaining its id in the unreported set, reconciliation can still
 classify that already-read message as lost; this is the sole unavoidable
 false-positive window.
+
+### Kind downgrade refusal (renga-jvn)
+
+`client_kind_downgrade_refused` records an incoming Claude registration or
+readiness update that found both an existing Codex kind and a live peer event
+stream for the pane. Its `reason` is `live_subscriber_preserves_codex`. The
+attempted Claude kind and push receive mode remain in `new_client_kind` and
+`receive_mode`, while `client_kind_updated` is absent because no kind write
+occurred. Readiness and pending-inbox flushing still proceed for a refused
+`set_ready` update, so a reachable pane does not strand queued messages.
+
+The refusal also leaves the Codex owner's handover generation and disconnect
+deadline unchanged. This keeps a nested Claude registration from making a
+message delivered after the Codex peer's reconciliation snapshot look older
+than the current generation and falsely reporting it through
+`peer_message_lost`. Once the last subscriber is gone, a later Claude
+registration is accepted, advances the generation, and writes the normal
+`client_kind_updated` record.
+
+The event bus broadcasts each peer-inbox event to every live subscription, and
+each mcp-peer filters it by `target_pane`; therefore two subscribers registered
+for the same pane both receive the event. This behavior is unchanged here.
+
+Registration does not share the subscription registry lock. If a Claude
+registration races the Codex stream's final disconnect, it may be refused just
+before the gone notification or accepted just after it. The refused ordering
+can temporarily retain the stale Codex kind until the next registration, which
+is the same self-correcting stale-kind window that existed before this fix.

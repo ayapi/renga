@@ -19,6 +19,13 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Fixed
 
+- **Nested Claude processes no longer take over a live Codex pane's peer
+  routing.** While a Codex subscriber is alive, later Claude registration and
+  readiness metadata cannot replace its pull receive mode; readiness and inbox
+  flushing still proceed. Refused registrations also preserve Codex handover
+  tracking so an in-flight reconciliation cannot report a false message loss.
+  (renga-jvn)
+
 - **Slow Codex peer nudges no longer disappear when submission times out.**
   Growing composer text extends the wait up to 60 seconds. Stalled nudges stay
   visible in pending counts and recover through retries or notifications;

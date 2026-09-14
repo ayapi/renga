@@ -541,8 +541,8 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | `inspect` | `target: PaneRef`, `lines?`, `include_cursor: bool` (default false) | |
 | `peer_list` | `from_pane: usize` | |
 | `peer_send` | `from_pane: usize`, `target: PaneRef`, `body: string` | Unresolved and cross-tab targets return the same success-shaped `undeliverable` result and queue no body (Q5). Ok data is `{ "delivery": "delivered"\|"queued"\|"pending_user_confirmation"\|"undeliverable" }`. |
-| `peer_register_client` | `pane_id: usize`, `kind: claude\|codex` | Posted by `renga mcp-peer` on startup. |
-| `peer_set_ready` | `pane_id: usize`, `kind: claude\|codex`, `ready: bool` | Internal peer lifecycle update. `ready=true` means the event subscriber can receive. Pull clients publish it as soon as the subscriber is active; push clients publish it after MCP initialization and a short settling delay so Claude Code can attach its channel listener. Kind is repeated atomically with readiness. |
+| `peer_register_client` | `pane_id: usize`, `kind: claude\|codex` | Posted by `renga mcp-peer` on startup. An incoming Claude kind does not replace an existing Codex kind while a peer subscriber for the pane is alive. |
+| `peer_set_ready` | `pane_id: usize`, `kind: claude\|codex`, `ready: bool` | Internal peer lifecycle update. `ready=true` means the event subscriber can receive. Pull clients publish it as soon as the subscriber is active; push clients publish it after MCP initialization and a short settling delay so Claude Code can attach its channel listener. Kind still travels with readiness, but when an existing Codex kind has a live pane subscriber, only the incoming Claude kind write is refused; readiness and the pending-inbox flush proceed. |
 | `peer_inbox_ack` | `pane_id: usize`, `delivery_id: u64` | Internal mcp-peer receipt sent only after the target process retains the message. Separate from the later `check_messages` ack. |
 | `peer_inbox_consumed` | `pane_id: usize`, `delivery_id: u64` | Best-effort internal request sent after a Codex `check_messages` FIFO-head ack. It removes the App's handed-over-but-not-yet-read tracking entry. |
 | `peer_inbox_reconcile` | `pane_id: usize`, `held: u64[]`, `consumed: u64[]`, `held_overflow: usize`, `consumed_overflow: usize` | Sent by a Codex peer after re-registration and before `ready=true`. The two id arrays are capped at 256; a non-zero overflow count makes unmatched entries safe-retained rather than reported lost. |
@@ -785,6 +785,21 @@ specified in section 3.5.
      delivery. Callers must continue to treat delivery without supporting
      evidence as unknown, including the already documented case of an absent
      field from an older server.
+- Since renga-jvn, refusing a Claude kind update while an existing Codex peer
+  subscriber is live is an intentional semantic change under
+  `semver-policy.md` section 3: the same `peer_register_client` or
+  `peer_set_ready` input can leave `PaneInfo.kind`, `PeerInfo.kind`, and their
+  receive modes reporting Codex/pull where an older server reported
+  Claude/push. It does not require a major release for this bug fix because all
+  three compatibility conditions remain true:
+  1. The wire fields, their types, and their serde defaults remain unchanged.
+     No documented input or output field is removed or renamed.
+  2. The prior Claude/push value misreported which client owned the pane and
+     routed messages away from the live Codex peer. That erroneous value was
+     not a successful ownership or delivery contract callers could rely on.
+  3. Older servers can still report the prior value, so callers must continue
+     to treat `kind` and `receive_mode` as advisory metadata rather than proof
+     of which process currently owns the pane.
 - **Unknown `peer_send.delivery` values** are unverified outcomes. The
   additively introduced `pending_user_confirmation` and `undeliverable` values
   therefore degrade to the documented unconfirmed result on older MCP clients;
