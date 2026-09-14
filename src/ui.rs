@@ -213,6 +213,36 @@ fn render_captured(app: &mut App, frame: &mut Frame) {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn capture_skipped_pane_gets_one_false_record_per_app_draw() {
+    use crate::pane_capture::{test_config, with_test_config, TestCaptureCleanup};
+    let config = test_config("skipped-app-draw", std::time::Instant::now());
+    let _cleanup = TestCaptureCleanup::new(&config);
+    let mut app = with_test_config(Some(config.clone()), || App::new(40, 80)).unwrap();
+    let pane = app.ws().panes.get(&app.ws().focused_pane_id).unwrap();
+    let pane_id = pane.id;
+    let capture = pane.capture.clone().unwrap();
+    // The small-terminal path returns without copying any pane content.
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(1, 1)).unwrap();
+    for _ in 0..2 {
+        terminal.draw(|frame| render(&mut app, frame)).unwrap();
+    }
+    capture.flush();
+    let records: Vec<serde_json::Value> =
+        std::fs::read_to_string(config.directory.join(format!("pane-{pane_id}.jsonl")))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let draws: Vec<_> = records
+        .iter()
+        .filter(|record| record["event"] == "app_draw")
+        .collect();
+    assert_eq!(draws.len(), 2);
+    assert!(draws.iter().all(|record| record["drawn"] == false));
+}
+
 // ─── IME composition overlay ──────────────────────────────
 
 /// Minimum inside-box dimensions for the centered IME overlay. Below

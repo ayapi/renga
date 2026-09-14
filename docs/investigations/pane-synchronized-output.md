@@ -220,11 +220,20 @@ A bare `ESC[H` does not count as an H-OPEN repaint.
 Screen comparisons use vt100 `contents()` text, with each row trimmed at the
 end and blank rows retained to the screen height. The burst's `pre` is the raw
 screen before its first read; `post` is the raw screen after its last read.
+Raw replay pre-indexes resize injections and inserts them at their recorded
+`applied_offset` in byte order. A resize recorded while bytes are held must
+precede those held bytes in raw replay, even though their read records have
+already arrived. Actual applied/drawn replay retains file order and performs
+the resize at its record, matching the live parser. This prevents a delayed
+resize clear from manufacturing a false raw post-screen or third state.
 Each table prints `before_equals_after` and `third_states=X/Y`: a third state
 differs from **both** pre and post. `raw` samples after reads 1 through n-1,
 reproducing the original "5 of 9" form; `applied` samples each actual parser
 application ending within the burst's byte range; `drawn` samples actual pane
 draws from its first read record until the next burst's first read record.
+A draw with nonzero scrollback is labeled `scrolled_view` and excluded from
+third-state samples and partial-envelope/rewrite draw counts. It does not
+replace the previous live-view screen used for the next live draw comparison.
 A release triggered by a later read is therefore still assigned to the bytes
 it applied. Delayed or suppressed draws can produce fewer samples.
 
@@ -237,11 +246,20 @@ Each draw and table snapshot also reports its change from the previous screen:
   rows must match and this count must exceed the unchanged nonblank count.
   Ties choose the smallest k. A fixed footer does not exclude a shifted body.
 - `rows_changed(n)`: other changes, with the number of differing rows.
+- `scrolled_view scrollback=n`: a user-scrolled view; excluded from repaint
+  comparisons as described above.
 
 Every third state prints mutually exclusive `post_only`, `pre_only`, `both`,
 and `neither` row counts. `top_prefix=true` means post-only rows precede
-pre-only rows, both sets exist, and no neither rows occur; rows equal to both
-are neutral. This measures a partial top-to-bottom replacement directly.
+pre-only rows, with both sets present; rows equal to both are neutral. At most
+one neither row may sit between those sets if it is a partial overwrite:
+for some character count `0 < k < len(post[j])`, it equals
+`post[j][..k] + pre[j][k..]` (an exhausted old suffix is empty). For example,
+writing `del` over `charlie` towards `delta` leaves `delrlie`. The table prints
+its zero-based `partial_row` and `partial_chars=k`, or `none` for both when
+the split falls between rows. Matching uses Unicode characters, not bytes.
+Any other neither row makes the flag false. The mutually exclusive row counts
+still count the partial row in `neither`; this measures the shape separately.
 
 Every cursor envelope beginning in a burst, from `ESC[?25l` through the next
 `ESC[?25h`, reports its half-open byte span, completion, first/last read indexes
@@ -252,6 +270,36 @@ No extra record is made for every idle App iteration. An incomplete envelope
 ends at the last indexed byte and prints `complete=false`. Burst rows also
 count DECSTBM, SU, SD, IL, DL, RI, EL (`ESC[K`), and ED (`ESC[J`), including
 numeric CSI parameters, to identify scrolling operations.
+
+The additional `erase_rewrite` table follows each raw erase into its later
+rewrite, even when a long gap places the rewrite in a separate 40 ms burst.
+`kind=PTY_ERASE` rows name the erase's burst, byte offset, recognition read,
+and timestamp; a split erase is recognized by the read containing its final
+byte. `first_rewrite_delay_us` is the time from that read to the read containing
+the first printable payload byte after the erase. Cursor positioning, style,
+cursor visibility, and OSC/DCS/control strings are skipped when finding that
+payload; spaces count as payload. Thus an erase followed only by a home command
+does not report a zero-delay rewrite.
+
+`hold_close_reason` comes from the corresponding erase-hold transition.
+`closed_before_rewrite=true` requires both an earlier close record and a
+strictly earlier close instant than the first payload read. A reader-side
+expiry with the arriving read's timestamp is therefore false. Missing hold
+evidence prints `unknown`; if the capture has a close but no later payload,
+the flag is true for the observed capture and the delay is `n/a`.
+`rewrite_span` starts at the first payload byte and ends with that payload's
+40 ms burst, limited by the next raw erase or resize clear. `rewrite_bytes`
+counts the raw span, including its intervening/trailing controls;
+`rewrite_reads` counts reads intersecting it. `draws_inside_rewrite` counts
+true draws whose applied offset is strictly inside the span, before any next
+resize clear and with scrollback zero; it is `n/a` without draw records. This association is an explicit
+measurement rule, not proof that arbitrary later text belongs to a repaint.
+
+Parser-injected resize clears appear as separate `kind=RESIZE_CLEAR` rows,
+with their sequence, timestamp, applied offset, and seven injected clear/home
+bytes. Their hold fields are `not_applicable`: they bypass the raw stream and
+do not open an erase hold. This distinguishes a resize blank from an erase-only
+hold released before a delayed multi-read rewrite.
 
 These text classes diagnose parser visibility. They do not compare colors,
 cursor-only changes, host-terminal flush completion, or the physical screen.

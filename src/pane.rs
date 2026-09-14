@@ -2769,6 +2769,7 @@ mod tests {
         use crate::pane_capture::{test_config, with_test_config};
         let origin = Instant::now();
         let config = test_config("reader", origin);
+        let _cleanup = crate::pane_capture::TestCaptureCleanup::new(&config);
         let mut harness = with_test_config(Some(config.clone()), ReaderHarness::new);
         let capture = harness.capture();
         harness.send_at(b"seed", origin);
@@ -2833,6 +2834,7 @@ mod tests {
     fn debug_capture_unwritable_path_preserves_reader_output() {
         use crate::pane_capture::{test_config, with_test_config};
         let config = test_config("unwritable", Instant::now());
+        let _cleanup = crate::pane_capture::TestCaptureCleanup::new(&config);
         std::fs::write(&config.directory, b"regular file").unwrap();
         let failures = crate::pane_capture::failure_count();
         let mut harness = with_test_config(Some(config.clone()), ReaderHarness::new);
@@ -2850,10 +2852,70 @@ mod tests {
     }
 
     #[test]
+    fn debug_capture_fake_reader_draws_pin_applied_offsets_and_replay_visibility() {
+        use crate::pane_capture::{test_config, with_test_config, TestCaptureCleanup};
+        let origin = Instant::now();
+        let config = test_config("alignment", origin);
+        let _cleanup = TestCaptureCleanup::new(&config);
+        let mut harness = with_test_config(Some(config.clone()), ReaderHarness::new);
+        let capture = harness.capture();
+        let draw = || {
+            let parser = harness.parser.lock().unwrap();
+            capture.draw(true, parser.screen().scrollback());
+            capture.finish_draw();
+            parser.screen().contents()
+        };
+        harness.send_at(b"seed", origin);
+        assert_eq!(harness.recv_output(), 4);
+        assert_eq!(draw(), "seed");
+        let held = b"\x1b[2J\x1b[Htop";
+        harness.send_at(held, origin + Duration::from_millis(1));
+        harness.wait_for_buffered_len(held.len());
+        assert_eq!(draw(), "seed");
+        harness.tick_at(origin + Duration::from_millis(41));
+        assert_eq!(harness.recv_output(), held.len());
+        assert_eq!(draw(), "top");
+        harness.finish_with_eof();
+        capture.flush();
+        let path = config.directory.join("pane-4242.jsonl");
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let draw_offsets: Vec<_> = records
+            .iter()
+            .filter(|record| record["event"] == "app_draw")
+            .map(|record| record["applied_offset"].as_u64().unwrap())
+            .collect();
+        assert_eq!(draw_offsets, [4, 4, 4 + held.len() as u64]);
+        let apply_offsets: Vec<_> = records
+            .iter()
+            .filter(|record| record["event"] == "parser_apply")
+            .map(|record| record["applied_offset"].as_u64().unwrap())
+            .collect();
+        assert_eq!(apply_offsets, [4, 4 + held.len() as u64]);
+        let replay = crate::pane_capture::replay::replay_file(&path, 40_000).unwrap();
+        let draws: Vec<_> = replay
+            .lines()
+            .filter(|line| line.starts_with("draw "))
+            .collect();
+        assert_eq!(draws.len(), 3);
+        assert!(draws[0].contains("applied_offset=4 class=rows_changed(1)"));
+        assert!(draws[1].contains("applied_offset=4 class=identical (none)"));
+        assert!(draws[1].contains("erase_hold"));
+        assert!(draws[2].contains(&format!(
+            "applied_offset={} class=rows_changed(1)",
+            4 + held.len()
+        )));
+    }
+
+    #[test]
     fn debug_capture_records_split_frames_conversion_and_all_close_reasons() {
         use crate::pane_capture::test_config;
         let origin = Instant::now();
         let config = test_config("transitions", origin);
+        let _cleanup = crate::pane_capture::TestCaptureCleanup::new(&config);
         let capture = Capture::create(config.clone(), 9, None, 8, 80).unwrap();
         let mut stream = SynchronizedOutputStream {
             capture: Some(capture.clone()),

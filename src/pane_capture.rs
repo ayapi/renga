@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 #[cfg(test)]
-mod replay;
+pub(crate) mod replay;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -146,6 +146,8 @@ struct Record {
 enum Command {
     Record(Record, Option<Vec<u8>>, bool),
     Flush(mpsc::Sender<()>),
+    #[cfg(test)]
+    Stop(mpsc::Sender<()>),
 }
 
 struct State {
@@ -443,6 +445,15 @@ fn write_capture(
                 jsonl.flush()?;
                 let _ = done.send(());
             }
+            #[cfg(test)]
+            Ok(Command::Stop(done)) => {
+                binary.flush()?;
+                jsonl.flush()?;
+                drop(binary);
+                drop(jsonl);
+                let _ = done.send(());
+                return Ok(());
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -483,12 +494,66 @@ pub(crate) fn test_config(name: &str, origin: Instant) -> Config {
 }
 
 #[cfg(test)]
+pub(crate) struct TestCaptureCleanup(PathBuf);
+
+#[cfg(test)]
+impl TestCaptureCleanup {
+    pub(crate) fn new(config: &Config) -> Self {
+        assert_eq!(
+            config.directory.parent(),
+            Some(std::env::temp_dir().as_path())
+        );
+        assert!(config
+            .directory
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("renga-capture-"));
+        Self(config.directory.clone())
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestCaptureCleanup {
+    fn drop(&mut self) {
+        // Stop only this test's writers before deleting their known scratch path.
+        let captures: Vec<_> = {
+            let mut registry = REGISTRY.lock().unwrap_or_else(|error| error.into_inner());
+            let captures = registry
+                .iter()
+                .filter(|capture| capture.config.directory == self.0)
+                .cloned()
+                .collect();
+            registry.retain(|capture| capture.config.directory != self.0);
+            captures
+        };
+        for capture in captures {
+            capture.disabled.store(true, Ordering::Release);
+            let (done, receive) = mpsc::channel();
+            let _ = capture
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .sender
+                .send(Command::Stop(done));
+            let _ = receive.recv_timeout(Duration::from_secs(1));
+        }
+        if self.0.is_dir() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        } else {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn absent_capture_opens_nothing_with_positive_leak_control() {
         let config = test_config("absent", Instant::now());
+        let _cleanup = TestCaptureCleanup::new(&config);
         assert!(resolve_config(|| None).is_none());
         with_test_config(None, || assert!(Capture::for_pane(1, None, 3, 8).is_none()));
         assert!(!config.directory.exists());
@@ -507,6 +572,7 @@ mod tests {
     #[test]
     fn draw_records_are_one_per_pane_per_render_including_skips() {
         let config = test_config("draws", Instant::now());
+        let _cleanup = TestCaptureCleanup::new(&config);
         let capture = Capture::create(config.clone(), 7, Some(123), 3, 8).unwrap();
         capture.draw(true, 2);
         capture.finish_draw();

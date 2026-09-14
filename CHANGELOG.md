@@ -16,7 +16,12 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
   applications, resize clears, and actual/skipped pane draws in isolated
   per-TUI session directories. The ignored `replay_capture` test prints raw,
   applied, and drawn burst tables, shifted rows, partial top-to-bottom
-  rewrites, and cursor-hide/show envelopes. Capture is absent by default and
+  rewrites, and cursor-hide/show envelopes. Erase-to-rewrite rows report the
+  first-payload delay, hold close reason and early-close flag, rewrite bytes
+  and reads, and draws inside the rewrite; resize-injected clears have their
+  own row kind. Replay places resize clears at their applied byte offset,
+  excludes user-scrolled views from repaint counts, and recognizes rewrites
+  split in the middle of a Unicode row. Capture is absent by default and
   does not change the output hold policy. See the
   [field capture guide](docs/investigations/pane-synchronized-output.md#field-capture-and-replay).
   (renga-gou)
