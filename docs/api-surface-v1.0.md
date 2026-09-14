@@ -341,6 +341,12 @@ possible and an older server's missing key is reported as no command requested.
 
 ### 1.12 `inspect_pane` — stable
 
+Pane snapshots do not expose a partially applied DEC private mode 2026
+synchronized-output frame. Renga applies a completed frame to the terminal
+parser in one update. An incomplete frame is released on the first later PTY
+read after 350 ms, when its buffered payload exceeds 1 MiB, or when the reader
+exits.
+
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `target` | string | yes | |
@@ -727,6 +733,11 @@ classes into more specific numeric codes; this is **not** a breaking change
 because downstream is required to read the `[code]` token for branching.
 
 ### 5.3 Forward-compat rules — stable
+
+Applying a DEC private mode 2026 frame to the pane parser in one update is an
+internal timing change. `inspect_pane` may now keep returning the last complete
+screen while such a frame is in progress, then expose the completed frame all
+at once. The response schema and snapshot meaning are unchanged.
 
 Delaying an internal push-client readiness declaration during startup is not a
 semantic change under the policy in `docs/semver-policy.md` section 3: the same

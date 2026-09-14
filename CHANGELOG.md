@@ -19,6 +19,14 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Fixed
 
+- **Pane synchronized-output frames are now applied atomically.** Bytes between
+  DEC private mode 2026 start and end markers reach the terminal parser in one
+  update and trigger one repaint notification, even when the frame spans
+  several PTY reads. Timeout, size-cap, and reader-exit safeguards release an
+  incomplete frame when activity resumes, its cap is reached, or the reader
+  exits. Large redraws without synchronized-output markers continue to be
+  applied per read. (renga-swk)
+
 - **Nested Claude processes no longer take over a live Codex pane's peer
   routing.** While a Codex subscriber is alive, later Claude registration and
   readiness metadata cannot replace its pull receive mode; readiness and inbox

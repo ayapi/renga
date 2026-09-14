@@ -13,6 +13,14 @@ use crate::app::AppEvent;
 
 const MOUSE_PROTOCOL_CACHE_TTL: Duration = Duration::from_secs(2);
 
+/// Maximum time a DEC synchronized-output frame may remain buffered before
+/// the next PTY read flushes it and returns the pane to pass-through mode.
+const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_millis(350);
+
+/// Maximum byte count retained for one DEC synchronized-output frame before it
+/// is flushed and the pane returns to pass-through mode.
+const SYNCHRONIZED_OUTPUT_BYTE_CAP: usize = 1024 * 1024;
+
 #[derive(Copy, Clone)]
 struct CachedMouseProtocol {
     mode: vt100::MouseProtocolMode,
@@ -1217,6 +1225,177 @@ fn detect_alternate_scroll_toggle(data: &[u8]) -> Option<bool> {
     last
 }
 
+const SYNCHRONIZED_OUTPUT_BEGIN: &[u8] = b"\x1b[?2026h";
+const SYNCHRONIZED_OUTPUT_END: &[u8] = b"\x1b[?2026l";
+
+struct SynchronizedOutputFrame {
+    started_at: Instant,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct SynchronizedOutputStream {
+    marker_tail: Vec<u8>,
+    frame: Option<SynchronizedOutputFrame>,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum SynchronizedOutputMarker {
+    Begin,
+    End,
+}
+
+impl SynchronizedOutputStream {
+    fn push(&mut self, data: &[u8], now: Instant) -> Vec<Vec<u8>> {
+        let mut flushed = Vec::new();
+
+        if self.frame.as_ref().is_some_and(|frame| {
+            now.duration_since(frame.started_at) >= SYNCHRONIZED_OUTPUT_TIMEOUT
+        }) {
+            self.flush_frame(&mut flushed);
+        }
+
+        let markers = self.markers_in(data);
+        let mut pass_through = Vec::new();
+        let mut cursor = 0;
+        for (marker_start, marker_end, marker) in markers {
+            self.append_bytes(&data[cursor..marker_start], &mut pass_through, &mut flushed);
+            match marker {
+                SynchronizedOutputMarker::Begin => {
+                    if self.frame.is_none() {
+                        if !pass_through.is_empty() {
+                            flushed.push(std::mem::take(&mut pass_through));
+                        }
+                        self.frame = Some(SynchronizedOutputFrame {
+                            started_at: now,
+                            bytes: Vec::new(),
+                        });
+                    }
+                    self.append_bytes(
+                        &data[marker_start..marker_end],
+                        &mut pass_through,
+                        &mut flushed,
+                    );
+                }
+                SynchronizedOutputMarker::End => {
+                    if self.frame.is_some() {
+                        self.append_bytes(
+                            &data[marker_start..marker_end],
+                            &mut pass_through,
+                            &mut flushed,
+                        );
+                        self.flush_frame(&mut flushed);
+                    } else {
+                        pass_through.extend_from_slice(&data[marker_start..marker_end]);
+                    }
+                }
+            }
+            cursor = marker_end;
+        }
+        self.append_bytes(&data[cursor..], &mut pass_through, &mut flushed);
+
+        if !pass_through.is_empty() {
+            flushed.push(pass_through);
+        }
+        flushed
+    }
+
+    fn finish(&mut self) -> Vec<Vec<u8>> {
+        let mut flushed = Vec::new();
+        if self.frame.is_some() {
+            self.flush_frame(&mut flushed);
+        }
+        flushed
+    }
+
+    fn append_bytes(
+        &mut self,
+        data: &[u8],
+        pass_through: &mut Vec<u8>,
+        flushed: &mut Vec<Vec<u8>>,
+    ) {
+        if let Some(frame) = self.frame.as_mut() {
+            frame.bytes.extend_from_slice(data);
+            if frame.bytes.len() > SYNCHRONIZED_OUTPUT_BYTE_CAP {
+                self.flush_frame(flushed);
+            }
+        } else {
+            pass_through.extend_from_slice(data);
+        }
+    }
+
+    fn flush_frame(&mut self, flushed: &mut Vec<Vec<u8>>) {
+        if let Some(frame) = self.frame.take() {
+            if !frame.bytes.is_empty() {
+                flushed.push(frame.bytes);
+            }
+        }
+    }
+
+    fn markers_in(&mut self, data: &[u8]) -> Vec<(usize, usize, SynchronizedOutputMarker)> {
+        let tail_len = self.marker_tail.len();
+        let mut combined = std::mem::take(&mut self.marker_tail);
+        combined.extend_from_slice(data);
+        let mut markers = Vec::new();
+
+        for index in 0..combined.len() {
+            let marker = if combined[index..].starts_with(SYNCHRONIZED_OUTPUT_BEGIN) {
+                Some(SynchronizedOutputMarker::Begin)
+            } else if combined[index..].starts_with(SYNCHRONIZED_OUTPUT_END) {
+                Some(SynchronizedOutputMarker::End)
+            } else {
+                None
+            };
+            let Some(marker) = marker else {
+                continue;
+            };
+            let combined_end = index + SYNCHRONIZED_OUTPUT_BEGIN.len();
+            if combined_end <= tail_len {
+                continue;
+            }
+            markers.push((
+                index.saturating_sub(tail_len),
+                combined_end - tail_len,
+                marker,
+            ));
+        }
+
+        let keep = combined.len().min(SYNCHRONIZED_OUTPUT_BEGIN.len() - 1);
+        self.marker_tail
+            .extend_from_slice(&combined[combined.len() - keep..]);
+        markers
+    }
+}
+
+fn process_pty_output(
+    data: &[u8],
+    parser: &Arc<Mutex<vt100::Parser>>,
+    mouse_protocol_cache: &Arc<Mutex<Option<CachedMouseProtocol>>>,
+    pane_id: usize,
+    event_tx: &Sender<AppEvent>,
+) {
+    if data.is_empty() {
+        return;
+    }
+
+    let mut parser = parser.lock().unwrap_or_else(|error| error.into_inner());
+    parser.process(data);
+    let screen = parser.screen();
+    let mode = screen.mouse_protocol_mode();
+    if !matches!(mode, vt100::MouseProtocolMode::None) {
+        let mut cache = mouse_protocol_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *cache = Some(CachedMouseProtocol {
+            mode,
+            encoding: screen.mouse_protocol_encoding(),
+            seen_at: Instant::now(),
+        });
+    }
+    drop(parser);
+    let _ = event_tx.send(AppEvent::PtyOutput(pane_id, data.len()));
+}
+
 /// Background thread that reads PTY output and feeds it to vt100 parser.
 #[allow(clippy::too_many_arguments)]
 fn pty_reader_thread(
@@ -1241,6 +1420,7 @@ fn pty_reader_thread(
     let mut osc7_stream = Osc7Stream::new();
     let mut control_tail: Vec<u8> = Vec::with_capacity(64);
     let mut osc52_tail: Vec<u8> = Vec::with_capacity(4096);
+    let mut synchronized_output = SynchronizedOutputStream::default();
     #[cfg(test)]
     let mut prompt_capture_tail: Vec<u8> = Vec::with_capacity(TAIL_CAP * 2);
     #[cfg(test)]
@@ -1250,6 +1430,9 @@ fn pty_reader_thread(
     loop {
         match reader.read(&mut buf) {
             Ok(0) => {
+                for data in synchronized_output.finish() {
+                    process_pty_output(&data, &parser, &mouse_protocol_cache, pane_id, &event_tx);
+                }
                 let _ = event_tx.send(AppEvent::PtyEof(pane_id));
                 break;
             }
@@ -1371,24 +1554,30 @@ fn pty_reader_thread(
                     osc52_tail.clear();
                 }
 
-                let mut parser = parser.lock().unwrap_or_else(|e| e.into_inner());
-                parser.process(data);
-                let screen = parser.screen();
-                let mode = screen.mouse_protocol_mode();
-                if !matches!(mode, vt100::MouseProtocolMode::None) {
-                    let mut cache = mouse_protocol_cache
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    *cache = Some(CachedMouseProtocol {
-                        mode,
-                        encoding: screen.mouse_protocol_encoding(),
-                        seen_at: Instant::now(),
-                    });
+                // Keep every detector above on the raw read, matching the legacy
+                // behavior exactly. Only parser mutation, mouse-mode sampling,
+                // and the dirty notification are synchronized. The DEC 2026
+                // bytes remain in the parser stream because vt100 ignores the
+                // unsupported mode harmlessly.
+                //
+                // `read` is blocking, so the timeout is intentionally checked
+                // on the next read. A producer that goes silent mid-frame leaves
+                // the last complete screen visible until it writes again or the
+                // PTY closes; both exit paths flush the buffered bytes below.
+                for complete_data in synchronized_output.push(data, Instant::now()) {
+                    process_pty_output(
+                        &complete_data,
+                        &parser,
+                        &mouse_protocol_cache,
+                        pane_id,
+                        &event_tx,
+                    );
                 }
-                drop(parser);
-                let _ = event_tx.send(AppEvent::PtyOutput(pane_id, n));
             }
             Err(_) => {
+                for data in synchronized_output.finish() {
+                    process_pty_output(&data, &parser, &mouse_protocol_cache, pane_id, &event_tx);
+                }
                 break;
             }
         }
@@ -1901,6 +2090,392 @@ mod tests {
         } else {
             PathBuf::from("/c/Users/color/Develop/renga-cdr")
         }
+    }
+
+    struct ChannelReader {
+        receiver: std::sync::mpsc::Receiver<Vec<u8>>,
+        pending: Vec<u8>,
+        offset: usize,
+    }
+
+    impl Read for ChannelReader {
+        fn read(&mut self, target: &mut [u8]) -> std::io::Result<usize> {
+            if self.offset == self.pending.len() {
+                self.pending = self.receiver.recv().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "test reader closed")
+                })?;
+                self.offset = 0;
+                if self.pending.is_empty() {
+                    return Ok(0);
+                }
+            }
+
+            let count = target.len().min(self.pending.len() - self.offset);
+            target[..count].copy_from_slice(&self.pending[self.offset..self.offset + count]);
+            self.offset += count;
+            Ok(count)
+        }
+    }
+
+    struct ReaderHarness {
+        input: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+        events: std::sync::mpsc::Receiver<AppEvent>,
+        parser: Arc<Mutex<vt100::Parser>>,
+        title: Arc<Mutex<String>>,
+        scrollback_count: Arc<std::sync::atomic::AtomicUsize>,
+        prompt_seen: Arc<AtomicBool>,
+        codex_seen: Arc<AtomicBool>,
+        alternate_scroll_mode: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ReaderHarness {
+        fn new() -> Self {
+            let (input, input_rx) = std::sync::mpsc::channel();
+            let (event_tx, events) = std::sync::mpsc::channel();
+            let parser = Arc::new(Mutex::new(vt100::Parser::new(8, 80, 100)));
+            let title = Arc::new(Mutex::new(String::new()));
+            let scrollback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let prompt_seen = Arc::new(AtomicBool::new(false));
+            let claude_seen = Arc::new(AtomicBool::new(false));
+            let codex_seen = Arc::new(AtomicBool::new(false));
+            let mouse_protocol_cache = Arc::new(Mutex::new(None));
+            let alternate_scroll_mode = Arc::new(AtomicBool::new(false));
+
+            let handle = {
+                let parser = Arc::clone(&parser);
+                let title = Arc::clone(&title);
+                let scrollback_count = Arc::clone(&scrollback_count);
+                let prompt_seen = Arc::clone(&prompt_seen);
+                let codex_seen = Arc::clone(&codex_seen);
+                let alternate_scroll_mode_for_reader = Arc::clone(&alternate_scroll_mode);
+                thread::spawn(move || {
+                    pty_reader_thread(
+                        Box::new(ChannelReader {
+                            receiver: input_rx,
+                            pending: Vec::new(),
+                            offset: 0,
+                        }),
+                        parser,
+                        title,
+                        scrollback_count,
+                        prompt_seen,
+                        claude_seen,
+                        codex_seen,
+                        mouse_protocol_cache,
+                        alternate_scroll_mode_for_reader,
+                        4242,
+                        event_tx,
+                        None,
+                    );
+                })
+            };
+
+            Self {
+                input: Some(input),
+                events,
+                parser,
+                title,
+                scrollback_count,
+                prompt_seen,
+                codex_seen,
+                alternate_scroll_mode,
+                handle: Some(handle),
+            }
+        }
+
+        fn send(&self, data: &[u8]) {
+            self.input
+                .as_ref()
+                .expect("reader input available")
+                .send(data.to_vec())
+                .expect("send fake PTY bytes");
+        }
+
+        fn screen(&self) -> String {
+            self.parser
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .screen()
+                .contents()
+        }
+
+        fn recv_output(&self) -> usize {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match self.events.recv_timeout(remaining) {
+                    Ok(AppEvent::PtyOutput(4242, bytes)) => return bytes,
+                    Ok(_) => {}
+                    Err(error) => panic!("timed out waiting for PTY output: {error}"),
+                }
+            }
+        }
+
+        fn assert_no_event(&self) {
+            assert!(
+                self.events.recv_timeout(Duration::from_millis(40)).is_err(),
+                "reader emitted an event before the synchronized frame completed"
+            );
+        }
+    }
+
+    impl Drop for ReaderHarness {
+        fn drop(&mut self) {
+            if let Some(input) = self.input.take() {
+                let _ = input.send(Vec::new());
+            }
+            if let Some(handle) = self.handle.take() {
+                handle.join().expect("join fake PTY reader");
+            }
+        }
+    }
+
+    #[test]
+    fn synchronized_output_in_one_read_is_one_parser_update() {
+        let harness = ReaderHarness::new();
+        harness.send(b"\x1b[?2026h\x1b[2J\x1b[Hcomplete\x1b[?2026l");
+
+        assert_eq!(
+            harness.recv_output(),
+            b"\x1b[?2026h\x1b[2J\x1b[Hcomplete\x1b[?2026l".len()
+        );
+        assert!(harness.screen().starts_with("complete"));
+        harness.assert_no_event();
+    }
+
+    #[test]
+    fn synchronized_output_across_reads_hides_intermediate_parser_state() {
+        let harness = ReaderHarness::new();
+        harness.send(b"old");
+        harness.recv_output();
+        assert!(harness.screen().starts_with("old"));
+
+        harness.send(b"\x1b[?2026h\x1b[2J\x1b[Hnew");
+        harness.assert_no_event();
+        assert!(harness.screen().starts_with("old"));
+
+        harness.send(b"\x1b[?2026l");
+        harness.recv_output();
+        assert!(harness.screen().starts_with("new"));
+        harness.assert_no_event();
+    }
+
+    #[test]
+    fn synchronized_output_markers_split_at_every_byte() {
+        for split in 1..SYNCHRONIZED_OUTPUT_BEGIN.len() {
+            let harness = ReaderHarness::new();
+            harness.send(&SYNCHRONIZED_OUTPUT_BEGIN[..split]);
+            assert_eq!(harness.recv_output(), split);
+            assert!(harness.screen().trim().is_empty());
+            let mut remainder = SYNCHRONIZED_OUTPUT_BEGIN[split..].to_vec();
+            remainder.extend_from_slice(b"frame");
+            harness.send(&remainder);
+            harness.assert_no_event();
+            harness.send(SYNCHRONIZED_OUTPUT_END);
+            harness.recv_output();
+            assert!(harness.screen().starts_with("frame"), "begin split={split}");
+        }
+
+        for split in 1..SYNCHRONIZED_OUTPUT_END.len() {
+            let harness = ReaderHarness::new();
+            let mut first = SYNCHRONIZED_OUTPUT_BEGIN.to_vec();
+            first.extend_from_slice(b"frame");
+            first.extend_from_slice(&SYNCHRONIZED_OUTPUT_END[..split]);
+            harness.send(&first);
+            harness.assert_no_event();
+            harness.send(&SYNCHRONIZED_OUTPUT_END[split..]);
+            harness.recv_output();
+            assert!(harness.screen().starts_with("frame"), "end split={split}");
+        }
+    }
+
+    #[test]
+    fn synchronized_output_timeout_flushes_on_next_read() {
+        let harness = ReaderHarness::new();
+        harness.send(b"\x1b[?2026hstalled");
+        harness.assert_no_event();
+        thread::sleep(SYNCHRONIZED_OUTPUT_TIMEOUT + Duration::from_millis(20));
+
+        harness.send(b" resumed");
+        assert_eq!(
+            harness.recv_output(),
+            SYNCHRONIZED_OUTPUT_BEGIN.len() + b"stalled".len()
+        );
+        assert_eq!(harness.recv_output(), b" resumed".len());
+        assert!(harness.screen().starts_with("stalled resumed"));
+    }
+
+    #[test]
+    fn synchronized_output_byte_cap_flushes_and_returns_to_pass_through() {
+        let mut stream = SynchronizedOutputStream::default();
+        let now = Instant::now();
+        assert!(stream.push(SYNCHRONIZED_OUTPUT_BEGIN, now).is_empty());
+        let payload = vec![b'x'; SYNCHRONIZED_OUTPUT_BYTE_CAP + 1];
+
+        let flushed = stream.push(&payload, now);
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(
+            flushed[0].len(),
+            SYNCHRONIZED_OUTPUT_BEGIN.len() + payload.len()
+        );
+        assert!(flushed[0].starts_with(SYNCHRONIZED_OUTPUT_BEGIN));
+        assert!(flushed[0].ends_with(&payload));
+        assert_eq!(stream.push(b"tail", now), vec![b"tail".to_vec()]);
+        assert_eq!(
+            stream.push(SYNCHRONIZED_OUTPUT_END, now),
+            vec![SYNCHRONIZED_OUTPUT_END.to_vec()]
+        );
+    }
+
+    #[test]
+    fn synchronized_output_repeated_begin_does_not_nest_or_reset_timeout() {
+        let mut stream = SynchronizedOutputStream::default();
+        let started = Instant::now();
+        assert!(stream.push(SYNCHRONIZED_OUTPUT_BEGIN, started).is_empty());
+        let repeated_at = started + SYNCHRONIZED_OUTPUT_TIMEOUT / 2;
+        let mut repeated = b"first".to_vec();
+        repeated.extend_from_slice(SYNCHRONIZED_OUTPUT_BEGIN);
+        repeated.extend_from_slice(b"second");
+        assert!(stream.push(&repeated, repeated_at).is_empty());
+
+        let mut expected_frame = SYNCHRONIZED_OUTPUT_BEGIN.to_vec();
+        expected_frame.extend_from_slice(b"first");
+        expected_frame.extend_from_slice(SYNCHRONIZED_OUTPUT_BEGIN);
+        expected_frame.extend_from_slice(b"second");
+        assert_eq!(
+            stream.push(b"after", started + SYNCHRONIZED_OUTPUT_TIMEOUT),
+            vec![expected_frame, b"after".to_vec()]
+        );
+    }
+
+    #[test]
+    fn synchronized_output_stray_end_passes_through_without_side_effect() {
+        let mut stream = SynchronizedOutputStream::default();
+        let mut data = b"before".to_vec();
+        data.extend_from_slice(SYNCHRONIZED_OUTPUT_END);
+        data.extend_from_slice(b"after");
+        assert_eq!(stream.push(&data, Instant::now()), vec![data]);
+    }
+
+    #[test]
+    fn stream_without_synchronized_output_matches_direct_parser() {
+        let data = b"one\r\ntwo\x1b[2;4Hthree\x1b[31m!\x1b[0m";
+        let mut direct = vt100::Parser::new(8, 80, 100);
+        direct.process(data);
+        let mut streamed = vt100::Parser::new(8, 80, 100);
+        let mut stream = SynchronizedOutputStream::default();
+        for chunk in data.chunks(3) {
+            for complete in stream.push(chunk, Instant::now()) {
+                streamed.process(&complete);
+            }
+        }
+        for complete in stream.finish() {
+            streamed.process(&complete);
+        }
+
+        assert_eq!(streamed.screen().contents(), direct.screen().contents());
+        assert_eq!(
+            streamed.screen().cursor_position(),
+            direct.screen().cursor_position()
+        );
+    }
+
+    #[test]
+    fn synchronized_output_preserves_every_input_byte() {
+        let mut input = b"before\x1b[?2026hframe".to_vec();
+        input.extend_from_slice(SYNCHRONIZED_OUTPUT_BEGIN);
+        input.extend_from_slice(b"more\x1b[?2026lafter");
+        input.extend_from_slice(SYNCHRONIZED_OUTPUT_END);
+
+        let mut stream = SynchronizedOutputStream::default();
+        let mut actual = Vec::new();
+        for chunk in input.chunks(5) {
+            for complete in stream.push(chunk, Instant::now()) {
+                actual.extend_from_slice(&complete);
+            }
+        }
+        for complete in stream.finish() {
+            actual.extend_from_slice(&complete);
+        }
+
+        assert_eq!(actual, input);
+    }
+
+    #[test]
+    fn synchronized_output_flush_runs_osc_and_title_detectors() {
+        let harness = ReaderHarness::new();
+        harness.send(
+            b"\x1b[?2026h\x1b]0;Codex task\x07\x1b]7;file://host/c/Users/color/project\x07\x1b]52;c;aGVsbG8=\x07\x1b[?1007hready>",
+        );
+
+        let mut saw_cwd = false;
+        let mut saw_copy = false;
+        let mut saw_output = 0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && (!saw_cwd || !saw_copy) {
+            match harness.events.recv_timeout(Duration::from_millis(50)) {
+                Ok(AppEvent::CwdChanged(4242, path)) => {
+                    saw_cwd = path.ends_with(PathBuf::from("project"));
+                }
+                Ok(AppEvent::ClipboardCopy(text)) => saw_copy = text == "hello",
+                Ok(AppEvent::PtyOutput(4242, _)) => saw_output += 1,
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        assert!(saw_cwd);
+        assert!(saw_copy);
+        assert_eq!(saw_output, 0);
+        assert_eq!(
+            harness
+                .title
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_str(),
+            "Codex task"
+        );
+        assert!(harness.codex_seen.load(Ordering::Relaxed));
+        assert!(harness.prompt_seen.load(Ordering::Acquire));
+        assert!(harness.alternate_scroll_mode.load(Ordering::Relaxed));
+        assert!(harness.screen().trim().is_empty());
+
+        harness.send(SYNCHRONIZED_OUTPUT_END);
+        harness.recv_output();
+        harness.assert_no_event();
+    }
+
+    #[test]
+    fn synchronized_output_keeps_title_detection_chunk_local() {
+        let harness = ReaderHarness::new();
+        harness.send(b"\x1b[?2026h\x1b]0;Cod");
+        harness.assert_no_event();
+        harness.send(b"ex task\x07\x1b[?2026l");
+        harness.recv_output();
+
+        assert!(harness
+            .title
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty());
+        assert!(!harness.codex_seen.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn synchronized_output_counts_scrollback_bytes_once() {
+        let plain = ReaderHarness::new();
+        plain.send(b"one\ntwo\nthree\n");
+        plain.recv_output();
+
+        let synchronized = ReaderHarness::new();
+        synchronized.send(b"\x1b[?2026hone\ntwo\nthree\n\x1b[?2026l");
+        synchronized.recv_output();
+
+        assert_eq!(
+            synchronized.scrollback_count.load(Ordering::Relaxed),
+            plain.scrollback_count.load(Ordering::Relaxed)
+        );
+        assert_eq!(synchronized.scrollback_count.load(Ordering::Relaxed), 3);
     }
 
     // Deterministic real-ConPTY startup capture for issue renga-cdr. Invoke with:
