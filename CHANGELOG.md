@@ -22,12 +22,14 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 - **Measured erase-keyed pane repaints are now applied as one parser update.**
   Outside DEC private mode 2026 frames, `ESC[2J` and `ESC[3J` start a pane-local
   output hold. The first later PTY read or UI iteration at or after 40 ms
-  releases the completed repaint; the 1 MiB byte cap and reader exits also
-  release it. The UI iteration adds up to roughly 33 ms at the default 30 fps
-  and up to 1 second at `--fps 1`. Measured `ESC[H`-only repaints remain
-  per-read because capture replay found no intermediate third screen. This is
-  a snapshot-consistency bug fix under
-  [`docs/semver-policy.md` section 3](./docs/semver-policy.md#3-what-counts-as-a-breaking-change).
+  releases the buffered bytes; the 1 MiB byte cap and reader exits also release
+  them. A repaint stretched past the fixed 40 ms cap by host load can therefore
+  still be released mid-rewrite and show the same half-applied paint, though
+  less often. The UI iteration adds up to roughly 33 ms at the default 30 fps
+  and up to 1 second at `--fps 1`. Measured `ESC[H`-only repaints remain per-read
+  because capture replay found no intermediate third screen. This uses the
+  [`docs/semver-policy.md` section 3](./docs/semver-policy.md#3-what-counts-as-a-breaking-change)
+  rule for undocumented or deferred behavior changes.
   (renga-1fz)
 
 - **Pane synchronized-output frames are now applied atomically.** Bytes between

@@ -353,10 +353,12 @@ or UI iteration at or after 40 ms, when the shared 1 MiB cap is exceeded, or
 when the reader exits. The UI iteration can add up to one polling interval:
 about 33 ms at the default 30 fps and up to 1 second at `--fps 1`. A DEC 2026
 frame that begins during the hold retains its own atomicity if the erase hold
-closes first. `ESC[H` alone does not start a hold and ordinary output retains
-one parser update and `PtyOutput` notification per PTY read. This extends the
-stable snapshot guarantee as a backward-compatible bug fix under
-[`semver-policy.md` section 3](./semver-policy.md#3-what-counts-as-a-breaking-change).
+closes first. A repaint stretched past the fixed 40 ms cap by host load can be
+released mid-rewrite and expose the same half-applied paint, though less often.
+`ESC[H` alone does not start a hold and ordinary output retains one parser
+update and `PtyOutput` notification per PTY read. This uses the
+[`semver-policy.md` section 3](./semver-policy.md#3-what-counts-as-a-breaking-change)
+rule for undocumented or deferred behavior changes.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
@@ -751,6 +753,10 @@ screen while such a frame is in progress, then expose the completed frame all
 at once. A partially applied frame was never a documented snapshot outcome, so
 this uses section 3 of `docs/semver-policy.md` for undocumented or deferred
 behavior changes. The response schema and snapshot meaning are unchanged.
+
+- **Erase-keyed pane repaint timing**: `inspect_pane` may return the pre-erase
+  screen for up to 40 ms plus one UI polling interval, then expose the buffered
+  bytes together. The response schema and snapshot meaning are unchanged.
 
 Delaying an internal push-client readiness declaration during startup is not a
 semantic change under the policy in `docs/semver-policy.md` section 3: the same

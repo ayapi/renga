@@ -122,6 +122,52 @@ fn expired_erase_hold_flushes_for_background_pane_and_records_bytes() {
 }
 
 #[test]
+fn production_drain_uses_current_time_for_expired_erase_hold() {
+    let mut app = App::new(40, 80).expect("App::new");
+    quiesce(&mut app);
+    let pane_id = app.ws().focused_pane_id;
+    let opened_at = Instant::now() - Duration::from_millis(41);
+    let held = b"\x1b[2J\x1b[Hafter";
+    let event_tx = app.event_tx.clone();
+    let pane = app
+        .ws()
+        .panes
+        .get(&pane_id)
+        .expect("focused pane available");
+    pane.process_test_output_at(held, opened_at, &event_tx);
+    assert!(!pane
+        .parser
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .screen()
+        .contents()
+        .starts_with("after"));
+
+    app.dirty = false;
+    frame_diagnostics::begin_test_frame(opened_at);
+    assert!(app.drain_pty_events());
+
+    let pane = app
+        .ws()
+        .panes
+        .get(&pane_id)
+        .expect("focused pane available");
+    assert!(pane
+        .parser
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .screen()
+        .contents()
+        .starts_with("after"));
+    assert_eq!(
+        frame_diagnostics::output_bytes_for_test(pane_id),
+        held.len()
+    );
+    frame_diagnostics::clear_test_frame();
+    app.shutdown();
+}
+
+#[test]
 fn pty_output_for_unknown_pane_does_not_dirty() {
     // A reader thread can still drain a chunk after its pane was
     // removed from every workspace; that must not repaint either.

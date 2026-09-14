@@ -2752,6 +2752,70 @@ mod tests {
     }
 
     #[test]
+    fn erase_hold_repeated_begin_preserves_first_unmatched_frame_start() {
+        let mut stream = SynchronizedOutputStream::default();
+        let started = Instant::now();
+        let mut held = b"\x1b[2Jprefix".to_vec();
+        held.extend_from_slice(SYNCHRONIZED_OUTPUT_BEGIN);
+        held.extend_from_slice(b"first-half");
+        held.extend_from_slice(SYNCHRONIZED_OUTPUT_BEGIN);
+        held.extend_from_slice(b"second-half");
+
+        assert!(stream.push(&held, started).is_empty());
+        let first_begin = held
+            .windows(SYNCHRONIZED_OUTPUT_BEGIN.len())
+            .position(|window| window == SYNCHRONIZED_OUTPUT_BEGIN)
+            .expect("first synchronized begin in held bytes");
+        assert_eq!(
+            stream.flush_expired_erase_hold(started + ERASE_OUTPUT_HOLD),
+            vec![held[..first_begin].to_vec()]
+        );
+        assert_eq!(
+            stream.deferred_kind(),
+            Some(DeferredOutputKind::Synchronized)
+        );
+
+        assert_eq!(
+            stream.push(SYNCHRONIZED_OUTPUT_END, started + Duration::from_millis(45)),
+            vec![held[first_begin..]
+                .iter()
+                .copied()
+                .chain(SYNCHRONIZED_OUTPUT_END.iter().copied())
+                .collect::<Vec<_>>()]
+        );
+    }
+
+    #[test]
+    fn converted_synchronized_frame_timeout_starts_at_its_begin_read() {
+        let mut stream = SynchronizedOutputStream::default();
+        let hold_started = Instant::now();
+        let frame_started = hold_started + Duration::from_millis(30);
+        assert!(stream.push(ERASE_DISPLAY, hold_started).is_empty());
+
+        let mut frame = SYNCHRONIZED_OUTPUT_BEGIN.to_vec();
+        frame.extend_from_slice(b"half");
+        assert!(stream.push(&frame, frame_started).is_empty());
+        assert_eq!(
+            stream.flush_expired_erase_hold(hold_started + ERASE_OUTPUT_HOLD),
+            vec![ERASE_DISPLAY.to_vec()]
+        );
+
+        assert!(stream
+            .push(b"more", hold_started + Duration::from_millis(360))
+            .is_empty());
+        let mut expected = frame;
+        expected.extend_from_slice(b"more");
+        expected.extend_from_slice(SYNCHRONIZED_OUTPUT_END);
+        assert_eq!(
+            stream.push(
+                SYNCHRONIZED_OUTPUT_END,
+                hold_started + Duration::from_millis(370)
+            ),
+            vec![expected]
+        );
+    }
+
+    #[test]
     fn erase_at_end_of_read_is_not_redetected_from_marker_tail() {
         let mut stream = SynchronizedOutputStream::default();
         let started = Instant::now();

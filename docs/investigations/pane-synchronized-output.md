@@ -57,11 +57,13 @@ a frame has no synchronization effect. All marker bytes still reach vt100.
 ## Measured scope
 
 A later live Codex 0.154.0 capture through ConPTY found that synchronized
-frames covered only 8-21% of bytes. All 20 full-repaint markers across four
-captures were outside frames. The four erase repaints took 28.5-30.9 ms from
-`ESC[2J` and spanned 8-10 reads; their rewrites started in the read after the
-erase. The approximately 1 KiB cursor-hide through cursor-show rewrite arrived
-in one read in 18 of 18 cases, while the erase read arrived separately.
+frames covered 8-21% of bytes across four captures. Every full-repaint marker
+in those captures was outside frames, with zero exceptions; the v5 capture
+contained 20 markers and the v2 capture contained 8. The four erase repaints
+took 28.5-30.9 ms from `ESC[2J` and spanned 8-10 reads; their rewrites started
+in the read after the erase. The approximately 1 KiB cursor-hide through
+cursor-show rewrite arrived in one read in 18 of 18 cases, while the erase read
+arrived separately.
 
 Replay of the saved capture through vt100, one captured read at a time, counted
 intermediate screens that differed from both the pre-burst and post-burst
