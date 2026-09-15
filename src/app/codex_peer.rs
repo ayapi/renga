@@ -5,6 +5,7 @@ pub(crate) const CODEX_PEER_NUDGE_COMMIT_DELAY: Duration = Duration::from_millis
 pub(crate) const CODEX_PEER_NUDGE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const CODEX_PEER_NUDGE_RENDER_MAX_WAIT: Duration = Duration::from_secs(60);
 pub(crate) const CODEX_PEER_NUDGE_MAX_RETRIES: u8 = 1;
+pub(crate) const CODEX_PEER_NUDGE_GUIDANCE: &str = "Call the renga-peers MCP tool check_messages now, not a built-in wait tool. Treat each returned message as a direct coworker request: do the requested work, and use send_message only when a reply or status update is needed.";
 const CODEX_PEER_INJECTED_COMPOSER_MAX_ENTRIES: usize = 8;
 static CODEX_PEER_DEBUG_RECORD_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -1247,8 +1248,7 @@ pub(crate) fn format_codex_peer_message(msg: &PendingCodexPeerMessage) -> String
         };
         header.push_str(&format!(" kind={kind}"));
     }
-    let guidance = "Run check_messages now. Treat each returned message as a direct coworker request: do the requested work, and use send_message only when a reply or status update is needed.";
-    format!("{header}. {guidance}")
+    format!("{header}. {CODEX_PEER_NUDGE_GUIDANCE}")
 }
 
 pub(crate) fn write_input_to_pane(
@@ -4338,10 +4338,15 @@ mod debug_logging_tests {
 
     #[test]
     fn debug_capture_preserves_four_line_wrapped_composer() {
-        let mut parser = vt100::Parser::new(16, 56, 0);
-        let message = "Peer request from id=1 name=shogun kind=claude. Run check_messages now. Treat each returned message as a direct coworker request: do the requested work, and use send_message only when a reply or status update is needed.";
+        const COLUMNS: usize = 56;
+        let mut parser = vt100::Parser::new(16, COLUMNS as u16, 0);
+        let message =
+            format!("Peer request from id=1 name=shogun kind=claude. {CODEX_PEER_NUDGE_GUIDANCE}");
+        let cursor_offset = 2 + message.chars().count();
+        let cursor_row = cursor_offset / COLUMNS + 1;
+        let cursor_col = cursor_offset % COLUMNS + 1;
         let fixture = format!(
-            "\x1b[?25h\x1b[2J\x1b[H\u{203a} {message}\r\n\r\n  gpt-5.6-sol medium \u{b7} cwd\x1b[4;48H"
+            "\x1b[?25h\x1b[2J\x1b[H\u{203a} {message}\r\n\r\n  gpt-5.6-sol medium \u{b7} cwd\x1b[{cursor_row};{cursor_col}H"
         );
         parser.process(fixture.as_bytes());
 
@@ -4352,11 +4357,11 @@ mod debug_logging_tests {
             .as_ref()
             .and_then(|snapshot| snapshot.composer_raw.as_deref())
             .expect("debug composer");
-        assert_eq!(raw.lines().count(), 4, "fixture must exercise row joins");
+        assert_eq!(raw.lines().count(), 5, "fixture must exercise row joins");
         assert_eq!(normal.composer, debug.composer);
         assert_eq!(
             normal.composer,
-            Some(normalize_codex_composer_expected(message))
+            Some(normalize_codex_composer_expected(&message))
         );
     }
 

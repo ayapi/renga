@@ -1,8 +1,8 @@
 use super::super::*;
 use crate::app::codex_peer::{
     codex_composer_has_draft_on_screen, normalized_codex_composer_text,
-    CODEX_PEER_DRAFT_STALL_TIMEOUT, CODEX_PEER_NUDGE_COMMIT_TIMEOUT, CODEX_PEER_NUDGE_MAX_RETRIES,
-    PENDING_PEER_INBOX_MAX_MESSAGES,
+    CODEX_PEER_DRAFT_STALL_TIMEOUT, CODEX_PEER_NUDGE_COMMIT_TIMEOUT, CODEX_PEER_NUDGE_GUIDANCE,
+    CODEX_PEER_NUDGE_MAX_RETRIES, PENDING_PEER_INBOX_MAX_MESSAGES,
 };
 
 fn seed_focused_pane_screen(app: &mut App, bytes: &[u8]) -> usize {
@@ -41,10 +41,37 @@ fn seed_codex_busy_placeholder(app: &mut App, pane_id: usize) {
     );
 }
 
+fn pane_composer_chunk_width(app: &App, pane_id: usize) -> usize {
+    let pane = app.ws().panes.get(&pane_id).expect("pane exists");
+    let parser = pane
+        .parser
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    usize::from(parser.screen().size().1.saturating_sub(2).max(1))
+}
+
 fn seed_codex_busy_composer(app: &mut App, pane_id: usize, text: &str) {
-    let screen = format!(
-        "\x1b[?25h\x1b[2J\x1b[3;1H\u{25e6} Working (1m 03s \u{2022} esc to interrupt)\x1b[6;1H\u{203a} {text}\x1b[10;1H  tab to queue message  51% context left\x1b[8;20H"
+    let chunk_width = pane_composer_chunk_width(app, pane_id);
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut screen = String::from(
+        "\x1b[?25h\x1b[2J\x1b[3;1H\u{25e6} Working (1m 03s \u{2022} esc to interrupt)",
     );
+    for (index, chunk) in chars.chunks(chunk_width).enumerate() {
+        let row = 6 + index;
+        let text = chunk.iter().collect::<String>();
+        let prefix = if index == 0 { "\u{203a} " } else { "  " };
+        screen.push_str(&format!("\x1b[{row};1H{prefix}{text}"));
+    }
+    let blank_row = 6 + chars.chunks(chunk_width).len();
+    let footer_row = blank_row + 1;
+    let cursor_row = blank_row - 1;
+    let cursor_col = chars
+        .chunks(chunk_width)
+        .last()
+        .map_or(3, |chunk| chunk.len() + 3);
+    screen.push_str(&format!(
+        "\x1b[{footer_row};1H  tab to queue message  51% context left\x1b[{cursor_row};{cursor_col}H"
+    ));
     seed_pane_screen(app, pane_id, screen.as_bytes());
 }
 
@@ -69,18 +96,24 @@ fn seed_codex_long_busy_composer(app: &mut App, pane_id: usize, text: &str) {
 }
 
 fn seed_codex_idle_composer(app: &mut App, pane_id: usize, text: &str) {
+    // Some changed-draft fixtures include CJK text, so keep enough columns
+    // for every fixture character to occupy two terminal cells.
+    let chunk_width = (pane_composer_chunk_width(app, pane_id) / 2).max(1);
     let chars = text.chars().collect::<Vec<_>>();
     let mut screen = String::from("\x1b[?25h\x1b[2J");
-    for (index, chunk) in chars.chunks(20).enumerate() {
+    for (index, chunk) in chars.chunks(chunk_width).enumerate() {
         let row = 1 + index;
         let text = chunk.iter().collect::<String>();
         let prefix = if index == 0 { "\u{203a} " } else { "  " };
         screen.push_str(&format!("\x1b[{row};1H{prefix}{text}"));
     }
-    let blank_row = 1 + chars.chunks(20).len();
+    let blank_row = 1 + chars.chunks(chunk_width).len();
     let footer_row = blank_row + 1;
     let cursor_row = blank_row - 1;
-    let cursor_col = chars.chunks(20).last().map_or(3, |chunk| chunk.len() + 3);
+    let cursor_col = chars
+        .chunks(chunk_width)
+        .last()
+        .map_or(3, |chunk| chunk.len() + 3);
     screen.push_str(&format!(
         "\x1b[{footer_row};1H  gpt-5.6-sol medium \u{b7} cwd\x1b[{cursor_row};{cursor_col}H"
     ));
@@ -223,13 +256,62 @@ fn format_codex_peer_message_includes_sender_and_check_messages_guidance() {
         "{formatted:?}"
     );
     assert!(
-        formatted.contains("Run check_messages now."),
+        formatted.ends_with(CODEX_PEER_NUDGE_GUIDANCE),
         "{formatted:?}"
     );
     assert!(
         formatted.contains("use send_message only when a reply or status update is needed."),
         "{formatted:?}"
     );
+}
+
+#[test]
+fn codex_peer_nudge_guidance_names_the_mcp_server_and_tool() {
+    assert!(CODEX_PEER_NUDGE_GUIDANCE.contains("renga-peers"));
+    assert!(CODEX_PEER_NUDGE_GUIDANCE.contains("check_messages"));
+}
+
+#[test]
+fn codex_peer_nudge_write_matches_the_submit_guard() {
+    let (mut app, sender_id, codex_id) = setup_unfocused_registered_codex();
+    seed_codex_live_ready_placeholder(&mut app, codex_id);
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "verify exact nudge text".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    let written = app
+        .ws()
+        .panes
+        .get(&codex_id)
+        .expect("Codex pane")
+        .test_input();
+    let expected_raw = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: None,
+        from_kind: None,
+    });
+    assert_eq!(written, expected_raw.as_bytes());
+
+    let expected_guard: String = expected_raw
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    match app
+        .pending_codex_peer_messages
+        .get(&codex_id)
+        .and_then(|queue| queue.front())
+    {
+        Some(PendingCodexPeerDelivery::SubmitAt {
+            expected_composer, ..
+        }) => assert_eq!(expected_composer, &expected_guard),
+        other => panic!("expected SubmitAt, got {other:?}"),
+    }
+    app.shutdown();
 }
 
 #[test]
@@ -2675,6 +2757,70 @@ fn unfocused_busy_codex_without_draft_queues_nudge_natively() {
 }
 
 #[test]
+fn named_sender_nudge_at_field_width_reaches_busy_queue_footer() {
+    let mut app = App::new(40, 136).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.ws_mut()
+        .pane_names
+        .insert("impl-h25-pot-authority".to_string(), sender_id);
+    app.peer_client_kinds
+        .insert(sender_id, PeerClientKind::Claude);
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(codex_id);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+
+    assert_eq!(pane_composer_chunk_width(&app, codex_id), 53);
+    seed_codex_busy_placeholder(&mut app, codex_id);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "field-width queue footer".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    let expected = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: sender_id,
+        from_name: Some("impl-h25-pot-authority".to_string()),
+        from_kind: Some(PeerClientKind::Claude),
+    });
+    let header = expected
+        .strip_suffix(CODEX_PEER_NUDGE_GUIDANCE)
+        .expect("shared guidance suffix")
+        .trim_end_matches(". ");
+    assert_eq!(header.chars().count(), 62);
+    seed_codex_busy_composer(&mut app, codex_id, &expected);
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+    make_codex_native_queue_ready(&mut app, codex_id);
+
+    app.flush_pending_codex_peer_messages();
+
+    assert_eq!(
+        app.ws().panes.get(&codex_id).expect("pane").test_input(),
+        b"\t",
+        "the field-width busy footer must remain inside the measured scan range"
+    );
+    assert!(!app.pending_codex_peer_messages.contains_key(&codex_id));
+    app.shutdown();
+}
+
+#[test]
 fn busy_codex_native_queue_path_is_independent_of_pane_focus() {
     for pane_is_focused in [false, true] {
         let mut app = App::new(40, 160).expect("App::new");
@@ -3598,10 +3744,7 @@ fn busy_codex_nudge_submits_if_turn_finishes_before_tab() {
     });
     // Codex v0.147.0 has no idle action hint. Turn completion is observable
     // only through the disappearance of the busy status above the composer.
-    let idle_screen = format!(
-        "\x1b[?25h\x1b[2J\x1b[H\u{203a} {expected}\x1b[5;1Hgpt-5.6-sol medium \u{b7} cwd\x1b[3;20H"
-    );
-    seed_pane_screen(&mut app, sibling_id, idle_screen.as_bytes());
+    seed_codex_idle_composer(&mut app, sibling_id, &expected);
     {
         let pane = app.ws().panes.get(&sibling_id).expect("pane");
         let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
@@ -6756,7 +6899,7 @@ fn submit_commit_observes_complete_render_during_delay_before_release() {
 }
 
 fn codex_nudge_substring(expected: &str) -> String {
-    let user_text = "Runcheck_messagesnow";
+    let user_text = "MCPtoolcheck_messages";
     assert!(expected.contains(user_text));
     assert!(!expected.starts_with(user_text));
     user_text.to_string()

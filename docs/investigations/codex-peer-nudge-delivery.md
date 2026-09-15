@@ -62,8 +62,9 @@
 renga の nudge は **composer に文字列を打ち込み、少し遅れて Enter を送る**方式。実際に注入される本文（`codex_peer.rs:433,444`）:
 
 ```
-Peer request from id=1 kind=claude. Run check_messages now. Treat each returned message as a direct coworker
-request: do the requested work, and use send_message only when a reply or status update is needed.
+Peer request from id=1 kind=claude. Call the renga-peers MCP tool check_messages now, not a built-in wait tool.
+Treat each returned message as a direct coworker request: do the requested work, and use send_message only when
+a reply or status update is needed.
 ```
 
 A-6 のラウンドで**注入直後・Enter 前の中間状態を実測で捕捉**した（`inspect_pane` の連続2回で、1回目が composer に本文・`Working` なし、2回目が `Working (2s)`）。`CODEX_PEER_NUDGE_COMMIT_DELAY = 1000ms`（`codex_peer.rs:4`）と整合する。
@@ -117,8 +118,9 @@ Ctrl+Enter 直後:
 ───────────────────────────────────────────────────────────────────
 
 
-› Peer request from id=1 kind=claude. Run check_messages now. Treat each returned message as a direct coworker
-  request: do the requested work, and use send_message only when a reply or status update is needed.
+› Peer request from id=1 kind=claude. Call the renga-peers MCP tool check_messages now, not a built-in wait tool.
+  Treat each returned message as a direct coworker request: do the requested work, and use send_message only when
+  a reply or status update is needed.
 
   gpt-5.6-sol medium · ~          ← Working なし。まだ送信されていない
 ```
@@ -248,8 +250,9 @@ requeue 自体はメッセージを失わない（`restore_codex_peer_notificati
 accept で composer に nudge 文が入った状態のまま文字を打つと、末尾に連結される。実測:
 
 ```
-› Peer request from id=1 kind=claude. Run check_messages now. Treat each returned message as a direct coworker
-  request: do the requested work, and use send_message only when a reply or status update is needed.ABC
+› Peer request from id=1 kind=claude. Call the renga-peers MCP tool check_messages now, not a built-in wait tool.
+  Treat each returned message as a direct coworker request: do the requested work, and use send_message only when
+  a reply or status update is needed.ABC
 ```
 
 ユーザーは nudge 文が見えている状態なので気付ける余地はあるが、問題①を直して自動 commit するようになると、**commit までの1秒間に打った文字が混入したまま送信される**。§2 の確認事項のとおり `expected_composer` 照合を入れるのが安全。
@@ -542,3 +545,21 @@ SubmitAt Enter、QueueAt Enter/Tab、stale Enter、成功した Ctrl-U、subscri
 未知の非 dim placeholder は下書きとして扱い、そのペインの nudge を focus まで
 `has_draft` 経路で保留する。この失敗方向を選ぶのは、ユーザー下書きの上書きより安全だからである。
 9 件の既知 placeholder のうち `Ask Codex to do anything` と `Ask a follow-up question` は Codex 0.154.0 の installed binary で確認し、残る 7 件のうち 6 件は 2026 年 7 月の renga-f85 実機記録（`Write tests for @filename` を含む）と Codex source に由来する。残る 1 件は従来から認識している `Ask Codex anything` である。一覧と完全一致するユーザー下書きも placeholder と同様に空と判定される trade-off を受け入れる。
+
+## 2026-09-15 追記: built-in agent wait tool との誤選択 (renga-vdr)
+
+Codex 0.154 のペインが自身の subagent を持つ field shape では、従来の曖昧な
+`check_messages` nudge を、renga-peers の MCP tool ではなく Codex
+組み込みの agent collaboration wait tool への指示として解釈した。画面には
+`Waiting for agents`、続いて `No agents completed yet` と出る一方、renga-peers inbox
+は読まれず、peer message が未 ack のまま残った。
+
+nudge は sender prefix を変更せず、次の wording で MCP server と tool を明示する。
+
+```text
+Peer request from id=1 kind=claude. Call the renga-peers MCP tool check_messages now, not a built-in wait tool. Treat each returned message as a direct coworker request: do the requested work, and use send_message only when a reply or status update is needed.
+```
+
+guidance は production formatter と fixture が共有する一つの定数に置き、composer
+へ書く bytes と `expected_composer` の完全一致 guard が同じ wording から作られることを
+回帰テストで固定する。配送 state machine や re-nudge 条件は変更しない。

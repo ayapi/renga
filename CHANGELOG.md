@@ -36,6 +36,12 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Fixed
 
+- **Codex peer nudges now name the renga-peers MCP tool unambiguously.**
+  The prompt tells Codex to call the `renga-peers` MCP tool
+  `check_messages`, rather than a built-in wait tool. Production and test
+  fixtures share the same guidance text, including the exact composer-match
+  guard. (renga-vdr)
+
 - **Codex peer nudges left in the composer now recover without waiting for
   user focus.** Renga remembers normalized nudge text it injected, recognizes
   only complete visible composers made entirely from those injections, and
