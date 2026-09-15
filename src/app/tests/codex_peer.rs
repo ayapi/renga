@@ -75,6 +75,49 @@ fn seed_codex_busy_composer(app: &mut App, pane_id: usize, text: &str) {
     seed_pane_screen(app, pane_id, screen.as_bytes());
 }
 
+fn word_wrap_codex_composer(text: &str, width: usize) -> Vec<String> {
+    assert!(width > 0);
+    let mut remaining = text.chars().collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    while remaining.len() > width {
+        let split = (0..=width)
+            .rev()
+            .find(|&index| remaining[index].is_whitespace())
+            .unwrap_or(width);
+        lines.push(remaining[..split].iter().collect());
+        remaining.drain(..split);
+        let leading_whitespace = remaining.iter().take_while(|ch| ch.is_whitespace()).count();
+        remaining.drain(..leading_whitespace);
+    }
+    lines.push(remaining.iter().collect());
+    lines
+}
+
+fn seed_codex_busy_word_wrapped_composer(
+    app: &mut App,
+    pane_id: usize,
+    text: &str,
+    text_columns: usize,
+) {
+    let lines = word_wrap_codex_composer(text, text_columns);
+    let mut screen = String::from(
+        "\x1b[?25h\x1b[2J\x1b[3;1H\u{25e6} Working (1m 03s \u{2022} esc to interrupt)",
+    );
+    for (index, text) in lines.iter().enumerate() {
+        let row = 6 + index;
+        let prefix = if index == 0 { "\u{203a} " } else { "  " };
+        screen.push_str(&format!("\x1b[{row};1H{prefix}{text}"));
+    }
+    let blank_row = 6 + lines.len();
+    let footer_row = blank_row + 1;
+    let cursor_row = blank_row - 1;
+    let cursor_col = lines.last().map_or(3, |line| line.chars().count() + 3);
+    screen.push_str(&format!(
+        "\x1b[{footer_row};1H  tab to queue message  51% context left\x1b[{cursor_row};{cursor_col}H"
+    ));
+    seed_pane_screen(app, pane_id, screen.as_bytes());
+}
+
 fn seed_codex_long_busy_composer(app: &mut App, pane_id: usize, text: &str) {
     let chars = text.chars().collect::<Vec<_>>();
     let mut screen =
@@ -2758,7 +2801,7 @@ fn unfocused_busy_codex_without_draft_queues_nudge_natively() {
 
 #[test]
 fn named_sender_nudge_at_field_width_reaches_busy_queue_footer() {
-    let mut app = App::new(40, 136).expect("App::new");
+    let mut app = App::new(40, 138).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
     let codex_id = app
         .handle_split(
@@ -2781,7 +2824,15 @@ fn named_sender_nudge_at_field_width_reaches_busy_queue_footer() {
     app.handle_focus(&ipc::PaneRef::Id(sender_id))
         .expect("refocus sender");
 
-    assert_eq!(pane_composer_chunk_width(&app, codex_id), 53);
+    let pane_columns = {
+        let pane = app.ws().panes.get(&codex_id).expect("pane");
+        let parser = pane
+            .parser
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        usize::from(parser.screen().size().1)
+    };
+    assert_eq!(pane_columns.saturating_sub(3), 53);
     seed_codex_busy_placeholder(&mut app, codex_id);
     app.handle_peer_send(
         sender_id,
@@ -2801,7 +2852,7 @@ fn named_sender_nudge_at_field_width_reaches_busy_queue_footer() {
         .expect("shared guidance suffix")
         .trim_end_matches(". ");
     assert_eq!(header.chars().count(), 62);
-    seed_codex_busy_composer(&mut app, codex_id, &expected);
+    seed_codex_busy_word_wrapped_composer(&mut app, codex_id, &expected, 53);
     app.ws_mut()
         .panes
         .get_mut(&codex_id)

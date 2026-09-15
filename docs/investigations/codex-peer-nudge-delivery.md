@@ -67,6 +67,8 @@ Treat each returned message as a direct coworker request: do the requested work,
 a reply or status update is needed.
 ```
 
+以下の 2026-08 の実機 capture は、この wording 変更より前の画面をそのまま記録している。
+
 A-6 のラウンドで**注入直後・Enter 前の中間状態を実測で捕捉**した（`inspect_pane` の連続2回で、1回目が composer に本文・`Working` なし、2回目が `Working (2s)`）。`CODEX_PEER_NUDGE_COMMIT_DELAY = 1000ms`（`codex_peer.rs:4`）と整合する。
 
 ### 状態別の挙動（実測）
@@ -118,9 +120,8 @@ Ctrl+Enter 直後:
 ───────────────────────────────────────────────────────────────────
 
 
-› Peer request from id=1 kind=claude. Call the renga-peers MCP tool check_messages now, not a built-in wait tool.
-  Treat each returned message as a direct coworker request: do the requested work, and use send_message only when
-  a reply or status update is needed.
+› Peer request from id=1 kind=claude. Run check_messages now. Treat each returned message as a direct coworker
+  request: do the requested work, and use send_message only when a reply or status update is needed.
 
   gpt-5.6-sol medium · ~          ← Working なし。まだ送信されていない
 ```
@@ -250,9 +251,8 @@ requeue 自体はメッセージを失わない（`restore_codex_peer_notificati
 accept で composer に nudge 文が入った状態のまま文字を打つと、末尾に連結される。実測:
 
 ```
-› Peer request from id=1 kind=claude. Call the renga-peers MCP tool check_messages now, not a built-in wait tool.
-  Treat each returned message as a direct coworker request: do the requested work, and use send_message only when
-  a reply or status update is needed.ABC
+› Peer request from id=1 kind=claude. Run check_messages now. Treat each returned message as a direct coworker
+  request: do the requested work, and use send_message only when a reply or status update is needed.ABC
 ```
 
 ユーザーは nudge 文が見えている状態なので気付ける余地はあるが、問題①を直して自動 commit するようになると、**commit までの1秒間に打った文字が混入したまま送信される**。§2 の確認事項のとおり `expected_composer` 照合を入れるのが安全。
