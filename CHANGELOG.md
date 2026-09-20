@@ -32,7 +32,7 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
   it places resize clears at their applied byte offset, excludes user-scrolled
   views from repaint counts, and recognizes Unicode-split rewrites. See the
   [field capture guide](docs/investigations/pane-synchronized-output.md#field-capture-and-replay).
-  (renga-gou)
+  (renga-bgi)
 
 ### Changed
 

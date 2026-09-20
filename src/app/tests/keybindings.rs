@@ -37,6 +37,45 @@ fn alt_shift_c_uses_the_focused_capture_path() {
 }
 
 #[test]
+fn alt_shift_c_writes_the_focused_live_ring() {
+    let mut config = crate::pane_capture::test_config("capture-key-live", Instant::now());
+    let _cleanup = crate::pane_capture::TestCaptureCleanup::new(&config);
+    config.continuous_directory = None;
+    let dump_root = config.dump_root.clone();
+    let mut app =
+        crate::pane_capture::with_test_config(Some(config), || App::new(40, 80).expect("App::new"));
+    let pane_id = app.ws().focused_pane_id;
+
+    let consumed = app
+        .handle_key_event(key(
+            KeyCode::Char('c'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ))
+        .expect("Alt+Shift+C");
+
+    assert!(consumed, "Alt+Shift+C must be consumed by renga");
+    let bin_name = format!("pane-{pane_id}.bin");
+    let jsonl_name = format!("pane-{pane_id}.jsonl");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let written = loop {
+        let found = std::fs::read_dir(&dump_root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .any(|entry| {
+                entry.path().join(&bin_name).is_file() && entry.path().join(&jsonl_name).is_file()
+            });
+        if found || Instant::now() >= deadline {
+            break found;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(written, "key path must write the focused pane capture");
+    app.shutdown();
+}
+
+#[test]
 fn alt_d_splits_vertically_and_alt_e_horizontally() {
     let mut app = App::new(40, 120).expect("App::new");
     assert_eq!(app.ws().layout.pane_count(), 1);

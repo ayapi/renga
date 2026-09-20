@@ -1,6 +1,50 @@
 use super::super::*;
 
 #[test]
+fn dump_pane_capture_command_rejects_missing_selector() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let from_pane = app.ws().focused_pane_id;
+    let (reply, receive) = oneshot::channel();
+
+    app.handle_app_command(AppCommand::DumpPaneCapture {
+        from_pane,
+        target: None,
+        all: false,
+        reply,
+    });
+
+    let error = receive
+        .recv()
+        .expect("dump reply")
+        .expect_err("missing selector must fail");
+    assert_eq!(error.code, Some(ipc::err_code::PANE_CAPTURE_DUMP_FAILED));
+    assert_eq!(error.message, "target or all=true is required");
+    app.shutdown();
+}
+
+#[test]
+fn dump_pane_capture_command_rejects_target_with_all() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let from_pane = app.ws().focused_pane_id;
+    let (reply, receive) = oneshot::channel();
+
+    app.handle_app_command(AppCommand::DumpPaneCapture {
+        from_pane,
+        target: Some(PaneRef::Focused),
+        all: true,
+        reply,
+    });
+
+    let error = receive
+        .recv()
+        .expect("dump reply")
+        .expect_err("target with all must fail");
+    assert_eq!(error.code, Some(ipc::err_code::PANE_CAPTURE_DUMP_FAILED));
+    assert_eq!(error.message, "target and all cannot be used together");
+    app.shutdown();
+}
+
+#[test]
 fn handle_set_pane_identity_sets_name_and_role() {
     let mut app = App::new(40, 80).expect("App::new");
     let pane_id = app.ws().focused_pane_id;

@@ -459,8 +459,8 @@ directories are pruned to 32 directories / 128 MiB; manual dumps are exempt.
 For 13 panes the raw automatic-dump maximum before retention is
 `13 * 6 * (4 MiB + 1 MiB + 4096 B)`, about 390 MiB/hour, plus JSONL records.
 
-Errors retain their `[code]` token, including `pane_capture_dump_failed`,
-`pane_not_found`, and `pane_vanished` where applicable. Missing selectors,
+Errors retain their `[code]` token, including `pane_capture_dump_failed` and
+`pane_not_found` where applicable. Missing selectors,
 `all: false`, and simultaneous `target` / `all` are JSON-RPC `-32602` errors
 before IPC.
 

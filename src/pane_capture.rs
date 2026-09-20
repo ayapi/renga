@@ -56,6 +56,8 @@ pub(crate) struct Config {
     pub(crate) automatic_dump_total_bytes: usize,
     #[cfg(test)]
     pub(crate) dump_write_delay: Duration,
+    #[cfg(test)]
+    pub(crate) automatic_dump_done: Option<mpsc::Sender<()>>,
     session_token: u128,
 }
 
@@ -986,6 +988,8 @@ fn schedule_automatic_dump(
     let snapshot = ring.snapshot();
     let current_sequence = *sequence;
     *sequence = sequence.saturating_add(1);
+    #[cfg(test)]
+    let automatic_dump_done = config.automatic_dump_done.clone();
     let spawn = std::thread::Builder::new()
         .name(format!("capture-auto-{pane_id}"))
         .spawn(move || {
@@ -1000,6 +1004,10 @@ fn schedule_automatic_dump(
             .is_err()
             {
                 FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            #[cfg(test)]
+            if let Some(done) = automatic_dump_done {
+                let _ = done.send(());
             }
         });
     if spawn.is_err() {
@@ -1323,6 +1331,13 @@ pub(crate) fn format_dump_report(report: &DumpReport) -> String {
 }
 
 pub(crate) fn dump_captures(captures: Vec<Arc<Capture>>) -> Result<DumpReport, String> {
+    dump_captures_with_clock(captures, Instant::now)
+}
+
+fn dump_captures_with_clock(
+    captures: Vec<Arc<Capture>>,
+    now: impl Fn() -> Instant,
+) -> Result<DumpReport, String> {
     let first = captures.first().ok_or("no panes selected")?;
     let stamp = now_since_epoch().unwrap_or_default().as_nanos();
     std::fs::create_dir_all(&first.config.dump_root).map_err(|error| {
@@ -1337,10 +1352,10 @@ pub(crate) fn dump_captures(captures: Vec<Arc<Capture>>) -> Result<DumpReport, S
         .join(format!("manual-{}-{stamp}", std::process::id()));
     std::fs::create_dir(&directory)
         .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
-    let deadline = Instant::now() + DUMP_DEADLINE;
+    let deadline = now() + DUMP_DEADLINE;
     let mut panes = Vec::with_capacity(captures.len());
     for capture in captures {
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             panes.push(failed_dump(
                 capture.pane_id,
                 "timed_out",
@@ -1356,6 +1371,7 @@ pub(crate) fn dump_captures(captures: Vec<Arc<Capture>>) -> Result<DumpReport, S
                 capture.child_process_id,
                 snapshot,
                 deadline,
+                &now,
             ) {
                 Ok(report) => panes.push(report),
                 Err(DeadlineWriteError::TimedOut) => panes.push(failed_dump(
@@ -1396,8 +1412,9 @@ fn write_snapshot_until(
     child_process_id: Option<u32>,
     snapshot: RingSnapshot,
     deadline: Instant,
+    now: &impl Fn() -> Instant,
 ) -> Result<PaneDumpReport, DeadlineWriteError> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
+    let remaining = deadline.saturating_duration_since(now());
     if remaining.is_zero() {
         return Err(DeadlineWriteError::TimedOut);
     }
@@ -1446,9 +1463,9 @@ fn write_snapshot_until(
     if let Err(error) = spawn {
         return Err(DeadlineWriteError::Failed(error.to_string()));
     }
-    match receive.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+    match receive.recv_timeout(deadline.saturating_duration_since(now())) {
         Ok(Ok(mut report)) => {
-            if Instant::now() >= deadline {
+            if now() >= deadline {
                 cancelled.store(true, Ordering::Release);
                 let _ = std::fs::remove_dir_all(&staging_directory);
                 return Err(DeadlineWriteError::TimedOut);
@@ -1823,6 +1840,7 @@ pub(crate) fn test_config(name: &str, origin: Instant) -> Config {
         retained_automatic_dumps: 32,
         automatic_dump_total_bytes: 128 * 1024 * 1024,
         dump_write_delay: Duration::ZERO,
+        automatic_dump_done: None,
         session_token: token as u128,
     }
 }
@@ -1888,7 +1906,7 @@ mod tests {
         assert_eq!(
             deferred,
             Some(&DeferredState {
-                kind: DEFERRED_KIND_DEC2026,
+                kind: "dec2026",
                 opened_at_elapsed_us: Some(17),
                 buffered_len: 15,
             })
@@ -1921,7 +1939,7 @@ mod tests {
         assert_eq!(
             deferred,
             Some(&DeferredState {
-                kind: DEFERRED_KIND_ERASE_HOLD,
+                kind: "erase_hold",
                 opened_at_elapsed_us: Some(23),
                 buffered_len: 11,
             })
@@ -2002,6 +2020,7 @@ mod tests {
 
     #[test]
     fn dump_writer_stall_returns_timed_out_by_deadline() {
+        assert_eq!(DUMP_DEADLINE, Duration::from_secs(3));
         let origin = Instant::now();
         let mut config = test_config("writer-deadline", origin);
         let _cleanup = TestCaptureCleanup::new(&config);
@@ -2010,15 +2029,21 @@ mod tests {
         let capture = Capture::create(config, 5, None, 3, 8).unwrap();
         capture.read(origin, 0, b"hello", DeferredState::default());
 
-        let started = Instant::now();
-        let report = dump_captures(vec![capture]).unwrap();
-        assert!(started.elapsed() <= DUMP_DEADLINE + Duration::from_millis(500));
+        let clock_calls = Arc::new(AtomicUsize::new(0));
+        let test_clock_calls = clock_calls.clone();
+        let test_now = move || {
+            if test_clock_calls.fetch_add(1, Ordering::Relaxed) < 3 {
+                origin
+            } else {
+                origin + Duration::from_secs(3)
+            }
+        };
+        let report = dump_captures_with_clock(vec![capture], test_now).unwrap();
         assert_eq!(report.panes[0].status, "timed_out");
         assert_eq!(
             report.panes[0].reason.as_deref(),
             Some("dump deadline exceeded")
         );
-        std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
             std::fs::read_dir(&report.directory)
                 .unwrap()
@@ -2099,7 +2124,10 @@ mod tests {
         let mut config = test_config("forced-auto", Instant::now());
         config.continuous_directory = None;
         config.ring_bytes = 1;
-        let _cleanup = TestCaptureCleanup::new(&config);
+        let (automatic_dump_done, automatic_dump_receive) = mpsc::channel();
+        config.automatic_dump_done = Some(automatic_dump_done);
+        let cleanup = TestCaptureCleanup::new(&config);
+        let dump_root = config.dump_root.clone();
         let config = Arc::new(config);
         let mut ring = RingState::new(8, 80, config.ring_bytes);
         let first_len = ring.hard_cap;
@@ -2146,22 +2174,21 @@ mod tests {
         );
         assert_eq!(ring.automatic_dump_suppressions, 1);
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            let count = std::fs::read_dir(&config.dump_root)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|entry| {
-                    entry.file_name().to_string_lossy().starts_with("auto-")
-                        && entry.path().join(AUTOMATIC_DUMP_COMPLETE).is_file()
-                })
-                .count();
-            if count == 1 {
-                return;
-            }
-            std::thread::yield_now();
-        }
-        panic!("automatic forced-cut dump did not finish");
+        automatic_dump_receive
+            .recv_timeout(Duration::from_secs(2))
+            .expect("automatic forced-cut writer completion");
+        let count = std::fs::read_dir(&config.dump_root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().starts_with("auto-")
+                    && entry.path().join(AUTOMATIC_DUMP_COMPLETE).is_file()
+            })
+            .count();
+        assert_eq!(count, 1);
+        drop(config);
+        drop(cleanup);
+        assert!(!dump_root.exists());
     }
 }
