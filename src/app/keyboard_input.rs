@@ -82,6 +82,43 @@ impl App {
             return self.handle_copy_mode_key(key);
         }
 
+        // Alt+Shift+C — dump the focused pane's always-on capture ring. Some
+        // legacy terminals encode this as Alt plus an uppercase C without an
+        // explicit Shift bit; accept that form without consuming Alt+c.
+        let capture_dump_key = matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && (key.modifiers == (KeyModifiers::ALT | KeyModifiers::SHIFT)
+                || (key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('C'))));
+        if capture_dump_key && self.ws().focus_target == FocusTarget::Pane {
+            let pane_id = self.ws().focused_pane_id;
+            let capture = self
+                .ws()
+                .panes
+                .get(&pane_id)
+                .and_then(|pane| pane.capture.clone());
+            let Some(capture) = capture else {
+                self.pane_capture_status = Some("disabled by ring_bytes = 0".into());
+                self.status_bar_visible = true;
+                self.dirty = true;
+                return Ok(true);
+            };
+            self.pane_capture_status = Some(format!("dumping pane {pane_id}..."));
+            self.status_bar_visible = true;
+            self.dirty = true;
+            let event_tx = self.event_tx.clone();
+            if let Err(error) =
+                crate::pane_capture::dump_captures_async(vec![capture], move |result| {
+                    let status = result
+                        .as_ref()
+                        .map(crate::pane_capture::format_dump_report)
+                        .unwrap_or_else(|error| format!("dump failed: {error}"));
+                    let _ = event_tx.send(AppEvent::PaneCaptureDumped(status));
+                })
+            {
+                self.pane_capture_status = Some(format!("dump failed: {error}"));
+            }
+            return Ok(true);
+        }
+
         // Open the IME composition overlay. Primary hotkey is
         // `Ctrl+;`, with `Alt+;` and `Alt+I` as fallbacks for
         // terminals that refuse to pass `Ctrl+;` through to

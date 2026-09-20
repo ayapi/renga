@@ -19,6 +19,51 @@ pub struct Config {
     pub ime: ImeConfig,
     pub ui: UiConfig,
     pub shell: ShellConfig,
+    pub debug: DebugConfig,
+}
+
+pub const DEFAULT_PANE_CAPTURE_RING_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_PANE_CAPTURE_FILE_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_PANE_CAPTURE_FILE_SEGMENTS: usize = 4;
+pub const DEFAULT_PANE_CAPTURE_SESSIONS: usize = 4;
+pub const DEFAULT_PANE_CAPTURE_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
+pub const DEFAULT_PANE_CAPTURE_AUTO_DUMPS: usize = 32;
+pub const DEFAULT_PANE_CAPTURE_AUTO_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+
+/// Diagnostic storage knobs. These are intentionally isolated from normal UI
+/// settings because their names and defaults are a deferred diagnostic surface.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DebugConfig {
+    /// Raw PTY bytes retained in memory per live pane. Zero disables capture.
+    pub pane_capture_ring_bytes: usize,
+    /// Nominal raw-byte size of one continuous capture segment.
+    pub pane_capture_file_bytes: usize,
+    /// Maximum completed/in-progress segments retained per pane.
+    pub pane_capture_file_segments: usize,
+    /// Maximum old capture sessions retained beneath an env capture root.
+    pub pane_capture_sessions: usize,
+    /// Maximum aggregate bytes retained beneath an env capture root.
+    pub pane_capture_total_bytes: usize,
+    /// Maximum automatic dump directories retained beneath the dump root.
+    pub pane_capture_auto_dumps: usize,
+    /// Maximum aggregate bytes used by automatic dumps. Manual dumps are not
+    /// silently removed to satisfy this limit.
+    pub pane_capture_auto_total_bytes: usize,
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self {
+            pane_capture_ring_bytes: DEFAULT_PANE_CAPTURE_RING_BYTES,
+            pane_capture_file_bytes: DEFAULT_PANE_CAPTURE_FILE_BYTES,
+            pane_capture_file_segments: DEFAULT_PANE_CAPTURE_FILE_SEGMENTS,
+            pane_capture_sessions: DEFAULT_PANE_CAPTURE_SESSIONS,
+            pane_capture_total_bytes: DEFAULT_PANE_CAPTURE_TOTAL_BYTES,
+            pane_capture_auto_dumps: DEFAULT_PANE_CAPTURE_AUTO_DUMPS,
+            pane_capture_auto_total_bytes: DEFAULT_PANE_CAPTURE_AUTO_TOTAL_BYTES,
+        }
+    }
 }
 
 /// Optional command-line values applied on top of a loaded [`Config`].

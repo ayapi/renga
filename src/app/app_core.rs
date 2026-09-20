@@ -53,6 +53,7 @@ impl App {
             preview_width: 40,
             layout_swapped: true,
             status_bar_visible: true,
+            pane_capture_status: None,
             dragging: None,
             hover_border: None,
             last_tab_rects: Vec::new(),

@@ -268,7 +268,6 @@ fn main() -> Result<()> {
 }
 
 fn run_tui(cli: cli::Cli) -> Result<()> {
-    let _pane_capture_shutdown = pane_capture::startup();
     // Install panic hook to restore terminal state on crash
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
@@ -354,6 +353,7 @@ fn run_tui(cli: cli::Cli) -> Result<()> {
         ui_file_tree: cli.file_tree_override(),
         shell_program: cli.shell.clone(),
     });
+    let _pane_capture_shutdown = pane_capture::startup(&user_config.debug);
     // Install the pane-shell override before the first pane spawns.
     // Must come after the CLI merge so `--shell` beats `[shell]
     // program`, and before App::new so the initial pane sees it.

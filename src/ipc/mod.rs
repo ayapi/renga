@@ -155,6 +155,15 @@ pub enum Request {
         #[serde(default)]
         include_cursor: bool,
     },
+    /// Dump one pane, or every pane in the caller's tab, from the always-on
+    /// in-memory capture ring. Exactly one of `target` and `all` is required.
+    DumpPaneCapture {
+        from_pane: usize,
+        #[serde(default)]
+        target: Option<PaneRef>,
+        #[serde(default)]
+        all: bool,
+    },
     /// List peers visible from the caller's pane. Scope is always
     /// "panes in the same workspace as `from_pane`, excluding
     /// `from_pane` itself". Used by the bundled MCP peer server
@@ -529,6 +538,8 @@ pub mod err_code {
     /// per-pane cap (256 Unicode scalar values). The caller should
     /// either truncate the summary or send an empty string to clear.
     pub const SUMMARY_TOO_LONG: &str = "summary_too_long";
+    /// The on-demand pane capture could not be snapshotted or written.
+    pub const PANE_CAPTURE_DUMP_FAILED: &str = "pane_capture_dump_failed";
     /// The target is not ready and its bounded pre-registration peer
     /// inbox cannot accept another message.
     pub const PEER_QUEUE_FULL: &str = "peer_queue_full";

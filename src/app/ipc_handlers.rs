@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::{Arc, Mutex};
 
 impl App {
     pub(crate) fn handle_app_command(&mut self, cmd: AppCommand) {
@@ -83,6 +84,51 @@ impl App {
             } => {
                 let result = self.handle_inspect(&target, lines, include_cursor);
                 let _ = reply.send(result);
+            }
+            AppCommand::DumpPaneCapture {
+                from_pane,
+                target,
+                all,
+                reply,
+            } => {
+                let captures = self.resolve_pane_capture_dump(from_pane, target.as_ref(), all);
+                match captures {
+                    Ok(captures) => {
+                        let reply = Arc::new(Mutex::new(Some(reply)));
+                        let worker_reply = reply.clone();
+                        let start =
+                            crate::pane_capture::dump_captures_async(captures, move |result| {
+                                let result = result.map_err(|error| {
+                                    ipc::CodedError::new(
+                                        ipc::err_code::PANE_CAPTURE_DUMP_FAILED,
+                                        error,
+                                    )
+                                });
+                                if let Some(reply) = worker_reply
+                                    .lock()
+                                    .unwrap_or_else(|value| value.into_inner())
+                                    .take()
+                                {
+                                    let _ = reply.send(result);
+                                }
+                            });
+                        if let Err(error) = start {
+                            if let Some(reply) = reply
+                                .lock()
+                                .unwrap_or_else(|value| value.into_inner())
+                                .take()
+                            {
+                                let _ = reply.send(Err(ipc::CodedError::new(
+                                    ipc::err_code::PANE_CAPTURE_DUMP_FAILED,
+                                    error,
+                                )));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
             }
             AppCommand::Close { target, reply } => {
                 let result = self.handle_close(&target);
@@ -191,6 +237,55 @@ impl App {
                 let _ = reply.send(result);
             }
         }
+    }
+
+    fn resolve_pane_capture_dump(
+        &self,
+        from_pane: usize,
+        target: Option<&PaneRef>,
+        all: bool,
+    ) -> std::result::Result<Vec<Arc<crate::pane_capture::Capture>>, ipc::CodedError> {
+        if all && target.is_some() {
+            return Err(ipc::CodedError::new(
+                ipc::err_code::PANE_CAPTURE_DUMP_FAILED,
+                "target and all cannot be used together",
+            ));
+        }
+        let (workspace_index, _) = self
+            .resolve_pane_across_workspaces(&PaneRef::Id(from_pane))
+            .ok_or_else(|| {
+                ipc::CodedError::new(
+                    ipc::err_code::PANE_NOT_FOUND,
+                    format!("caller pane {from_pane} not found in any workspace"),
+                )
+            })?;
+        let workspace = &self.workspaces[workspace_index];
+        let pane_ids = if all {
+            workspace.layout.collect_pane_ids()
+        } else {
+            let selector = target.cloned().unwrap_or(PaneRef::Focused);
+            vec![workspace.resolve_pane_ref(&selector).ok_or_else(|| {
+                ipc::CodedError::new(
+                    ipc::err_code::PANE_NOT_FOUND,
+                    format!("pane not found in caller tab: {selector:?}"),
+                )
+            })?]
+        };
+        pane_ids
+            .into_iter()
+            .map(|pane_id| {
+                workspace
+                    .panes
+                    .get(&pane_id)
+                    .and_then(|pane| pane.capture.clone())
+                    .ok_or_else(|| {
+                        ipc::CodedError::new(
+                            ipc::err_code::PANE_CAPTURE_DUMP_FAILED,
+                            format!("pane {pane_id} capture is disabled"),
+                        )
+                    })
+            })
+            .collect()
     }
 
     /// Resolve `from_pane` to its workspace, then return every other

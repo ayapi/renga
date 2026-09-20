@@ -268,67 +268,6 @@ fn table(
     }
 }
 
-/// Locate erase commands and printable payload runs, excluding CSI/OSC/DCS
-/// housekeeping. A home or cursor-hide after an erase is not a rewrite byte.
-fn repaint_tokens(bytes: &[u8]) -> (Vec<std::ops::Range<usize>>, Vec<usize>) {
-    let mut erases = Vec::new();
-    let mut payloads = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == 0x1b {
-            let start = index;
-            index += 1;
-            let Some(&command) = bytes.get(index) else {
-                break;
-            };
-            index += 1;
-            match command {
-                b'[' => {
-                    while index < bytes.len() && !(0x40..=0x7e).contains(&bytes[index]) {
-                        index += 1;
-                    }
-                    if index < bytes.len() {
-                        index += 1;
-                    }
-                    if matches!(&bytes[start..index], b"\x1b[2J" | b"\x1b[3J") {
-                        erases.push(start..index);
-                    }
-                }
-                b']' | b'P' | b'X' | b'^' | b'_' => {
-                    while index < bytes.len() {
-                        if command == b']' && bytes[index] == 7 {
-                            index += 1;
-                            break;
-                        }
-                        if bytes[index..].starts_with(b"\x1b\\") {
-                            index += 2;
-                            break;
-                        }
-                        index += 1;
-                    }
-                }
-                0x20..=0x2f => {
-                    while index < bytes.len() && (0x20..=0x2f).contains(&bytes[index]) {
-                        index += 1;
-                    }
-                    if index < bytes.len() {
-                        index += 1;
-                    }
-                }
-                _ => {}
-            }
-        } else if bytes[index] >= 0x20 && bytes[index] != 0x7f {
-            payloads.push(index);
-            while index < bytes.len() && bytes[index] >= 0x20 && bytes[index] != 0x7f {
-                index += 1;
-            }
-        } else {
-            index += 1;
-        }
-    }
-    (erases, payloads)
-}
-
 fn erase_hold_close(records: &[Value], erase_offset: usize) -> Option<(usize, &Value)> {
     let is_transition = |record: &Value, action: &str| {
         record["event"] == "transition"
@@ -405,7 +344,7 @@ fn erase_rewrite_table(
     draws: &[Snapshot],
     gap_us: u64,
 ) -> Result<()> {
-    let (erases, payloads) = repaint_tokens(binary);
+    let (erases, payloads) = super::repaint_tokens(binary);
     let resize_cuts: Vec<_> = records
         .iter()
         .enumerate()

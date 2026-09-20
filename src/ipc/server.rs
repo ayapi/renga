@@ -666,6 +666,40 @@ fn dispatch_request_with_registry(
                 }
             }
         }
+        Request::DumpPaneCapture {
+            from_pane,
+            target,
+            all,
+        } => {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if enqueue_app_command(
+                command_tx,
+                AppCommand::DumpPaneCapture {
+                    from_pane,
+                    target,
+                    all,
+                    reply: reply_tx,
+                },
+            )
+            .is_err()
+            {
+                return Response::err_coded(err_code::SHUTTING_DOWN, "app shutting down");
+            }
+            match reply_rx.recv_timeout(APP_REPLY_TIMEOUT) {
+                Ok(Ok(report)) => match serde_json::to_value(report) {
+                    Ok(value) => Response::ok_value(value),
+                    Err(error) => Response::err_coded(
+                        err_code::INTERNAL,
+                        format!("serialize pane capture report: {error}"),
+                    ),
+                },
+                Ok(Err(error)) => error.into_response(),
+                Err(error) => Response::err_coded(
+                    err_code::APP_TIMEOUT,
+                    format!("app did not respond: {error}"),
+                ),
+            }
+        }
         Request::PeerList { from_pane } => {
             let (reply_tx, reply_rx) = oneshot::channel();
             if enqueue_app_command(

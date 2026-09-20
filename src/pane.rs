@@ -1385,7 +1385,7 @@ impl SynchronizedOutputStream {
         self.capture_cursor = self.capture_offset;
         let mut flushed = Vec::new();
 
-        self.flush_expired_for_read(now, &mut flushed);
+        self.flush_expired_for_read(now, data, &mut flushed);
 
         let markers = self.markers_in(data);
         let mut pass_through = Vec::new();
@@ -1537,7 +1537,7 @@ impl SynchronizedOutputStream {
         self.capture_now = Some(now);
         let mut flushed = Vec::new();
         if self.erase_hold_expired(now) {
-            self.flush_erase_hold(&mut flushed, "tick_release");
+            self.flush_erase_hold(&mut flushed, "tick_release", &[]);
             if let Some(capture) = self.capture.as_ref().filter(|capture| capture.is_enabled()) {
                 let deferred = self.capture_state();
                 capture.set_deferred(deferred.clone());
@@ -1588,7 +1588,7 @@ impl SynchronizedOutputStream {
                 break;
             }
             match self.deferred_kind() {
-                Some(DeferredOutputKind::Erase) => self.flush_erase_hold(flushed, "byte_cap"),
+                Some(DeferredOutputKind::Erase) => self.flush_erase_hold(flushed, "byte_cap", &[]),
                 Some(DeferredOutputKind::Synchronized) => {
                     self.flush_all_deferred(flushed, "byte_cap")
                 }
@@ -1597,7 +1597,12 @@ impl SynchronizedOutputStream {
         }
     }
 
-    fn flush_expired_for_read(&mut self, now: Instant, flushed: &mut Vec<Vec<u8>>) {
+    fn flush_expired_for_read(
+        &mut self,
+        now: Instant,
+        incoming: &[u8],
+        flushed: &mut Vec<Vec<u8>>,
+    ) {
         loop {
             let expired = match self.deferred.as_ref() {
                 Some(DeferredOutput::Synchronized(frame)) => {
@@ -1612,7 +1617,9 @@ impl SynchronizedOutputStream {
                 break;
             }
             match self.deferred_kind() {
-                Some(DeferredOutputKind::Erase) => self.flush_erase_hold(flushed, "timeout"),
+                Some(DeferredOutputKind::Erase) => {
+                    self.flush_erase_hold(flushed, "timeout", incoming)
+                }
                 Some(DeferredOutputKind::Synchronized) => {
                     self.flush_all_deferred(flushed, "timeout")
                 }
@@ -1629,7 +1636,24 @@ impl SynchronizedOutputStream {
         )
     }
 
-    fn flush_erase_hold(&mut self, flushed: &mut Vec<Vec<u8>>, reason: &'static str) {
+    fn flush_erase_hold(
+        &mut self,
+        flushed: &mut Vec<Vec<u8>>,
+        reason: &'static str,
+        following_bytes: &[u8],
+    ) {
+        let automatic_dump = matches!(reason, "tick_release" | "timeout" | "byte_cap")
+            && matches!(
+                self.deferred.as_ref(),
+                Some(DeferredOutput::Erase(hold))
+                    if if following_bytes.is_empty() {
+                        crate::pane_capture::erase_hold_closed_before_rewrite(&hold.bytes)
+                    } else {
+                        let mut observed = hold.bytes.clone();
+                        observed.extend_from_slice(following_bytes);
+                        crate::pane_capture::erase_hold_closed_before_rewrite(&observed)
+                    }
+            );
         self.capture_transition(
             "close",
             "erase_hold",
@@ -1637,6 +1661,14 @@ impl SynchronizedOutputStream {
             self.capture_cursor,
             Some(reason),
         );
+        if automatic_dump {
+            if let Some(capture) = self.capture.as_ref().filter(|capture| capture.is_enabled()) {
+                capture.automatic_dump(
+                    self.capture_now.unwrap_or_else(Instant::now),
+                    "erase_without_rewrite",
+                );
+            }
+        }
         let Some(DeferredOutput::Erase(mut hold)) = self.deferred.take() else {
             return;
         };
@@ -2831,17 +2863,21 @@ mod tests {
     }
 
     #[test]
-    fn debug_capture_unwritable_path_preserves_reader_output() {
+    fn continuous_capture_failure_preserves_ring_and_reader_output() {
         use crate::pane_capture::{test_config, with_test_config};
         let config = test_config("unwritable", Instant::now());
         let _cleanup = crate::pane_capture::TestCaptureCleanup::new(&config);
+        std::fs::create_dir_all(&config.dump_root).unwrap();
         std::fs::write(&config.directory, b"regular file").unwrap();
         let failures = crate::pane_capture::failure_count();
         let mut harness = with_test_config(Some(config.clone()), ReaderHarness::new);
         let capture = harness.capture();
         capture.flush();
-        assert!(!capture.is_enabled());
-        assert!(crate::pane_capture::failure_count() > failures);
+        assert!(capture.is_enabled());
+        assert!(wait_for(
+            || crate::pane_capture::failure_count() > failures,
+            Duration::from_secs(1)
+        ));
         harness.send(b"unchanged");
         assert_eq!(harness.recv_output(), 9);
         assert_eq!(harness.screen(), "unchanged");
@@ -2966,6 +3002,59 @@ mod tests {
         assert!(records
             .iter()
             .any(|record| record["action"] == "promote" && record["reason"] == "erase_conversion"));
+    }
+
+    #[test]
+    fn automatic_dump_ignores_cap_release_after_rewrite_and_captures_erase_only() {
+        use crate::pane_capture::test_config;
+        let origin = Instant::now();
+        let mut config = test_config("auto-negative", origin);
+        config.continuous_directory = None;
+        let _cleanup = crate::pane_capture::TestCaptureCleanup::new(&config);
+        let capture = Capture::create(config.clone(), 91, None, 8, 80).unwrap();
+        let mut stream = SynchronizedOutputStream {
+            capture: Some(capture.clone()),
+            ..Default::default()
+        };
+        let automatic_count = || {
+            std::fs::read_dir(&config.dump_root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| {
+                    entry.file_name().to_string_lossy().starts_with("auto-")
+                        && entry.path().join(".complete").is_file()
+                })
+                .count()
+        };
+
+        let ordinary = b"\x1b[2J\x1b[Hrewritten";
+        assert!(stream.push(ordinary, origin).is_empty());
+        assert_eq!(
+            stream.flush_expired_erase_hold(origin + ERASE_OUTPUT_HOLD),
+            vec![ordinary.to_vec()]
+        );
+        capture.flush();
+        assert_eq!(automatic_count(), 0);
+
+        let erase_only = b"\x1b[2J\x1b[H\x1b[?25l";
+        let second = origin + Duration::from_secs(1);
+        assert!(stream.push(erase_only, second).is_empty());
+        assert_eq!(
+            stream.flush_expired_erase_hold(second + ERASE_OUTPUT_HOLD),
+            vec![erase_only.to_vec()]
+        );
+        capture.flush();
+        assert!(wait_for(|| automatic_count() == 1, Duration::from_secs(2)));
+
+        let third = origin + Duration::from_secs(2);
+        assert!(stream.push(erase_only, third).is_empty());
+        assert_eq!(
+            stream.flush_expired_erase_hold(third + ERASE_OUTPUT_HOLD),
+            vec![erase_only.to_vec()]
+        );
+        capture.flush();
+        assert_eq!(automatic_count(), 1);
     }
 
     impl Drop for ReaderHarness {

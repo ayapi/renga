@@ -116,6 +116,14 @@ pub enum AppCommand {
         include_cursor: bool,
         reply: oneshot::Sender<std::result::Result<serde_json::Value, ipc::CodedError>>,
     },
+    /// Start an asynchronous dump without making the UI thread wait on disk.
+    DumpPaneCapture {
+        from_pane: usize,
+        target: Option<PaneRef>,
+        all: bool,
+        reply:
+            oneshot::Sender<std::result::Result<crate::pane_capture::DumpReport, ipc::CodedError>>,
+    },
     /// Close the target pane. Returns the id of the pane that was
     /// closed, so the caller can confirm which pane was resolved.
     Close {
@@ -230,6 +238,8 @@ pub enum AppEvent {
     PtyEof(usize),
     /// Shell changed working directory (pane_id, new path).
     CwdChanged(usize, PathBuf),
+    /// Completion text for an Alt+Shift+C capture dump.
+    PaneCaptureDumped(String),
 }
 
 /// Flag-preloaded launch command for `renga split --role claude` and
@@ -300,6 +310,9 @@ pub struct App {
     pub layout_swapped: bool,
     // Toggle status bar visibility (Alt+S)
     pub status_bar_visible: bool,
+    /// Last on-demand pane-capture outcome. Rendered by renga itself so the
+    /// diagnostic never writes into the child terminal.
+    pub(crate) pane_capture_status: Option<String>,
     // Drag/hover state
     pub dragging: Option<DragTarget>,
     pub hover_border: Option<DragTarget>,

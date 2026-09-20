@@ -116,6 +116,10 @@ impl App {
                     had_visible_output = true;
                     self.copy_to_clipboard(&text);
                 }
+                AppEvent::PaneCaptureDumped(status) => {
+                    self.pane_capture_status = Some(status);
+                    had_state_change = true;
+                }
             }
         }
         if had_state_change || had_visible_output {
@@ -218,6 +222,9 @@ impl App {
             AppCommand::Split { target, .. } => ("split", resolve(target)),
             AppCommand::NewTab { .. } => ("new_tab", None),
             AppCommand::Inspect { target, .. } => ("inspect_pane", resolve(target)),
+            AppCommand::DumpPaneCapture { from_pane, .. } => {
+                ("dump_pane_capture", Some(*from_pane))
+            }
             AppCommand::Close { target, .. } => ("close", resolve(target)),
             AppCommand::PeerList { from_pane, .. } => ("peer_list", Some(*from_pane)),
             AppCommand::PeerSend { target, .. } => ("peer_send", resolve(target)),

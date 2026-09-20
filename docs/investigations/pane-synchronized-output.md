@@ -116,8 +116,35 @@ the field-observed sweep is gone before the separate live field check.
 ## Field capture and replay
 
 The working-Codex field symptom is transcript rows flowing from top to bottom.
-The earlier idle measurements do not establish its cause. Set capture for the
-TUI that will run the workload, then reproduce that workload and quit normally:
+The earlier idle measurements do not establish its cause. Every pane now keeps
+a bounded in-memory capture ring. This steady state creates no capture files.
+Press `Alt+Shift+C` immediately after seeing the symptom, or call the
+`dump_pane_capture` peer tool, to write a manual dump beneath the platform data
+directory (`%LOCALAPPDATA%\renga\pane-captures` on Windows). Manual directories
+are named `manual-<TUI-pid>-<token>` and are never removed silently.
+
+An erase hold that reaches its time/byte cap before the replay classifier finds
+any printable rewrite payload also requests an automatic dump. A cap release
+after rewrite bytes have arrived is the ordinary repaint case and does not
+trigger. A forced ring cut is the other automatic trigger. Each pane has its
+own limiter, driven by the capture's monotonic elapsed clock: at most one dump
+is admitted per pane per 10 minutes. Suppressions are reported in dump metadata
+as `automatic_dump_suppressions`.
+
+Automatic directories are named `auto-<TUI-pid>-<session-token>-<pane>-<n>` and
+contain a renga ownership marker. Cleanup considers only directories with both
+that exact numeric name and marker; it never removes manual directories,
+unmarked directories, or foreign files. By default the oldest automatic dumps
+are removed first to retain at most 32 dumps and 128 MiB total. Configure these
+limits with `[debug].pane_capture_auto_dumps` and
+`[debug].pane_capture_auto_total_bytes`; zero disables automatic persistence.
+With the default 4 MiB raw ring and the forced-cut slack, the raw-byte write
+rate can reach about 30 MiB per pane-hour, or 390 MiB/hour for 13 panes, plus
+JSONL records. The retained automatic data still cannot exceed the configured
+128 MiB total after a writer completes pruning.
+
+For scripted continuous capture, set the legacy environment variable before
+starting the TUI:
 
 ```powershell
 $env:RENGA_DEBUG_PANE_CAPTURE = 'C:\scratch\renga-pane-capture'
@@ -126,9 +153,10 @@ Remove-Item Env:RENGA_DEBUG_PANE_CAPTURE
 ```
 
 On Unix, use `RENGA_DEBUG_PANE_CAPTURE=/tmp/renga-pane-capture renga`.
-The variable is read once on TUI startup. An absent variable creates no capture
-directory, file, writer thread, or capture handle. Tests use a creator-thread
-override that defaults to disabled, irrespective of inherited environment.
+The variable is read once on TUI startup and enables only continuous disk
+output; it is not required for the in-memory ring, manual dumps, or automatic
+signals. Without the variable, startup and ordinary recording perform no file
+system activity.
 
 Each TUI creates a unique `session-<TUI-pid>-<start-token>` subdirectory with
 `pane-<id>.bin` and `pane-<id>.jsonl`. Files use exclusive creation, so multiple

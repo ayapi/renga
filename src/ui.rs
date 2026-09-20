@@ -1881,7 +1881,12 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
 
     // Rename mode overrides focus-specific hints — key input is being
     // captured by the buffer regardless of which pane/panel is focused.
-    let hints = if app.rename_input.is_some() {
+    let hints = if let Some(status) = &app.pane_capture_status {
+        Line::from(Span::styled(
+            format!(" capture: {status}"),
+            Style::default().fg(ACCENT_GREEN),
+        ))
+    } else if app.rename_input.is_some() {
         Line::from(vec![
             Span::styled(" Enter", Style::default().fg(ACCENT_BLUE)),
             Span::styled(m.rename_confirm, Style::default().fg(TEXT_DIM)),
