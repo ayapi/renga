@@ -1731,6 +1731,8 @@ send_message calls may need approval before peer messaging becomes reliable.\n\n
     prompts, banners, or mode indicators in another pane without asking it. Returns plain \
     text by default; pass format=\"grid\" for row-addressable JSON or lines=N to trim to \
     the last N rows.\n\
+    - dump_pane_capture: Write the always-on capture ring for one pane or all panes in the \
+    current tab to replay-compatible files. Pass exactly one of target or all=true.\n\
     - send_keys: Send raw key input (y/n, Shift+Tab, Esc, arrow keys, Ctrl+letters, etc.) to a \
     pane's PTY. Use this to answer interactive prompts or drive a TUI when the target isn't a \
     peer-enabled agent that can read send_message. DISTINCT from send_message, which delivers \
@@ -2032,6 +2034,36 @@ fn tools_spec() -> Value {
                     }
                 },
                 "required": ["target"]
+            }
+        },
+        {
+            "name": "dump_pane_capture",
+            "description": "Write the always-on in-memory capture ring for one pane, or every pane in the caller's current tab, to replay-compatible files. Exactly one selector is required: a non-empty `target`, or `all: true`. Returns the dump directory and per-pane file paths. This diagnostic tool is a deferred-stability surface and may change in a minor release.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Pane to dump. Numeric id, stable name, or the literal 'focused'. Cannot be combined with `all`."
+                    },
+                    "all": {
+                        "type": "boolean",
+                        "const": true,
+                        "description": "Set to true to dump every pane in the caller's current tab. Cannot be combined with `target`."
+                    }
+                },
+                "oneOf": [
+                    {
+                        "required": ["target"],
+                        "not": { "required": ["all"] }
+                    },
+                    {
+                        "required": ["all"],
+                        "not": { "required": ["target"] }
+                    }
+                ],
+                "additionalProperties": false
             }
         },
         {
@@ -2752,6 +2784,7 @@ fn handle_tools_call(id: &Value, params: &Value, ctx: &PeerCtx) -> Result<Value>
         "focus_pane" => handle_focus_pane(id, &args, ctx),
         "new_tab" => handle_new_tab(id, &args, ctx),
         "inspect_pane" => handle_inspect_pane(id, &args, ctx),
+        "dump_pane_capture" => handle_dump_pane_capture(id, &args, ctx),
         "send_keys" => handle_send_keys(id, &args, ctx),
         "poll_events" => handle_poll_events(id, &args, ctx),
         "set_pane_identity" => handle_set_pane_identity(id, &args, ctx),
@@ -3955,6 +3988,125 @@ fn handle_inspect_pane(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
         Ok(other) => err_response(id, -32603, &format!("unexpected renga response: {other:?}")),
         Err(e) => err_response(id, -32603, &format!("renga call failed: {e}")),
     }
+}
+
+// ── pane capture dump ─────────────────────────────────────────
+
+fn handle_dump_pane_capture(id: &Value, args: &Value, ctx: &PeerCtx) -> Value {
+    handle_dump_pane_capture_with_request(id, args, ctx, client::send_request)
+}
+
+fn handle_dump_pane_capture_with_request<F>(
+    id: &Value,
+    args: &Value,
+    ctx: &PeerCtx,
+    send_request: F,
+) -> Value
+where
+    F: FnOnce(&EndpointName, &Request) -> Result<Response>,
+{
+    let raw_target = match args.get("target") {
+        None => None,
+        Some(Value::String(target)) if !target.trim().is_empty() => Some(target.as_str()),
+        Some(Value::String(_)) => {
+            return err_response(
+                id,
+                -32602,
+                "dump_pane_capture requires a non-empty `target`",
+            );
+        }
+        Some(_) => {
+            return err_response(id, -32602, "dump_pane_capture `target` must be a string");
+        }
+    };
+    let all = match args.get("all") {
+        None => None,
+        Some(Value::Bool(all)) => Some(*all),
+        Some(_) => {
+            return err_response(id, -32602, "dump_pane_capture `all` must be a boolean");
+        }
+    };
+    if raw_target.is_some() && all.is_some() {
+        return err_response(
+            id,
+            -32602,
+            "dump_pane_capture accepts exactly one of `target` or `all: true`",
+        );
+    }
+    if raw_target.is_none() && all != Some(true) {
+        return err_response(
+            id,
+            -32602,
+            "dump_pane_capture requires exactly one of `target` or `all: true`",
+        );
+    }
+
+    let (caller_pane, endpoint) = match require_connected(ctx, id, "dump pane capture") {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    let request = Request::DumpPaneCapture {
+        from_pane: caller_pane,
+        target: raw_target.map(|target| parse_target(Some(target))),
+        all: all == Some(true),
+    };
+    match send_request(endpoint, &request) {
+        Ok(Response::Ok { data }) => match format_dump_pane_capture_result(&data) {
+            Ok(text) => ok_response(
+                id,
+                json!({
+                    "content": [ { "type": "text", "text": text } ],
+                    "isError": false,
+                    "structuredContent": data,
+                }),
+            ),
+            Err(message) => err_response(id, -32603, &message),
+        },
+        Ok(Response::Err { message, code }) => err_response(
+            id,
+            -32603,
+            &format!(
+                "renga refused dump_pane_capture: {}",
+                fmt_code(&message, &code)
+            ),
+        ),
+        Ok(other) => err_response(id, -32603, &format!("unexpected renga response: {other:?}")),
+        Err(error) => err_response(id, -32603, &format!("renga call failed: {error}")),
+    }
+}
+
+fn format_dump_pane_capture_result(data: &Value) -> std::result::Result<String, String> {
+    let directory = data
+        .get("directory")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "decode dump_pane_capture result: missing directory".to_string())?;
+    let panes = data
+        .get("panes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "decode dump_pane_capture result: missing panes".to_string())?;
+    let mut text = format!("Pane capture saved to {directory}");
+    for pane in panes {
+        let pane_id = pane
+            .get("pane_id")
+            .and_then(Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let status = pane
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        text.push_str(&format!("\n- pane {pane_id}: {status}"));
+        if let Some(path) = pane.get("bin_path").and_then(Value::as_str) {
+            text.push_str(&format!("\n  binary: {path}"));
+        }
+        if let Some(path) = pane.get("jsonl_path").and_then(Value::as_str) {
+            text.push_str(&format!("\n  events: {path}"));
+        }
+        if let Some(reason) = pane.get("reason").and_then(Value::as_str) {
+            text.push_str(&format!("\n  reason: {reason}"));
+        }
+    }
+    Ok(text)
 }
 
 // ── send_keys (raw PTY key input over MCP) ────────────────────
@@ -5436,6 +5588,7 @@ mod tests {
             "focus_pane",
             "new_tab",
             "inspect_pane",
+            "dump_pane_capture",
             "send_keys",
             "poll_events",
         ] {
@@ -6825,6 +6978,97 @@ Commands:
     }
 
     // ── send_keys unit tests ──────────────────────────────────
+
+    #[test]
+    fn dump_pane_capture_schema_exposes_exclusive_selectors() {
+        let spec = tools_spec();
+        let dump = spec
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("dump_pane_capture"))
+            .expect("dump_pane_capture entry");
+        let schema = dump.get("inputSchema").expect("input schema");
+        assert_eq!(
+            schema.pointer("/properties/target/type"),
+            Some(&json!("string"))
+        );
+        assert_eq!(schema.pointer("/properties/all/const"), Some(&json!(true)));
+        assert_eq!(
+            schema.get("oneOf").and_then(Value::as_array).map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn handle_dump_pane_capture_rejects_missing_selector() {
+        let response = handle_dump_pane_capture(&json!(1), &json!({}), &detached_ctx("unused"));
+        assert_eq!(
+            response.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32602)
+        );
+    }
+
+    #[test]
+    fn handle_dump_pane_capture_rejects_target_with_all() {
+        let response = handle_dump_pane_capture(
+            &json!(1),
+            &json!({ "target": "2", "all": true }),
+            &detached_ctx("unused"),
+        );
+        assert_eq!(
+            response.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32602)
+        );
+    }
+
+    #[test]
+    fn handle_dump_pane_capture_maps_successful_ipc_request() {
+        let ctx = connected_ctx_with(new_event_sink());
+        let mut sent = None;
+        let response = handle_dump_pane_capture_with_request(
+            &json!(7),
+            &json!({ "target": "worker" }),
+            &ctx,
+            |_, request| {
+                sent = Some(request.clone());
+                Ok(Response::Ok {
+                    data: json!({
+                        "directory": "C:/captures/manual-1",
+                        "panes": [{
+                            "pane_id": 2,
+                            "status": "ok",
+                            "bin_path": "C:/captures/manual-1/pane-2.bin",
+                            "jsonl_path": "C:/captures/manual-1/pane-2.jsonl",
+                            "retained_raw_bytes": 12,
+                            "retained_records": 3,
+                            "first_retained_elapsed_us": 10,
+                            "last_retained_elapsed_us": 20
+                        }]
+                    }),
+                })
+            },
+        );
+        assert_eq!(
+            sent,
+            Some(Request::DumpPaneCapture {
+                from_pane: 1,
+                target: Some(PaneRef::Name("worker".to_string())),
+                all: false,
+            })
+        );
+        let text = response
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .expect("success text");
+        assert!(text.contains("C:/captures/manual-1"), "{text}");
+        assert!(text.contains("pane-2.bin"), "{text}");
+        assert!(text.contains("pane-2.jsonl"), "{text}");
+        assert_eq!(
+            response.pointer("/result/structuredContent/panes/0/pane_id"),
+            Some(&json!(2))
+        );
+    }
 
     #[test]
     fn translate_key_maps_common_named_keys() {
@@ -8855,6 +9099,7 @@ Commands:
             ("focus_pane", json!({ "target": "1" })),
             ("new_tab", json!({})),
             ("inspect_pane", json!({ "target": "1" })),
+            ("dump_pane_capture", json!({ "target": "1" })),
             ("send_keys", json!({ "target": "1", "text": "y" })),
             ("poll_events", json!({ "timeout_ms": 0 })),
         ] {

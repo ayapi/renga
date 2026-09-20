@@ -6,6 +6,14 @@ impl App {
     }
 
     pub(crate) fn drain_pty_events_at(&mut self, now: Instant) -> bool {
+        if self
+            .pane_capture_status
+            .as_ref()
+            .is_some_and(|(_, expires_at)| now >= *expires_at)
+        {
+            self.pane_capture_status = None;
+            self.dirty = true;
+        }
         // Erase-keyed output produces no event while held, so this pass must
         // run independently of `dirty` and before draining the channel. Its
         // generated PtyOutput is then counted and gated exactly like reader
@@ -117,7 +125,7 @@ impl App {
                     self.copy_to_clipboard(&text);
                 }
                 AppEvent::PaneCaptureDumped(status) => {
-                    self.pane_capture_status = Some(status);
+                    self.pane_capture_status = Some((status, now + PANE_CAPTURE_STATUS_TTL));
                     had_state_change = true;
                 }
             }

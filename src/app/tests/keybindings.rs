@@ -11,6 +11,32 @@ fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
 }
 
 #[test]
+fn alt_shift_c_uses_the_focused_capture_path() {
+    let mut config = crate::pane_capture::test_config("capture-key", Instant::now());
+    let _cleanup = crate::pane_capture::TestCaptureCleanup::new(&config);
+    config.ring_bytes = 0;
+    config.continuous_directory = None;
+    let mut app =
+        crate::pane_capture::with_test_config(Some(config), || App::new(40, 80).expect("App::new"));
+
+    let consumed = app
+        .handle_key_event(key(
+            KeyCode::Char('c'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ))
+        .expect("Alt+Shift+C");
+
+    assert!(consumed, "Alt+Shift+C must be consumed by renga");
+    assert!(
+        app.pane_capture_status
+            .as_ref()
+            .is_some_and(|(status, _)| status.contains("disabled by ring_bytes = 0")),
+        "key path must report why no capture was written"
+    );
+    app.shutdown();
+}
+
+#[test]
 fn alt_d_splits_vertically_and_alt_e_horizontally() {
     let mut app = App::new(40, 120).expect("App::new");
     assert_eq!(app.ws().layout.pane_count(), 1);

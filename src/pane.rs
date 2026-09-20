@@ -10,7 +10,10 @@ use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 use crate::app::AppEvent;
-use crate::pane_capture::{Capture, Data as CaptureData, DeferredState};
+use crate::pane_capture::{
+    Capture, Data as CaptureData, DeferredState, DEFERRED_KIND_DEC2026, DEFERRED_KIND_ERASE_HOLD,
+    DEFERRED_KIND_NONE,
+};
 
 const MOUSE_PROTOCOL_CACHE_TTL: Duration = Duration::from_secs(2);
 
@@ -1341,13 +1344,17 @@ enum DeferredOutputKind {
 impl SynchronizedOutputStream {
     fn capture_state(&self) -> DeferredState {
         let (kind, started, buffered_len) = match &self.deferred {
-            Some(DeferredOutput::Synchronized(frame)) => {
-                ("dec2026", Some(frame.started_at), frame.bytes.len())
-            }
-            Some(DeferredOutput::Erase(hold)) => {
-                ("erase_hold", Some(hold.started_at), hold.bytes.len())
-            }
-            None => ("none", None, 0),
+            Some(DeferredOutput::Synchronized(frame)) => (
+                DEFERRED_KIND_DEC2026,
+                Some(frame.started_at),
+                frame.bytes.len(),
+            ),
+            Some(DeferredOutput::Erase(hold)) => (
+                DEFERRED_KIND_ERASE_HOLD,
+                Some(hold.started_at),
+                hold.bytes.len(),
+            ),
+            None => (DEFERRED_KIND_NONE, None, 0),
         };
         DeferredState {
             kind,
@@ -1410,7 +1417,7 @@ impl SynchronizedOutputStream {
                 (None, OutputMarker::SynchronizedBegin) => {
                     self.capture_transition(
                         "open",
-                        "dec2026",
+                        DEFERRED_KIND_DEC2026,
                         Some(marker_match.name),
                         marker_offset,
                         None,
@@ -1425,7 +1432,7 @@ impl SynchronizedOutputStream {
                 (None, OutputMarker::Erase) => {
                     self.capture_transition(
                         "open",
-                        "erase_hold",
+                        DEFERRED_KIND_ERASE_HOLD,
                         Some(marker_match.name),
                         marker_offset,
                         None,
@@ -1456,7 +1463,7 @@ impl SynchronizedOutputStream {
                     if opened {
                         self.capture_transition(
                             "open",
-                            "dec2026",
+                            DEFERRED_KIND_DEC2026,
                             Some(marker_match.name),
                             marker_offset,
                             Some("inside_erase_hold"),
@@ -1468,7 +1475,7 @@ impl SynchronizedOutputStream {
                     if self.capture_nested_begin.is_some() {
                         self.capture_transition(
                             "close",
-                            "dec2026",
+                            DEFERRED_KIND_DEC2026,
                             Some(marker_match.name),
                             self.capture_offset + marker_match.end as u64,
                             Some("end_marker"),
@@ -1502,7 +1509,7 @@ impl SynchronizedOutputStream {
         if self.capture_nested_begin.take().is_some() {
             self.capture_transition(
                 "close",
-                "dec2026",
+                DEFERRED_KIND_DEC2026,
                 None,
                 self.capture_offset,
                 Some("reader_exit"),
@@ -1656,7 +1663,7 @@ impl SynchronizedOutputStream {
             );
         self.capture_transition(
             "close",
-            "erase_hold",
+            DEFERRED_KIND_ERASE_HOLD,
             None,
             self.capture_cursor,
             Some(reason),
@@ -1675,7 +1682,7 @@ impl SynchronizedOutputStream {
         if let Some((offset, started_at)) = hold.unmatched_synchronized_begin {
             self.capture_transition(
                 "promote",
-                "dec2026",
+                DEFERRED_KIND_DEC2026,
                 Some("dec2026_begin"),
                 self.capture_nested_begin.unwrap_or(self.capture_cursor),
                 Some("erase_conversion"),
@@ -2547,6 +2554,15 @@ mod tests {
         false
     }
 
+    fn assert_count_stays(mut count: impl FnMut() -> usize, expected: usize, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            assert_eq!(count(), expected);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(count(), expected);
+    }
+
     fn escaped_bytes(bytes: &[u8]) -> String {
         let mut out = String::new();
         for &byte in bytes {
@@ -3035,18 +3051,27 @@ mod tests {
             vec![ordinary.to_vec()]
         );
         capture.flush();
-        assert_eq!(automatic_count(), 0);
+        assert_count_stays(&automatic_count, 0, Duration::from_millis(800));
 
-        let erase_only = b"\x1b[2J\x1b[H\x1b[?25l";
+        let erase_before_arriving_rewrite = b"\x1b[2J\x1b[H\x1b[?25l";
+        let arriving_rewrite = b"repaint";
         let second = origin + Duration::from_secs(1);
-        assert!(stream.push(erase_only, second).is_empty());
+        assert!(stream
+            .push(erase_before_arriving_rewrite, second)
+            .is_empty());
+        let released = stream.push(arriving_rewrite, second + ERASE_OUTPUT_HOLD);
         assert_eq!(
-            stream.flush_expired_erase_hold(second + ERASE_OUTPUT_HOLD),
-            vec![erase_only.to_vec()]
+            released.concat(),
+            erase_before_arriving_rewrite
+                .iter()
+                .chain(arriving_rewrite)
+                .copied()
+                .collect::<Vec<_>>()
         );
         capture.flush();
-        assert!(wait_for(|| automatic_count() == 1, Duration::from_secs(2)));
+        assert_count_stays(&automatic_count, 0, Duration::from_millis(800));
 
+        let erase_only = b"\x1b[2J\x1b[H\x1b[?25l";
         let third = origin + Duration::from_secs(2);
         assert!(stream.push(erase_only, third).is_empty());
         assert_eq!(
@@ -3054,7 +3079,16 @@ mod tests {
             vec![erase_only.to_vec()]
         );
         capture.flush();
-        assert_eq!(automatic_count(), 1);
+        assert!(wait_for(|| automatic_count() == 1, Duration::from_secs(2)));
+
+        let fourth = origin + Duration::from_secs(3);
+        assert!(stream.push(erase_only, fourth).is_empty());
+        assert_eq!(
+            stream.flush_expired_erase_hold(fourth + ERASE_OUTPUT_HOLD),
+            vec![erase_only.to_vec()]
+        );
+        capture.flush();
+        assert_count_stays(&automatic_count, 1, Duration::from_millis(800));
     }
 
     impl Drop for ReaderHarness {

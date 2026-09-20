@@ -54,6 +54,8 @@ pub(crate) struct Config {
     pub(crate) total_disk_bytes: usize,
     pub(crate) retained_automatic_dumps: usize,
     pub(crate) automatic_dump_total_bytes: usize,
+    #[cfg(test)]
+    pub(crate) dump_write_delay: Duration,
     session_token: u128,
 }
 
@@ -152,12 +154,16 @@ impl Drop for Shutdown {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct DeferredState {
     pub(crate) kind: &'static str,
     pub(crate) opened_at_elapsed_us: Option<u64>,
     pub(crate) buffered_len: usize,
 }
+
+pub(crate) const DEFERRED_KIND_NONE: &str = "none";
+pub(crate) const DEFERRED_KIND_DEC2026: &str = "dec2026";
+pub(crate) const DEFERRED_KIND_ERASE_HOLD: &str = "erase_hold";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -330,6 +336,11 @@ enum RecorderCommand {
     },
     Snapshot(mpsc::Sender<RingSnapshot>),
     Flush(mpsc::Sender<()>),
+    #[cfg(test)]
+    Block {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -458,7 +469,7 @@ impl RingState {
 
     fn safe_cut_at_or_after(&self, target: u64) -> Option<u64> {
         let mut applied = self.base;
-        let mut prior_deferred = "none";
+        let mut prior_deferred = DEFERRED_KIND_NONE;
         for record in &self.records {
             match &record.data {
                 Data::ParserApply { applied_offset, .. } => applied = *applied_offset,
@@ -469,7 +480,7 @@ impl RingState {
                 } => {
                     if *bin_offset >= target
                         && *bin_offset > self.base
-                        && prior_deferred == "none"
+                        && prior_deferred == DEFERRED_KIND_NONE
                         && applied >= *bin_offset
                     {
                         return Some(*bin_offset);
@@ -748,8 +759,8 @@ impl Capture {
 
     pub(crate) fn set_deferred(&self, deferred: DeferredState) {
         let kind = match deferred.kind {
-            "dec2026_frame" => 1,
-            "erase_hold" => 2,
+            DEFERRED_KIND_DEC2026 => 1,
+            DEFERRED_KIND_ERASE_HOLD => 2,
             _ => 0,
         };
         self.deferred_kind.store(kind, Ordering::Release);
@@ -764,9 +775,9 @@ impl Capture {
     fn deferred(&self) -> DeferredState {
         DeferredState {
             kind: match self.deferred_kind.load(Ordering::Acquire) {
-                1 => "dec2026_frame",
-                2 => "erase_hold",
-                _ => "none",
+                1 => DEFERRED_KIND_DEC2026,
+                2 => DEFERRED_KIND_ERASE_HOLD,
+                _ => DEFERRED_KIND_NONE,
             },
             opened_at_elapsed_us: match self.deferred_opened.load(Ordering::Acquire) {
                 u64::MAX => None,
@@ -944,6 +955,11 @@ fn recorder_loop(
                     let _ = disk_receive.recv_timeout(Duration::from_millis(900));
                 }
                 let _ = done.send(());
+            }
+            #[cfg(test)]
+            RecorderCommand::Block { entered, release } => {
+                let _ = entered.send(());
+                let _ = release.recv();
             }
         }
     }
@@ -1133,7 +1149,7 @@ fn continuous_writer_loop(
     let mut part = 0;
     let mut base = 0;
     let mut applied = 0;
-    let mut deferred_kind = "none";
+    let mut deferred_kind = DEFERRED_KIND_NONE;
     let mut writer = open_segment(
         directory,
         pane_id,
@@ -1149,7 +1165,7 @@ fn continuous_writer_loop(
         match command {
             DiskCommand::Record(record) => {
                 if let Data::Read { bin_offset, .. } = &record.data {
-                    let safe = deferred_kind == "none" && applied >= *bin_offset;
+                    let safe = deferred_kind == DEFERRED_KIND_NONE && applied >= *bin_offset;
                     let hard = writer.raw_written
                         > config
                             .file_bytes
@@ -1333,17 +1349,22 @@ pub(crate) fn dump_captures(captures: Vec<Arc<Capture>>) -> Result<DumpReport, S
             continue;
         }
         match capture.snapshot_until(deadline) {
-            Ok(snapshot) => match write_snapshot(
-                &directory,
-                &capture.config,
+            Ok(snapshot) => match write_snapshot_until(
+                directory.clone(),
+                capture.config.clone(),
                 capture.pane_id,
                 capture.child_process_id,
                 snapshot,
-                None,
+                deadline,
             ) {
                 Ok(report) => panes.push(report),
-                Err(error) => {
-                    panes.push(failed_dump(capture.pane_id, "failed", &error.to_string()))
+                Err(DeadlineWriteError::TimedOut) => panes.push(failed_dump(
+                    capture.pane_id,
+                    "timed_out",
+                    "dump deadline exceeded",
+                )),
+                Err(DeadlineWriteError::Failed(error)) => {
+                    panes.push(failed_dump(capture.pane_id, "failed", &error))
                 }
             },
             Err(reason) => panes.push(failed_dump(
@@ -1361,6 +1382,104 @@ pub(crate) fn dump_captures(captures: Vec<Arc<Capture>>) -> Result<DumpReport, S
         directory: directory.to_string_lossy().into_owned(),
         panes,
     })
+}
+
+enum DeadlineWriteError {
+    TimedOut,
+    Failed(String),
+}
+
+fn write_snapshot_until(
+    directory: PathBuf,
+    config: Arc<Config>,
+    pane_id: usize,
+    child_process_id: Option<u32>,
+    snapshot: RingSnapshot,
+    deadline: Instant,
+) -> Result<PaneDumpReport, DeadlineWriteError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(DeadlineWriteError::TimedOut);
+    }
+    let staging_directory = directory.join(format!(".pane-{pane_id}-pending"));
+    let worker_staging_directory = staging_directory.clone();
+    let (done, receive) = mpsc::sync_channel(0);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = cancelled.clone();
+    let spawn = std::thread::Builder::new()
+        .name(format!("capture-dump-write-{pane_id}"))
+        .spawn(move || {
+            #[cfg(test)]
+            {
+                let delay_deadline = Instant::now() + config.dump_write_delay;
+                while Instant::now() < delay_deadline {
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(
+                        Duration::from_millis(10)
+                            .min(delay_deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+            }
+            if worker_cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            let result = std::fs::create_dir(&worker_staging_directory)
+                .and_then(|()| {
+                    write_snapshot(
+                        &worker_staging_directory,
+                        &config,
+                        pane_id,
+                        child_process_id,
+                        snapshot,
+                        None,
+                    )
+                })
+                .map_err(|error| error.to_string());
+            let failed = result.is_err();
+            let send_failed = done.send(result).is_err();
+            if failed || send_failed {
+                let _ = std::fs::remove_dir_all(&worker_staging_directory);
+            }
+        });
+    if let Err(error) = spawn {
+        return Err(DeadlineWriteError::Failed(error.to_string()));
+    }
+    match receive.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(mut report)) => {
+            if Instant::now() >= deadline {
+                cancelled.store(true, Ordering::Release);
+                let _ = std::fs::remove_dir_all(&staging_directory);
+                return Err(DeadlineWriteError::TimedOut);
+            }
+            let staged_bin = PathBuf::from(report.bin_path.as_deref().unwrap_or_default());
+            let staged_jsonl = PathBuf::from(report.jsonl_path.as_deref().unwrap_or_default());
+            let bin_path = directory.join(format!("pane-{pane_id}.bin"));
+            let jsonl_path = directory.join(format!("pane-{pane_id}.jsonl"));
+            if let Err(error) = std::fs::rename(&staged_bin, &bin_path) {
+                let _ = std::fs::remove_dir_all(&staging_directory);
+                return Err(DeadlineWriteError::Failed(error.to_string()));
+            }
+            if let Err(error) = std::fs::rename(&staged_jsonl, &jsonl_path) {
+                let _ = std::fs::remove_file(&bin_path);
+                let _ = std::fs::remove_dir_all(&staging_directory);
+                return Err(DeadlineWriteError::Failed(error.to_string()));
+            }
+            let _ = std::fs::remove_dir(&staging_directory);
+            report.bin_path = Some(bin_path.to_string_lossy().into_owned());
+            report.jsonl_path = Some(jsonl_path.to_string_lossy().into_owned());
+            Ok(report)
+        }
+        Ok(Err(error)) => Err(DeadlineWriteError::Failed(error)),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            cancelled.store(true, Ordering::Release);
+            Err(DeadlineWriteError::TimedOut)
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(DeadlineWriteError::Failed("dump writer stopped".to_owned()))
+        }
+    }
 }
 
 fn failed_dump(pane_id: usize, status: &'static str, reason: &str) -> PaneDumpReport {
@@ -1703,6 +1822,7 @@ pub(crate) fn test_config(name: &str, origin: Instant) -> Config {
         total_disk_bytes: 1024 * 1024 * 1024,
         retained_automatic_dumps: 32,
         automatic_dump_total_bytes: 128 * 1024 * 1024,
+        dump_write_delay: Duration::ZERO,
         session_token: token as u128,
     }
 }
@@ -1743,6 +1863,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn draw_reports_dec2026_deferred_kind() {
+        let mut config = test_config("draw-dec2026-kind", Instant::now());
+        let _cleanup = TestCaptureCleanup::new(&config);
+        config.continuous_directory = None;
+        let capture = Capture::create(config, 7, None, 3, 8).unwrap();
+        capture.set_deferred(DeferredState {
+            kind: DEFERRED_KIND_DEC2026,
+            opened_at_elapsed_us: Some(17),
+            buffered_len: 15,
+        });
+        capture.draw(true, 0);
+
+        let snapshot = capture
+            .snapshot_until(Instant::now() + Duration::from_secs(1))
+            .expect("snapshot");
+        let deferred = snapshot
+            .records
+            .iter()
+            .find_map(|record| match &record.data {
+                Data::AppDraw { deferred, .. } => Some(deferred),
+                _ => None,
+            });
+        assert_eq!(
+            deferred,
+            Some(&DeferredState {
+                kind: DEFERRED_KIND_DEC2026,
+                opened_at_elapsed_us: Some(17),
+                buffered_len: 15,
+            })
+        );
+    }
+
+    #[test]
+    fn draw_reports_erase_hold_deferred_kind_control() {
+        let mut config = test_config("draw-erase-kind", Instant::now());
+        let _cleanup = TestCaptureCleanup::new(&config);
+        config.continuous_directory = None;
+        let capture = Capture::create(config, 7, None, 3, 8).unwrap();
+        capture.set_deferred(DeferredState {
+            kind: DEFERRED_KIND_ERASE_HOLD,
+            opened_at_elapsed_us: Some(23),
+            buffered_len: 11,
+        });
+        capture.draw(true, 0);
+
+        let snapshot = capture
+            .snapshot_until(Instant::now() + Duration::from_secs(1))
+            .expect("snapshot");
+        let deferred = snapshot
+            .records
+            .iter()
+            .find_map(|record| match &record.data {
+                Data::AppDraw { deferred, .. } => Some(deferred),
+                _ => None,
+            });
+        assert_eq!(
+            deferred,
+            Some(&DeferredState {
+                kind: DEFERRED_KIND_ERASE_HOLD,
+                opened_at_elapsed_us: Some(23),
+                buffered_len: 11,
+            })
+        );
+    }
+
+    #[test]
     fn ring_zero_disables_capture_without_files() {
         let mut config = test_config("disabled", Instant::now());
         let _cleanup = TestCaptureCleanup::new(&config);
@@ -1750,6 +1936,96 @@ mod tests {
         config.continuous_directory = None;
         assert!(Capture::create(config.clone(), 1, None, 3, 8).is_none());
         assert!(!config.directory.exists());
+    }
+
+    #[test]
+    fn always_on_ring_does_not_write_until_requested() {
+        let origin = Instant::now();
+        let mut config = test_config("ring-only", origin);
+        let _cleanup = TestCaptureCleanup::new(&config);
+        config.continuous_directory = None;
+        let capture = Capture::create(config.clone(), 3, None, 3, 8).unwrap();
+
+        capture.read(origin, 0, b"hello", DeferredState::default());
+        capture.applied(5);
+        capture.draw(true, 0);
+        capture.flush();
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(!config.dump_root.exists());
+
+        let report = dump_captures(vec![capture]).unwrap();
+        assert_eq!(report.panes[0].status, "ok");
+        assert!(Path::new(report.panes[0].bin_path.as_ref().unwrap()).is_file());
+        assert!(Path::new(report.panes[0].jsonl_path.as_ref().unwrap()).is_file());
+    }
+
+    #[test]
+    fn producer_backlog_stays_capped_and_records_a_gap() {
+        let origin = Instant::now();
+        let mut config = test_config("producer-backlog", origin);
+        let _cleanup = TestCaptureCleanup::new(&config);
+        config.continuous_directory = None;
+        config.ring_bytes = 1024;
+        let capture = Capture::create(config.clone(), 4, None, 3, 8).unwrap();
+        let (entered, entered_receive) = mpsc::channel();
+        let (release, release_receive) = mpsc::channel();
+        capture
+            .sender
+            .send(RecorderCommand::Block {
+                entered,
+                release: release_receive,
+            })
+            .unwrap();
+        entered_receive
+            .recv_timeout(Duration::from_secs(1))
+            .expect("recorder blocked");
+
+        let bytes = vec![b'x'; MAX_PTY_READ_BYTES];
+        for index in 0..100_u64 {
+            capture.read(
+                origin + Duration::from_micros(index),
+                index * MAX_PTY_READ_BYTES as u64,
+                &bytes,
+                DeferredState::default(),
+            );
+        }
+        let backlog_cap = config.ring_bytes.max(MIN_AUXILIARY_BYTES);
+        assert!(capture.queued_bytes.load(Ordering::Acquire) <= backlog_cap);
+        assert!(capture.dropped_records.load(Ordering::Acquire) > 0);
+
+        release.send(()).unwrap();
+        let snapshot = capture
+            .snapshot_until(Instant::now() + Duration::from_secs(1))
+            .expect("snapshot after recorder release");
+        assert!(snapshot.gaps > 0);
+    }
+
+    #[test]
+    fn dump_writer_stall_returns_timed_out_by_deadline() {
+        let origin = Instant::now();
+        let mut config = test_config("writer-deadline", origin);
+        let _cleanup = TestCaptureCleanup::new(&config);
+        config.continuous_directory = None;
+        config.dump_write_delay = DUMP_DEADLINE + Duration::from_secs(1);
+        let capture = Capture::create(config, 5, None, 3, 8).unwrap();
+        capture.read(origin, 0, b"hello", DeferredState::default());
+
+        let started = Instant::now();
+        let report = dump_captures(vec![capture]).unwrap();
+        assert!(started.elapsed() <= DUMP_DEADLINE + Duration::from_millis(500));
+        assert_eq!(report.panes[0].status, "timed_out");
+        assert_eq!(
+            report.panes[0].reason.as_deref(),
+            Some("dump deadline exceeded")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            std::fs::read_dir(&report.directory)
+                .unwrap()
+                .flatten()
+                .count(),
+            0
+        );
     }
 
     #[test]

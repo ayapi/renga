@@ -122,6 +122,8 @@ Press `Alt+Shift+C` immediately after seeing the symptom, or call the
 `dump_pane_capture` peer tool, to write a manual dump beneath the platform data
 directory (`%LOCALAPPDATA%\renga\pane-captures` on Windows). Manual directories
 are named `manual-<TUI-pid>-<token>` and are never removed silently.
+The tool requires one explicit selector: `target` for one pane, or `all: true`
+for every pane in the caller's tab.
 
 An erase hold that reaches its time/byte cap before the replay classifier finds
 any printable rewrite payload also requests an automatic dump. A cap release

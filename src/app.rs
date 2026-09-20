@@ -27,6 +27,7 @@ mod workspace_state;
 pub(crate) use self::app_state::set_ipc_enqueue_timing_test_override;
 pub(crate) use self::app_state::{
     with_ipc_enqueue_timing, AppCommandTiming, SplitOutcome, CLAUDE_PEER_LAUNCH_CMD,
+    PANE_CAPTURE_STATUS_TTL,
 };
 pub use self::app_state::{App, AppCommand, AppEvent};
 #[cfg(test)]

@@ -8,7 +8,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::app::{frame_diagnostics, App, AppEvent};
+use crate::app::{frame_diagnostics, App, AppEvent, PANE_CAPTURE_STATUS_TTL};
 
 /// Drain until the freshly spawned shells stop emitting startup
 /// output, so live PtyOutput can't race the synthetic events these
@@ -29,6 +29,23 @@ fn quiesce(app: &mut App) {
             }
         }
     }
+}
+
+#[test]
+fn pane_capture_status_expires_on_injected_clock() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let shown_at = Instant::now();
+    app.pane_capture_status = Some((
+        "saved capture".to_string(),
+        shown_at + PANE_CAPTURE_STATUS_TTL,
+    ));
+    app.dirty = false;
+
+    app.drain_pty_events_at(shown_at + PANE_CAPTURE_STATUS_TTL);
+
+    assert!(app.pane_capture_status.is_none());
+    assert!(app.dirty, "status expiry must repaint the normal hints");
+    app.shutdown();
 }
 
 #[test]

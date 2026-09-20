@@ -18,6 +18,7 @@ Every global renga chord lives in the `Alt` namespace. Bare `Ctrl+<key>` combina
 | `Alt+Left/Right` | Previous / next tab |
 | `Alt+R` | Rename tab (session only) |
 | `Alt+S` | Toggle status bar |
+| `Alt+Shift+C` | Dump the focused pane's always-on capture ring to replay-compatible `.bin` / `.jsonl` files beneath the platform data directory (`%LOCALAPPDATA%\renga\pane-captures` on Windows). The status bar briefly reports completion or failure. |
 | `Alt+P` | Insert the peer-enabled Claude Code launch command into the focused pane (see [`peer-messaging.md`](./peer-messaging.md)). Silently no-ops when the focused pane is in alt-screen mode (vim, less, lazygit, a running Claude / Codex TUI) or its title contains "claude" — by design, so the command bytes aren't injected as keystrokes into a running TUI. Switch focus to a shell-prompt pane and press again. |
 | `Alt+F` | Toggle file tree |
 | `Alt+O` | Swap preview/terminal layout |
@@ -27,6 +28,12 @@ Every global renga chord lives in the `Alt` namespace. Bare `Ctrl+<key>` combina
 | `Ctrl+;` / `Alt+;` / `Alt+I` | Open IME composition overlay (centered multi-line — see [`ime.md`](./ime.md)). `Alt+;` and `Alt+I` are fallbacks for terminals that swallow `Ctrl+;` (WSL under Windows Terminal, VS Code terminal on Linux, some tmux configs). |
 | `Alt+M` / `Ctrl+Shift+M` | Enter keyboard copy mode on the focused pane (see [Copy mode](#copy-mode-after-altm)) |
 | `Alt+Q` | Quit |
+
+Git Bash binds the legacy `ESC C` sequence through `do-lowercase-version` to
+`capitalize-word`. Some terminals encode `Alt+Shift+C` as that same sequence,
+so renga consumes this rarely used alias for capture. Caps Lock plus `Alt+c`
+can encode identically and may therefore trigger a dump. Automation can use the
+`dump_pane_capture` MCP tool with an explicit `target` or `all: true` instead.
 
 ## Copy mode (after `Alt+M`)
 

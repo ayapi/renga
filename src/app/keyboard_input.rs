@@ -96,12 +96,18 @@ impl App {
                 .get(&pane_id)
                 .and_then(|pane| pane.capture.clone());
             let Some(capture) = capture else {
-                self.pane_capture_status = Some("disabled by ring_bytes = 0".into());
+                self.pane_capture_status = Some((
+                    "disabled by ring_bytes = 0".into(),
+                    Instant::now() + PANE_CAPTURE_STATUS_TTL,
+                ));
                 self.status_bar_visible = true;
                 self.dirty = true;
                 return Ok(true);
             };
-            self.pane_capture_status = Some(format!("dumping pane {pane_id}..."));
+            self.pane_capture_status = Some((
+                format!("dumping pane {pane_id}..."),
+                Instant::now() + PANE_CAPTURE_STATUS_TTL,
+            ));
             self.status_bar_visible = true;
             self.dirty = true;
             let event_tx = self.event_tx.clone();
@@ -114,7 +120,10 @@ impl App {
                     let _ = event_tx.send(AppEvent::PaneCaptureDumped(status));
                 })
             {
-                self.pane_capture_status = Some(format!("dump failed: {error}"));
+                self.pane_capture_status = Some((
+                    format!("dump failed: {error}"),
+                    Instant::now() + PANE_CAPTURE_STATUS_TTL,
+                ));
             }
             return Ok(true);
         }

@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -1876,79 +1878,7 @@ fn render_macos_tip(app: &App, frame: &mut Frame, area: Rect) {
 // ─── Status bar (context-aware) ───────────────────────────
 
 fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
-    let focus = app.ws().focus_target;
-    let m = app.messages();
-
-    // Rename mode overrides focus-specific hints — key input is being
-    // captured by the buffer regardless of which pane/panel is focused.
-    let hints = if let Some(status) = &app.pane_capture_status {
-        Line::from(Span::styled(
-            format!(" capture: {status}"),
-            Style::default().fg(ACCENT_GREEN),
-        ))
-    } else if app.rename_input.is_some() {
-        Line::from(vec![
-            Span::styled(" Enter", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(m.rename_confirm, Style::default().fg(TEXT_DIM)),
-            Span::styled("Esc", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(m.rename_cancel, Style::default().fg(TEXT_DIM)),
-            Span::styled(m.rename_empty_enter_label, Style::default().fg(ACCENT_BLUE)),
-            Span::styled(m.rename_reset, Style::default().fg(TEXT_DIM)),
-        ])
-    } else {
-        match focus {
-            FocusTarget::Preview => Line::from(vec![
-                Span::styled(" Scroll", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.preview_scroll, Style::default().fg(TEXT_DIM)),
-                Span::styled("A-W", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.preview_close, Style::default().fg(TEXT_DIM)),
-                Span::styled("A-O", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.preview_swap, Style::default().fg(TEXT_DIM)),
-                Span::styled("A-Q", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.preview_quit, Style::default().fg(TEXT_DIM)),
-            ]),
-            FocusTarget::FileTree => Line::from(vec![
-                Span::styled(" j/k", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.tree_move, Style::default().fg(TEXT_DIM)),
-                Span::styled("h/l", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.tree_parent_child, Style::default().fg(TEXT_DIM)),
-                Span::styled("Enter", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.tree_open, Style::default().fg(TEXT_DIM)),
-                Span::styled("c/v", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.tree_claude_launch, Style::default().fg(TEXT_DIM)),
-                Span::styled(".", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.tree_hidden, Style::default().fg(TEXT_DIM)),
-                Span::styled("Esc", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.tree_back, Style::default().fg(TEXT_DIM)),
-                Span::styled("A-F", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.tree_close, Style::default().fg(TEXT_DIM)),
-                Span::styled("A-Q", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.tree_quit, Style::default().fg(TEXT_DIM)),
-            ]),
-            FocusTarget::Pane => Line::from(vec![
-                Span::styled(" A-D", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.pane_split_vertical, Style::default().fg(TEXT_DIM)),
-                Span::styled("A-E", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.pane_split_horizontal, Style::default().fg(TEXT_DIM)),
-                Span::styled("A-W", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.pane_close, Style::default().fg(TEXT_DIM)),
-                Span::styled("A-T", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.pane_new_tab, Style::default().fg(TEXT_DIM)),
-                Span::styled("A-R", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.pane_rename_tab, Style::default().fg(TEXT_DIM)),
-                Span::styled("A-F", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.pane_tree, Style::default().fg(TEXT_DIM)),
-                Span::styled("A-O", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.pane_swap, Style::default().fg(TEXT_DIM)),
-                Span::styled("^;/A-;", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.pane_ime, Style::default().fg(TEXT_DIM)),
-                Span::styled("A-P", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.pane_peer_launch, Style::default().fg(TEXT_DIM)),
-                Span::styled("A-Q", Style::default().fg(ACCENT_BLUE)),
-                Span::styled(m.pane_quit, Style::default().fg(TEXT_DIM)),
-            ]),
-        }
-    };
+    let hints = status_bar_hints_at(app, Instant::now());
 
     let status = Paragraph::new(hints).style(Style::default().bg(HEADER_BG));
     frame.render_widget(status, area);
@@ -2026,6 +1956,119 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
                 Paragraph::new(Line::from(right_spans)).style(Style::default().bg(HEADER_BG));
             frame.render_widget(widget, right_rect);
         }
+    }
+}
+
+fn status_bar_hints_at(app: &App, now: Instant) -> Line<'static> {
+    let focus = app.ws().focus_target;
+    let m = app.messages();
+
+    // Modal hints win even while a pane-capture notice is live.
+    if app.rename_input.is_some() {
+        Line::from(vec![
+            Span::styled(" Enter", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.rename_confirm, Style::default().fg(TEXT_DIM)),
+            Span::styled("Esc", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.rename_cancel, Style::default().fg(TEXT_DIM)),
+            Span::styled(m.rename_empty_enter_label, Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.rename_reset, Style::default().fg(TEXT_DIM)),
+        ])
+    } else if let Some((status, expires_at)) = &app.pane_capture_status {
+        if now < *expires_at {
+            Line::from(Span::styled(
+                format!(" capture: {status}"),
+                Style::default().fg(ACCENT_GREEN),
+            ))
+        } else {
+            status_bar_focus_hints(focus, m)
+        }
+    } else {
+        status_bar_focus_hints(focus, m)
+    }
+}
+
+#[cfg(test)]
+mod capture_status_tests {
+    use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    #[test]
+    fn rename_hints_win_over_live_capture_status() {
+        let mut app = App::new(40, 80).expect("App::new");
+        let now = Instant::now();
+        app.pane_capture_status = Some((
+            "saved capture".into(),
+            now + crate::app::PANE_CAPTURE_STATUS_TTL,
+        ));
+        app.rename_input = Some("new-name".into());
+
+        let text = line_text(&status_bar_hints_at(&app, now));
+
+        assert!(text.contains("Enter"), "rename hint missing: {text}");
+        assert!(!text.contains("capture:"), "capture masked rename: {text}");
+        app.shutdown();
+    }
+}
+
+fn status_bar_focus_hints(focus: FocusTarget, m: &crate::i18n::Messages) -> Line<'static> {
+    match focus {
+        FocusTarget::Preview => Line::from(vec![
+            Span::styled(" Scroll", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.preview_scroll, Style::default().fg(TEXT_DIM)),
+            Span::styled("A-W", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.preview_close, Style::default().fg(TEXT_DIM)),
+            Span::styled("A-O", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.preview_swap, Style::default().fg(TEXT_DIM)),
+            Span::styled("A-Q", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.preview_quit, Style::default().fg(TEXT_DIM)),
+        ]),
+        FocusTarget::FileTree => Line::from(vec![
+            Span::styled(" j/k", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.tree_move, Style::default().fg(TEXT_DIM)),
+            Span::styled("h/l", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.tree_parent_child, Style::default().fg(TEXT_DIM)),
+            Span::styled("Enter", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.tree_open, Style::default().fg(TEXT_DIM)),
+            Span::styled("c/v", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.tree_claude_launch, Style::default().fg(TEXT_DIM)),
+            Span::styled(".", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.tree_hidden, Style::default().fg(TEXT_DIM)),
+            Span::styled("Esc", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.tree_back, Style::default().fg(TEXT_DIM)),
+            Span::styled("A-F", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.tree_close, Style::default().fg(TEXT_DIM)),
+            Span::styled("A-Q", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.tree_quit, Style::default().fg(TEXT_DIM)),
+        ]),
+        FocusTarget::Pane => Line::from(vec![
+            Span::styled(" A-D", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.pane_split_vertical, Style::default().fg(TEXT_DIM)),
+            Span::styled("A-E", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.pane_split_horizontal, Style::default().fg(TEXT_DIM)),
+            Span::styled("A-W", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.pane_close, Style::default().fg(TEXT_DIM)),
+            Span::styled("A-T", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.pane_new_tab, Style::default().fg(TEXT_DIM)),
+            Span::styled("A-R", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.pane_rename_tab, Style::default().fg(TEXT_DIM)),
+            Span::styled("A-F", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.pane_tree, Style::default().fg(TEXT_DIM)),
+            Span::styled("A-O", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.pane_swap, Style::default().fg(TEXT_DIM)),
+            Span::styled("^;/A-;", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.pane_ime, Style::default().fg(TEXT_DIM)),
+            Span::styled("A-P", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.pane_peer_launch, Style::default().fg(TEXT_DIM)),
+            Span::styled("A-Q", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(m.pane_quit, Style::default().fg(TEXT_DIM)),
+        ]),
     }
 }
 

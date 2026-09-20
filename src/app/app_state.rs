@@ -242,6 +242,8 @@ pub enum AppEvent {
     PaneCaptureDumped(String),
 }
 
+pub(crate) const PANE_CAPTURE_STATUS_TTL: Duration = Duration::from_secs(5);
+
 /// Flag-preloaded launch command for `renga split --role claude` and
 /// Alt+P. Also consumed by `crate::mcp_peer` so `spawn_pane` /
 /// `new_tab` upgrade a bare `claude` invocation to the peer-enabled
@@ -310,9 +312,9 @@ pub struct App {
     pub layout_swapped: bool,
     // Toggle status bar visibility (Alt+S)
     pub status_bar_visible: bool,
-    /// Last on-demand pane-capture outcome. Rendered by renga itself so the
-    /// diagnostic never writes into the child terminal.
-    pub(crate) pane_capture_status: Option<String>,
+    /// Last on-demand pane-capture outcome and its display deadline. Rendered
+    /// by renga itself so the diagnostic never writes into the child terminal.
+    pub(crate) pane_capture_status: Option<(String, Instant)>,
     // Drag/hover state
     pub dragging: Option<DragTarget>,
     pub hover_border: Option<DragTarget>,

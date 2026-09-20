@@ -11,18 +11,26 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Debug
 
-- **Opt-in pane capture and offline replay for repaint investigations.**
-  `RENGA_DEBUG_PANE_CAPTURE` records raw PTY reads, output holds, parser
-  applications, resize clears, and actual/skipped pane draws in isolated
-  per-TUI session directories. The ignored `replay_capture` test prints raw,
-  applied, and drawn burst tables, shifted rows, partial top-to-bottom
-  rewrites, and cursor-hide/show envelopes. Erase-to-rewrite rows report the
-  first-payload delay, hold close reason and early-close flag, rewrite bytes
-  and reads, and draws inside the rewrite; resize-injected clears have their
-  own row kind. Replay places resize clears at their applied byte offset,
-  excludes user-scrolled views from repaint counts, and recognizes rewrites
-  split in the middle of a Unicode row. Capture is absent by default and
-  does not change the output hold policy. See the
+- **Always-on bounded pane capture and on-demand repaint diagnostics.** Every
+  normally launched pane retains the latest 4 MiB of raw PTY data plus bounded
+  records in memory, with no environment variable and no steady-state file
+  writes. `Alt+Shift+C` and the deferred `dump_pane_capture` MCP/IPC surface
+  write replay-compatible snapshots beneath the platform data directory
+  (`%LOCALAPPDATA%\renga\pane-captures` on Windows) and report the chosen path.
+  Key-triggered status feedback expires after five seconds and does not mask
+  rename-mode hints. Draw records preserve the active `dec2026` or `erase_hold`
+  kind while output is deferred.
+  Automatic dumps fire only when an erase hold reaches its cap before any
+  printable rewrite payload, or when the ring must force a cut. They are
+  limited per pane by a monotonic 10-minute clock and retain at most 32 marked
+  automatic directories / 128 MiB by default; manual dumps are never silently
+  pruned. At 13 panes, the raw worst-case write rate before retention is
+  `13 * 6 * (4 MiB + 1 MiB + 4096 B)`, about 390 MiB/hour, plus JSONL records.
+  `RENGA_DEBUG_PANE_CAPTURE` remains as size-capped continuous mode for scripted
+  runs. Replay prints raw, applied, and drawn burst tables, shifted rows,
+  partial top-to-bottom rewrites, cursor envelopes, and erase-to-rewrite rows;
+  it places resize clears at their applied byte offset, excludes user-scrolled
+  views from repaint counts, and recognizes Unicode-split rewrites. See the
   [field capture guide](docs/investigations/pane-synchronized-output.md#field-capture-and-replay).
   (renga-gou)
 

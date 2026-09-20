@@ -251,6 +251,12 @@ impl App {
                 "target and all cannot be used together",
             ));
         }
+        if !all && target.is_none() {
+            return Err(ipc::CodedError::new(
+                ipc::err_code::PANE_CAPTURE_DUMP_FAILED,
+                "target or all=true is required",
+            ));
+        }
         let (workspace_index, _) = self
             .resolve_pane_across_workspaces(&PaneRef::Id(from_pane))
             .ok_or_else(|| {
@@ -263,7 +269,7 @@ impl App {
         let pane_ids = if all {
             workspace.layout.collect_pane_ids()
         } else {
-            let selector = target.cloned().unwrap_or(PaneRef::Focused);
+            let selector = target.cloned().expect("selector validated above");
             vec![workspace.resolve_pane_ref(&selector).ok_or_else(|| {
                 ipc::CodedError::new(
                     ipc::err_code::PANE_NOT_FOUND,

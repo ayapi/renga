@@ -424,6 +424,46 @@ different use cases; neither is deprecated.
 returns `events: []` with an **advanced** cursor. Callers must re-poll on
 empty responses to make progress.
 
+### 1.16 `dump_pane_capture` — deferred
+
+This diagnostic tool is shipped but is not part of the frozen v1.0 contract.
+Its inputs and output may change in any minor release under §5.3.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `target` | string | exactly one selector | Numeric pane id, stable name, or explicit `"focused"`. Must be non-empty and cannot be combined with `all`. |
+| `all` | boolean | exactly one selector | Must be `true`; dumps every pane in the caller's current tab and cannot be combined with `target`. |
+
+Success text starts with `"Pane capture saved to <directory>"`, followed by
+each selected pane's status and its `.bin` / `.jsonl` paths when written. The
+same report is returned as `structuredContent` using the §3.4 data shape.
+Partial completion is success-shaped: each pane reports `ok`, `timed_out`, or
+`failed`, with a reason for non-`ok` results.
+
+**Detached fallback (deferred prefix)**: `"(cannot dump pane capture — renga
+not reachable: <reason>)"`.
+
+The files use the existing version-1 replay format. A ring dump begins with a
+blank parser at the retained cut, so pre/post/third-state tables before the
+first retained full clear are relative to a blank screen. Later erase clusters
+remain useful. The response and metadata report the actual retained raw bytes,
+record count, and first/last elapsed timestamps; no fixed time span is promised.
+
+Manual and automatic dumps are created beneath the default platform local-data
+directory (`%LOCALAPPDATA%\renga\pane-captures` on Windows). The always-on
+ring performs no steady-state file writes. Automatic
+dumps fire when an erase-keyed hold reaches its cap before any printable
+rewrite payload, or when the ring must force a cut. They are limited to once
+per pane per ten monotonic minutes. By default, only marked automatic dump
+directories are pruned to 32 directories / 128 MiB; manual dumps are exempt.
+For 13 panes the raw automatic-dump maximum before retention is
+`13 * 6 * (4 MiB + 1 MiB + 4096 B)`, about 390 MiB/hour, plus JSONL records.
+
+Errors retain their `[code]` token, including `pane_capture_dump_failed`,
+`pane_not_found`, and `pane_vanished` where applicable. Missing selectors,
+`all: false`, and simultaneous `target` / `all` are JSON-RPC `-32602` errors
+before IPC.
+
 ### Common error wire format
 
 JSON-RPC error `message` is `[<code>] <human message>` per `fmt_code`. Codes
@@ -558,6 +598,7 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | `new_tab` | `command?`, `id?`, `label?`, `role?`, `cwd?` | |
 | `subscribe` | `pane_id?: usize` | Switches to event-stream mode after ack. Bundled MCP peers identify their pane; generic consumers omit the additively introduced key. |
 | `inspect` | `target: PaneRef`, `lines?`, `include_cursor: bool` (default false) | |
+| `dump_pane_capture` | `from_pane: usize`, `target?: PaneRef`, `all: bool` (default false) | **Deferred.** Exactly one selector is required: `target`, or `all=true`. The selected panes are limited to `from_pane`'s tab. |
 | `peer_list` | `from_pane: usize` | |
 | `peer_send` | `from_pane: usize`, `target: PaneRef`, `body: string` | Unresolved and cross-tab targets return the same success-shaped `undeliverable` result and queue no body (Q5). Ok data is `{ "delivery": "delivered"\|"queued"\|"pending_user_confirmation"\|"undeliverable" }`. |
 | `peer_register_client` | `pane_id: usize`, `kind: claude\|codex` | Posted by `renga mcp-peer` on startup. An incoming Claude kind does not replace an existing Codex kind while a peer subscriber for the pane is alive. |
@@ -570,6 +611,8 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | `set_summary` | `from_pane: usize`, `summary: string` | Empty `summary` clears. >256 `chars` rejected with `summary_too_long`. |
 
 `PaneRef` = `{ id: usize } | { name: string } | "focused"`.
+`dump_pane_capture` resolves its explicit selector only within `from_pane`'s
+tab. Unlike most CLI selectors, it has no omitted-selector default.
 For `peer_send`, consistent with other tab-scoped pane operations, the
 reference is resolved only within `from_pane`'s tab; `focused` means the
 focused pane in that sender tab, even when it is inactive.
@@ -588,6 +631,11 @@ focused pane in that sender tab, even when it is inactive.
 Request-specific `ok.data` shapes include
 `split: { "id": usize, "startup_command"?: string | null }` and
 `new_tab: { "id": usize, "startup_command"?: string | null }` and
+`dump_pane_capture: { "directory": string, "panes": [{ "pane_id": usize,
+"status": "ok"|"timed_out"|"failed", "bin_path"?: string,
+"jsonl_path"?: string, "reason"?: string, "retained_raw_bytes": u64,
+"retained_records": u64, "first_retained_elapsed_us"?: u64|null,
+"last_retained_elapsed_us"?: u64|null }] }` and
 `peer_send: { "delivery": "delivered" | "queued" | "pending_user_confirmation" | "undeliverable" }`;
 lifecycle setters such
 as `peer_register_client` and `peer_set_ready` return `null`. For `split` and
@@ -660,10 +708,35 @@ overlay_catchup_ms = 3000        # default 3000; non-zero clamped >= 100; 0 = pu
 
 [ui]
 lang = "auto"             # "auto" (default) | "ja" | "en"; case-insensitive
+
+[debug]
+pane_capture_ring_bytes = 4194304          # 4 MiB; 0 disables capture
+pane_capture_file_bytes = 16777216         # 16 MiB per continuous segment
+pane_capture_file_segments = 4             # segments retained per pane
+pane_capture_sessions = 4                  # continuous sessions retained
+pane_capture_total_bytes = 1073741824      # 1 GiB continuous-session cap
+pane_capture_auto_dumps = 32                # marked automatic directories
+pane_capture_auto_total_bytes = 134217728   # 128 MiB automatic-dump cap
 ```
 
 Missing or malformed file → warning to stderr, defaults apply (never fails
 startup). Extra keys are ignored — additive forward-compat.
+
+The `[debug]` section above is a **deferred** diagnostic surface rather than a
+frozen v1.0 schema. Its keys and defaults may change in a minor release under
+§5.3. Capture is on by default with no environment variable or opt-in key.
+`pane_capture_ring_bytes = 0` is an explicit opt-out.
+
+Per live pane, the named memory limits are the raw ring cap, up to 1 MiB of
+forced-cut hold slack plus one 4096-byte PTY read, an auxiliary record budget
+of `max(ring_bytes, 64 KiB)`, and a producer backlog budget of the same size,
+plus fixed bookkeeping. With the default 4 MiB ring this is about 13.004 MiB
+per live pane before fixed bookkeeping. A dump temporarily owns its snapshot
+while a writer produces the files.
+
+`RENGA_DEBUG_PANE_CAPTURE` is a separate, optional continuous-output mode for
+scripted runs. Its files rotate using the deferred segment/session limits;
+that environment variable is not part of the frozen §2.3 environment surface.
 
 ### 4.2 Layout TOML — stable (`version = 1`)
 
@@ -731,6 +804,7 @@ these as `[<code>] <human message>` in JSON-RPC error message strings.
 | `summary_too_long` | `set_summary` | Summary input exceeds 256 Unicode scalar values. Pre-mutation rejection. |
 | `peer_queue_full` | `peer_send` | Target's pre-registration queue reached its message-count or byte cap. |
 | `peer_delivery_unconfirmed` | `peer_send` | Target mcp-peer did not confirm local retention before the sender reply deadline. Safe to retry. |
+| `pane_capture_dump_failed` | `dump_pane_capture` | Selector use is invalid at IPC level, capture is disabled for a selected pane, the capture root or snapshot could not be written, or dump coordination could not start. This code belongs to the deferred diagnostic surface. |
 | `codex_not_installed` | `spawn_codex_pane` | Codex's `~/.codex/config.toml` is missing the renga-peers entry, the file is unreadable, or the `RENGA_PEER_CLIENT_KIND=codex` env-var passthrough is absent. Surfaced from the MCP layer (not `renga::ipc::err_code`); branch on the `[code]` token same as the others. Run `renga mcp install --client codex` to remediate. |
 
 ### 5.2 JSON-RPC numeric codes (Q9)
@@ -746,6 +820,16 @@ classes into more specific numeric codes; this is **not** a breaking change
 because downstream is required to read the `[code]` token for branching.
 
 ### 5.3 Forward-compat rules — stable
+
+- **Deferred pane-capture diagnostics**: the `dump_pane_capture` MCP tool, the
+  same-named IPC request and response data, the `pane_capture_dump_failed`
+  code, and every `[debug].pane_capture_*` key are shipped but not frozen by
+  v1.0. Their names, validation, shapes, defaults, and behavior may change or
+  be removed in any minor release. Older clients must treat an unknown tool or
+  IPC request as unsupported; older renga versions ignore unknown config keys.
+  `RENGA_DEBUG_PANE_CAPTURE` continuous mode is also outside the frozen §2.3
+  environment list. `Alt+Shift+C` consumption is a user-visible key addition,
+  not a stable protocol promise.
 
 Applying a DEC private mode 2026 frame to the pane parser in one update is an
 internal timing change. `inspect_pane` may now keep returning the last complete
@@ -896,10 +980,11 @@ major version.
   `"focused"` only where documented (`spawn_*`, `set_pane_identity`); other
   tools require an explicit `target`.
 - **Tab scoping (Q4)**: `list_panes`, `focus_pane`, `inspect_pane`,
-  `send_keys`, `set_pane_identity`, and `close_pane` are
+  `dump_pane_capture`, `send_keys`, `set_pane_identity`, and `close_pane` are
   **scoped to the current tab**. Panes on other tabs are not addressable in
-  v1.0. A `peer_send` target (`send_message` on the MCP side) is scoped to the
-  sender's tab, including when that tab is inactive.
+  v1.0. The deferred IPC `dump_pane_capture` request uses `from_pane` to select
+  that tab. A `peer_send` target (`send_message` on the MCP side) is scoped to
+  the sender's tab, including when that tab is inactive.
 - **Unresolved and cross-tab `peer_send` targets share one result (Q5)**:
   `delivery=undeliverable` raises no error, queues no body, and does not reveal
   whether a matching pane exists in another tab.
@@ -939,13 +1024,13 @@ minor release.
 
 | Section | Count |
 |---|---|
-| MCP tools (§1) | 15 |
+| MCP tools (§1) | 16 |
 | CLI top-level flags (§2.1) | 11 |
 | CLI IPC subcommands (§2.2) | 13 |
 | Env vars (§2.3) | 6 |
-| IPC `Request` variants (§3.3) | 18 |
+| IPC `Request` variants (§3.3) | 19 |
 | IPC `Response` variants (§3.4) | 4 |
 | IPC `Event` variants (§3.5) | 6 |
-| Error codes (§5.1) | 16 |
-| Config schema sections (§4.1) | 2 |
+| Error codes (§5.1) | 17 |
+| Config schema sections (§4.1) | 3 |
 | Layout TOML node types (§4.2) | 2 |

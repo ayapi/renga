@@ -20,6 +20,7 @@ renga のグローバルキーはすべて `Alt` 名前空間にあります。�
 | `Alt+Left/Right` | 前 / 次のタブ |
 | `Alt+R` | タブ名を変更 (セッション内のみ) |
 | `Alt+S` | ステータスバー表示切替 |
+| `Alt+Shift+C` | フォーカス中のペインの常時キャプチャリングを、リプレイ可能な `.bin` / `.jsonl` としてプラットフォームのデータディレクトリ (`%LOCALAPPDATA%\renga\pane-captures` on Windows) に保存。完了または失敗はステータスバーに短時間表示される。 |
 | `Alt+P` | フォーカス中のペインにメッセージング対応の Claude Code 起動コマンドを入力 ([`peer-messaging.ja.md`](./peer-messaging.ja.md) 参照)。フォーカス中のペインが alt-screen モード (vim / less / lazygit / 起動中の Claude / Codex の TUI 等) かペインタイトルに "claude" を含む場合は仕様として silently no-op になります — 起動中の TUI にコマンドのバイト列がキーストロークとして注入されるのを防ぐためです。シェルプロンプトのペインにフォーカスを移してから再度押してください。 |
 | `Alt+F` | ファイルツリー表示切替 |
 | `Alt+O` | プレビューとターミナルの位置を入れ替え |
@@ -29,6 +30,14 @@ renga のグローバルキーはすべて `Alt` 名前空間にあります。�
 | `Ctrl+;` / `Alt+;` / `Alt+I` | IME 合成 overlay を開く (中央に複数行入力ボックス — [`ime.ja.md`](./ime.ja.md) 参照)。`Alt+;` / `Alt+I` は `Ctrl+;` を奪うターミナル (WSL + Windows Terminal、Linux 上の VS Code ターミナル、一部の tmux 設定など) のフォールバック。 |
 | `Alt+M` / `Ctrl+Shift+M` | フォーカス中のペインでキーボードコピーモードに入る ([コピーモード](#コピーモード-altm-押下後) 参照) |
 | `Alt+Q` | renga 終了 |
+
+Git Bash は従来の `ESC C` シーケンスを `do-lowercase-version` 経由で
+`capitalize-word` に割り当てています。一部のターミナルでは
+`Alt+Shift+C` も同じシーケンスになるため、renga はこの使用頻度の低い
+エイリアスをキャプチャ用に消費します。Caps Lock と `Alt+c` の組み合わせも
+同じ符号化になる場合があり、その場合はダンプが発火します。自動化では、
+明示的な `target` または `all: true` を指定する `dump_pane_capture` MCP
+ツールを使用できます。
 
 ## コピーモード (`Alt+M` 押下後)
 
