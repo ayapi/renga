@@ -217,7 +217,7 @@ fn render_captured(app: &mut App, frame: &mut Frame) {
 
 #[cfg(test)]
 #[test]
-fn capture_skipped_pane_gets_one_false_record_per_app_draw() {
+fn capture_skipped_pane_preserves_false_app_draw_count() {
     use crate::pane_capture::{test_config, with_test_config, TestCaptureCleanup};
     let config = test_config("skipped-app-draw", std::time::Instant::now());
     let _cleanup = TestCaptureCleanup::new(&config);
@@ -241,7 +241,13 @@ fn capture_skipped_pane_gets_one_false_record_per_app_draw() {
         .iter()
         .filter(|record| record["event"] == "app_draw")
         .collect();
-    assert_eq!(draws.len(), 2);
+    assert_eq!(
+        draws
+            .iter()
+            .map(|record| record["repeat"].as_u64().unwrap_or(1))
+            .sum::<u64>(),
+        2
+    );
     assert!(draws.iter().all(|record| record["drawn"] == false));
 }
 

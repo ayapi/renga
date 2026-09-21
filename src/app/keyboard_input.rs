@@ -112,7 +112,7 @@ impl App {
             self.dirty = true;
             let event_tx = self.event_tx.clone();
             if let Err(error) =
-                crate::pane_capture::dump_captures_async(vec![capture], move |result| {
+                crate::pane_capture::dump_captures_async(vec![capture], "keyboard", move |result| {
                     let status = result
                         .as_ref()
                         .map(crate::pane_capture::format_dump_report)

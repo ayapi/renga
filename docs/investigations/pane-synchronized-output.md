@@ -125,13 +125,27 @@ are named `manual-<TUI-pid>-<token>` and are never removed silently.
 The tool requires one explicit selector: `target` for one pane, or `all: true`
 for every pane in the caller's tab.
 
+Every manual attempt writes `outcome.json` first and finalizes it after the
+per-pane workers finish. It records the start/finish state, requester, selected
+pane ids, and each pane's status, reason, paths, retained counts, and time
+range. Panes run concurrently with a fresh three-second allowance each. A pane
+that cannot finish the full snapshot in time writes its newest replayable
+suffix, marks it `partial`, and returns both paths; one slow pane does not spend
+another pane's allowance. The optional peer trace records the same lifecycle,
+but `outcome.json` is authoritative for ordinary launches without peer tracing.
+
 An erase hold that reaches its time/byte cap before the replay classifier finds
 any printable rewrite payload also requests an automatic dump. A cap release
 after rewrite bytes have arrived is the ordinary repaint case and does not
-trigger. A forced ring cut is the other automatic trigger. Each pane has its
-own limiter, driven by the capture's monotonic elapsed clock: at most one dump
-is admitted per pane per 10 minutes. Suppressions are reported in dump metadata
-as `automatic_dump_suppressions`.
+trigger. A forced ring cut is the other automatic trigger, limited to raw-byte
+starvation past the hard ceiling when chained holds provide no safe cut.
+Ordinary structural-record eviction is not a forced cut and does not write a
+file. An admitted automatic trigger waits 10 seconds before taking its snapshot
+so the following rewrite is present; another trigger during that delay does not
+restart it. `outcome.json` records the original trigger time and reason. Each
+pane has its own limiter, driven by the capture's monotonic elapsed clock: at
+most one dump is admitted per pane per 10 minutes. Suppressions are reported in
+dump metadata as `automatic_dump_suppressions`.
 
 Automatic directories are named `auto-<TUI-pid>-<session-token>-<pane>-<n>` and
 contain a renga ownership marker. Cleanup considers only directories with both
@@ -182,9 +196,18 @@ are optional for converted historical captures. A metadata/read/parser-apply
 capture prints its raw and applied tables with no drawn samples and envelope
 `draws=n/a`.
 
-### File schema (version 1)
+### File schemas
 
-Each UTF-8 JSONL line is an object. Common fields are `sequence` (zero-based,
+Manual and automatic snapshots use compact schema version 2. The first JSONL
+line remains a self-describing metadata object; event lines are arrays whose
+first item is a type code (`r` read, `t` transition, `a` parser apply, `k` tick
+release, `d` draw, `z` resize, `x` reader exit, or `g` gap). Per-read records
+remain individual so timing and burst analysis are unchanged. Common pane,
+process, origin, and retention data live in metadata instead of being repeated
+on every event. The replay helper accepts both versions.
+
+Continuous capture retains schema version 1 for compatibility. Each UTF-8
+JSONL line is an object. Common fields are `sequence` (zero-based,
 contiguous per pane), `timestamp_unix_ms`, `elapsed_us`, `pane_id`, `process_id`
 (the **TUI** process), `child_process_id` (PTY child or null), and `event`.
 The process-wide origin is sampled once; Unix timestamps are that origin's
@@ -208,9 +231,10 @@ prefix already applied to vt100, starting at zero.
 | `transition` | `action`: `marker`, `open`, `close`, or `promote`; `kind`: `marker`, `dec2026`, or `erase_hold`; `marker`: `dec2026_begin`, `dec2026_end`, `erase_display`, `erase_scrollback`, or null; `bin_offset`; `reason` or null. Marker/open offsets include marker prefixes split across reads. Close offsets identify the consumed position at the release decision. |
 | `parser_apply` | `bin_offset`, `byte_len`, `applied_offset`. Applies that raw range, which starts at the previous applied offset. Ranges can end partway through a read or combine several reads. |
 | `app_tick_release` | `released_len`, resulting `deferred`; the actual App-side erase release, including its own tick timestamp. |
-| `app_draw` | `drawn`, `applied_offset`, `scrollback`, `deferred`. True means terminal content was copied into this App frame; false means this pane was skipped. A draw is an App buffer render, not confirmation of host-terminal presentation. |
+| `app_draw` | `drawn`, `applied_offset`, `scrollback`, `deferred`, and optional `repeat` / `last_elapsed_us`. True means terminal content was copied into this App frame; false means this pane was skipped. Equal consecutive draws are coalesced before both ring and continuous fanout; `repeat` preserves their logical count. A draw is an App buffer render, not confirmation of host-terminal presentation. |
 | `resize` | `rows`, `cols`, `clear: true`, `applied_offset`. At this parser position, call `set_size`, then process `ESC[2J ESC[H` (with no intervening space). These injected bytes are not raw PTY bytes and do not advance the applied offset. |
 | `reader_exit` | Resulting `deferred`; emitted after applying the reader's final released bytes, for EOF or a read error. |
+| `gap` | `bin_offset`, `missing_raw_bytes`, `dropped_records`. A producer or continuous-writer queue loss ends the current burst and resets replay parsers; tables never span it. Replay also derives equivalent gaps from missing read offsets in legacy captures. |
 
 `deferred` is `{ "kind": "none|dec2026|erase_hold",
 "opened_at_elapsed_us": null|integer, "buffered_len": integer }`.
@@ -233,7 +257,10 @@ the optional child PID:
 {"sequence":2,"timestamp_unix_ms":1001,"elapsed_us":1000,"pane_id":1,"process_id":123,"event":"parser_apply","bin_offset":0,"byte_len":3,"applied_offset":3}
 ```
 
-Replay validates sequences, dimensions, and read/apply ranges. An unindexed
+Replay validates sequences, dimensions, and read/apply ranges. It reports
+missing read and apply ranges separately, including apply records that overlap
+unavailable input, instead of rejecting the rest of a damaged legacy capture.
+An unindexed
 binary tail is reported and ignored, allowing analysis of complete records
 from a capture interrupted between binary and JSON writes. A malformed or
 partial JSONL line is an error; preserve the original and remove only its
@@ -364,11 +391,16 @@ The creator resolves capture and passes the handle into the reader's shared
 stream. Under the stream lock the reader enqueues raw bytes and typed records;
 parser applications additionally hold the existing parser lock. Draw/resize
 records use that parser lock and a short capture-state lock; they never
-acquire the stream lock. Serialization and file IO happen only in the per-pane
-writer thread, using two buffered writers and an unbounded channel. There is
-at most one small draw record per pane per App render, including skipped panes.
-The skipped-pane pass is behind one cached enabled flag. A stalled disk may
-grow the diagnostic queue; enable capture for the workload being investigated.
+acquire the stream lock. The pending-draw and dropped-event locks are leaf
+locks: code holding either one never acquires a parser or stream lock, so taking
+them while the parser lock is held cannot form a lock cycle. Serialization and
+file IO happen only in the per-pane
+writer thread, using two buffered writers. Consecutive equal draws are
+coalesced on the producer side, before ring and continuous-disk fanout. The
+producer backlog, structural ring records, and raw ring bytes are independently
+charged; whole read-led groups are evicted in constant time instead of
+rescanning the ring on every event. Queue overflow is represented by a gap
+rather than silently corrupting replay.
 
 Both files flush at fixed 100 ms deadlines even under continuous traffic,
 on close/release (including the resulting parser application), reader exit,
@@ -380,9 +412,33 @@ increments an atomic failure counter and disables that capture; senders check
 disabled before copying raw data. There is no diagnostic stdout/stderr output
 inside the TUI and pane parsing continues unchanged.
 
-As a small synthetic serialization measurement, a true/false draw pair occupied
-248/249 bytes per line (five-digit process ID, short timestamps, no hold).
-At 13 panes and 30 App draws/s, 249 bytes per record projects to approximately
-350 MB/hour of draw JSONL alone; real timestamps and hold state increase that,
-and raw bytes/read/transition records add workload-dependent volume. This is a
-format-size projection, not a measured field throughput or a storage cap.
+The default per-pane in-memory ceiling is approximately 13.004 MiB: 4 MiB raw
+ring, at most 1 MiB forced-cut slack plus one 4096-byte read, 4 MiB structural
+record budget, and 4 MiB producer backlog, plus fixed bookkeeping. The ring
+uses 40-byte compact records and one preallocated raw-byte allocation; vector,
+group, and deque overhead is charged to the structural budget. Snapshots share
+sealed record groups and copy the contiguous raw ring once. The acceptance
+load is 6 pane-24 streams at 10x plus 6 pane-28 streams at 30x in a maximized
+window. Its no-capture 5e402df reference was 156--160 MB private memory and
+0.061 CPU cores; b5b4dfd reached 1,363 MB at 606 seconds, averaged 11.3 cores,
+and lost every pane in an all-pane dump. The corrected build is checked for 30
+minutes against `<= 160 MB + 12 * 13.004 MiB` private memory, `<= 0.5` total
+capture CPU core, and a final 12-pane dump containing `outcome.json` plus either
+complete or path-bearing partial results.
+
+The release ring microbenchmark measured 0.152 us/push in its first
+full-capacity window and 0.130 us/push in its last (0.86x; 40-byte compact
+records and 144-byte transient queue records). A corrected three-minute
+preflight on the same 12-pane rig reached 287 MB at 181 seconds and 29
+CPU-seconds total (about 0.160 core, or 0.099 above the no-capture reference).
+Its all-pane dump completed 12/12 in 184 ms with a written outcome and both
+paths for every pane; aggregate JSON/raw size was 3.165x. It created zero
+automatic directories, confirming structural eviction has no disk side effect.
+The final 30-minute run remains the acceptance measurement for long-run
+flatness.
+
+The preserved field dump's original retained interval was exactly 35m58.792s
+(5,471,262,171 through 7,630,054,047 us). Replaying that pane-24 record shape
+through the corrected 4 MiB structural ring retained the newest 223.194 seconds,
+778,037 raw bytes, and 58,658 records. Time retention is workload-dependent;
+the configured caps, rather than a promised duration, define the guarantee.

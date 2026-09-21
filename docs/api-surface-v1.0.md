@@ -443,18 +443,27 @@ Partial completion is success-shaped: each pane reports `ok`, `timed_out`, or
 **Detached fallback (deferred prefix)**: `"(cannot dump pane capture — renga
 not reachable: <reason>)"`.
 
-The files use the existing version-1 replay format. A ring dump begins with a
+Manual and automatic files use compact replay format version 2; continuous
+capture remains version 1, and replay accepts both. A ring dump begins with a
 blank parser at the retained cut, so pre/post/third-state tables before the
 first retained full clear are relative to a blank screen. Later erase clusters
 remain useful. The response and metadata report the actual retained raw bytes,
-record count, and first/last elapsed timestamps; no fixed time span is promised.
+record count, queued record/byte counts, and first/last elapsed timestamps; no
+fixed time span is promised. Every attempt creates one directory and writes
+`outcome.json` first with requester, selector, and per-pane lifecycle details.
+All selected panes dump concurrently with independent three-second allowances;
+a timeout returns the newest replayable suffix with both paths and a partial
+reason rather than an empty unexplained result.
 
 Manual and automatic dumps are created beneath the default platform local-data
 directory (`%LOCALAPPDATA%\renga\pane-captures` on Windows). The always-on
 ring performs no steady-state file writes. Automatic
 dumps fire when an erase-keyed hold reaches its cap before any printable
-rewrite payload, or when the ring must force a cut. They are limited to once
-per pane per ten monotonic minutes. By default, only marked automatic dump
+rewrite payload, or when raw-byte starvation forces a cut. Ordinary structural
+eviction never fires one. An admitted trigger snapshots 10 seconds later and
+records the original trigger time/reason in `outcome.json`; another trigger in
+that delay does not restart it. They are limited to once per pane per ten
+monotonic minutes. By default, only marked automatic dump
 directories are pruned to 32 directories / 128 MiB; manual dumps are exempt.
 For 13 panes the raw automatic-dump maximum before retention is
 `13 * 6 * (4 MiB + 1 MiB + 4096 B)`, about 390 MiB/hour, plus JSONL records.

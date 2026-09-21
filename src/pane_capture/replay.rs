@@ -121,6 +121,7 @@ struct Read {
     time: u64,
     pre: Screen,
     post: Screen,
+    segment: u64,
 }
 
 struct Snapshot {
@@ -129,6 +130,7 @@ struct Snapshot {
     screen: Screen,
     scrollback: usize,
     resize_clear: bool,
+    repeat: u64,
 }
 
 fn number(value: &Value, key: &str) -> Result<u64> {
@@ -238,29 +240,42 @@ fn table(
     burst: usize,
     pre: &Screen,
     post: &Screen,
-    snapshots: &[&Screen],
+    snapshots: &[(&Screen, u64)],
 ) {
     let thirds = snapshots
         .iter()
-        .filter(|screen| ***screen != *pre && ***screen != *post)
-        .count();
+        .filter(|(screen, _)| **screen != *pre && **screen != *post)
+        .map(|(_, repeat)| *repeat)
+        .sum::<u64>();
+    let total = snapshots.iter().map(|(_, repeat)| *repeat).sum::<u64>();
     writeln!(
         out,
         "{name} burst={burst} before_equals_after={} third_states={thirds}/{} change={}",
         pre == post,
-        snapshots.len(),
+        total,
         class(pre, post)
     )
     .unwrap();
     let mut previous = pre;
-    for (index, screen) in snapshots.iter().enumerate() {
-        writeln!(
-            out,
-            "  snapshot={} change={}",
-            index + 1,
-            class(previous, screen)
-        )
-        .unwrap();
+    for (index, (screen, repeat)) in snapshots.iter().enumerate() {
+        if *repeat > 1 {
+            writeln!(
+                out,
+                "  snapshot={} repeat={} change={}",
+                index + 1,
+                repeat,
+                class(previous, screen)
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                out,
+                "  snapshot={} change={}",
+                index + 1,
+                class(previous, screen)
+            )
+            .unwrap();
+        }
         if **screen != *pre && **screen != *post {
             writeln!(out, "    third {}", composition(pre, post, screen)).unwrap();
         }
@@ -431,7 +446,8 @@ fn erase_rewrite_table(
                                 && draw.offset < end
                                 && next_resize.is_none_or(|sequence| draw.record < sequence)
                         })
-                        .count()
+                        .map(|draw| draw.repeat)
+                        .sum::<u64>()
                         .to_string()
                 } else {
                     "n/a".into()
@@ -486,6 +502,23 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
     let mut draws = Vec::<Snapshot>::new();
     let mut raw_offset = 0;
     let mut applied_offset = 0;
+    let mut segment = 0_u64;
+    let mut read_gap_count = 0_u64;
+    let mut read_gap_bytes = 0_usize;
+    let mut apply_gap_count = 0_u64;
+    let mut apply_gap_bytes = 0_usize;
+    let mut unavailable_apply_count = 0_u64;
+    let mut unavailable_apply_bytes = 0_usize;
+    let mut missing_read_ranges = Vec::new();
+    let mut expected_read_offset = 0_usize;
+    for record in records.iter().filter(|record| record["event"] == "read") {
+        let offset = usize::try_from(number(record, "bin_offset")?)?;
+        let len = usize::try_from(number(record, "read_len")?)?;
+        if offset > expected_read_offset {
+            missing_read_ranges.push(expected_read_offset..offset);
+        }
+        expected_read_offset = offset.saturating_add(len);
+    }
     let mut pending_resize_clear = false;
     let mut out = String::new();
     let mut last_draw = Screen::of(&applied);
@@ -501,6 +534,24 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                 let offset = usize::try_from(number(record, "bin_offset")?)?;
                 let len = usize::try_from(number(record, "read_len")?)?;
                 let end = offset.checked_add(len).context("read offset overflow")?;
+                if offset > raw_offset {
+                    let missing = offset - raw_offset;
+                    read_gap_count += 1;
+                    read_gap_bytes += missing;
+                    segment += 1;
+                    writeln!(
+                        out,
+                        "read_gap record={index} offset={raw_offset} len={missing}"
+                    )
+                    .unwrap();
+                    raw = vt100::Parser::new(rows, cols, 10000);
+                    raw_offset = offset;
+                    while next_resize < resizes.len()
+                        && number(resizes[next_resize], "applied_offset")? < offset as u64
+                    {
+                        next_resize += 1;
+                    }
+                }
                 ensure!(
                     offset == raw_offset && len > 0 && end <= binary.len(),
                     "invalid read range at record {index}"
@@ -531,19 +582,60 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                     time,
                     pre,
                     post: Screen::of(&raw),
+                    segment,
                 });
                 raw_offset = end;
             }
             "parser_apply" => {
                 let offset = usize::try_from(number(record, "bin_offset")?)?;
                 let end = usize::try_from(number(record, "applied_offset")?)?;
+                let unavailable = missing_read_ranges
+                    .iter()
+                    .map(|range| end.min(range.end).saturating_sub(offset.max(range.start)))
+                    .sum::<usize>();
+                if unavailable > 0 {
+                    unavailable_apply_count += 1;
+                    unavailable_apply_bytes += unavailable;
+                }
+                let discontinuity = offset != applied_offset;
+                if discontinuity || unavailable > 0 {
+                    segment = segment.saturating_add(1);
+                }
+                if discontinuity {
+                    let missing = offset.abs_diff(applied_offset);
+                    apply_gap_count += 1;
+                    apply_gap_bytes += missing;
+                    writeln!(
+                        out,
+                        "apply_gap record={index} offset={applied_offset} len={missing}"
+                    )
+                    .unwrap();
+                    applied = vt100::Parser::new(rows, cols, 10000);
+                    last_draw = Screen::of(&applied);
+                    applied_offset = offset;
+                    pending_resize_clear = false;
+                } else if unavailable > 0 {
+                    applied = vt100::Parser::new(rows, cols, 10000);
+                    last_draw = Screen::of(&applied);
+                    pending_resize_clear = false;
+                }
                 ensure!(
                     offset == applied_offset
                         && end >= offset
-                        && end <= raw_offset
+                        && end <= binary.len()
                         && end - offset == number(record, "byte_len")? as usize,
                     "invalid apply range at record {index}"
                 );
+                if unavailable > 0 {
+                    writeln!(
+                        out,
+                        "apply_unknown record={index} offset={offset} len={} unavailable={unavailable}",
+                        end - offset
+                    )
+                    .unwrap();
+                    applied_offset = end;
+                    continue;
+                }
                 applied.process(&binary[offset..end]);
                 if end > offset {
                     pending_resize_clear = false;
@@ -555,6 +647,7 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                     screen: Screen::of(&applied),
                     scrollback: 0,
                     resize_clear: pending_resize_clear,
+                    repeat: 1,
                 });
             }
             "resize" => {
@@ -570,13 +663,18 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                     number(record, "applied_offset")? as usize == applied_offset,
                     "draw offset mismatch"
                 );
+                let repeat = record["repeat"].as_u64().unwrap_or(1);
                 if record["drawn"] != true {
-                    writeln!(
-                        out,
-                        "draw seq={index} elapsed_us={time} drawn=false class=none hold={}",
-                        record["deferred"]
-                    )
-                    .unwrap();
+                    if repeat > 1 {
+                        writeln!(out, "draw seq={index} elapsed_us={time} drawn=false repeat={repeat} class=none hold={}", record["deferred"]).unwrap();
+                    } else {
+                        writeln!(
+                            out,
+                            "draw seq={index} elapsed_us={time} drawn=false class=none hold={}",
+                            record["deferred"]
+                        )
+                        .unwrap();
+                    }
                     continue;
                 }
                 let scrollback = number(record, "scrollback")? as usize;
@@ -590,7 +688,11 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                 } else {
                     class(&last_draw, &screen)
                 };
-                writeln!(out, "draw seq={index} elapsed_us={time} drawn=true applied_offset={applied_offset} class={change} hold={}", record["deferred"]).unwrap();
+                if repeat > 1 {
+                    writeln!(out, "draw seq={index} elapsed_us={time} drawn=true repeat={repeat} applied_offset={applied_offset} class={change} hold={}", record["deferred"]).unwrap();
+                } else {
+                    writeln!(out, "draw seq={index} elapsed_us={time} drawn=true applied_offset={applied_offset} class={change} hold={}", record["deferred"]).unwrap();
+                }
                 if scrollback == 0 {
                     last_draw = screen.clone();
                 }
@@ -600,7 +702,15 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                     screen,
                     scrollback,
                     resize_clear: pending_resize_clear,
+                    repeat,
                 });
+            }
+            "gap" => {
+                segment += 1;
+                raw = vt100::Parser::new(rows, cols, 10000);
+                applied = vt100::Parser::new(rows, cols, 10000);
+                last_draw = Screen::of(&applied);
+                pending_resize_clear = false;
             }
             "app_tick_release" | "reader_exit" => {}
             "transition" => {}
@@ -616,7 +726,10 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
     let has_draw_records = records.iter().any(|record| record["event"] == "app_draw");
     while start < reads.len() {
         let mut end = start + 1;
-        while end < reads.len() && reads[end].time.saturating_sub(reads[end - 1].time) < gap_us {
+        while end < reads.len()
+            && reads[end].segment == reads[end - 1].segment
+            && reads[end].time.saturating_sub(reads[end - 1].time) < gap_us
+        {
             end += 1;
         }
         burst += 1;
@@ -652,7 +765,8 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                     && snapshot.record >= first.record
                     && snapshot.record < record_end
             })
-            .count();
+            .map(|snapshot| snapshot.repeat)
+            .sum::<u64>();
         let resize_clear_applies = applies
             .iter()
             .filter(|snapshot| {
@@ -676,7 +790,7 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
             &last.post,
             &reads[start..end - 1]
                 .iter()
-                .map(|read| &read.post)
+                .map(|read| (&read.post, 1))
                 .collect::<Vec<_>>(),
         );
         table(
@@ -692,7 +806,7 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                         && snapshot.offset > first.offset
                         && snapshot.offset <= byte_end
                 })
-                .map(|snapshot| &snapshot.screen)
+                .map(|snapshot| (&snapshot.screen, snapshot.repeat))
                 .collect::<Vec<_>>(),
         );
         table(
@@ -704,7 +818,7 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
             &draws
                 .iter()
                 .filter(in_window)
-                .map(|snapshot| &snapshot.screen)
+                .map(|snapshot| (&snapshot.screen, snapshot.repeat))
                 .collect::<Vec<_>>(),
         );
         for hide in first.offset..byte_end {
@@ -733,7 +847,8 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                             && draw.offset > hide
                             && draw.offset < envelope_end
                     })
-                    .count()
+                    .map(|draw| draw.repeat)
+                    .sum::<u64>()
                     .to_string()
             } else {
                 "n/a".into()
@@ -746,7 +861,12 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
         out,
         "totals reads={} bytes={raw_offset} bursts={burst} non_other_bursts={non_other} draws={}",
         reads.len(),
-        draws.len()
+        draws.iter().map(|draw| draw.repeat).sum::<u64>()
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "gaps read_count={read_gap_count} read_bytes={read_gap_bytes} apply_count={apply_gap_count} apply_bytes={apply_gap_bytes} unavailable_apply_count={unavailable_apply_count} unavailable_apply_bytes={unavailable_apply_bytes}"
     )
     .unwrap();
     erase_rewrite_table(
@@ -763,14 +883,110 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
 pub(crate) fn replay_file(path: &Path, gap_us: u64) -> Result<String> {
     let binary = std::fs::read(path.with_extension("bin"))?;
     let jsonl = std::fs::read_to_string(path.with_extension("jsonl"))?;
-    let records = jsonl
+    let parsed: Vec<Value> = jsonl
         .lines()
         .enumerate()
         .map(|(line, text)| {
             serde_json::from_str(text).with_context(|| format!("invalid JSONL line {}", line + 1))
         })
         .collect::<Result<Vec<_>>>()?;
-    replay(&binary, &records, gap_us)
+    let compact = parsed
+        .first()
+        .is_some_and(|metadata| metadata["event"] == "metadata" && metadata["version"] == 2);
+    let records = if compact {
+        parsed
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, value)| compact_record(sequence, value))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        parsed
+    };
+    let mut expanded = Vec::new();
+    let mut binary_cursor = 0_usize;
+    let mut source_end = 0_usize;
+    for record in records.iter().filter(|record| record["event"] == "read") {
+        let offset = usize::try_from(number(record, "bin_offset")?)?;
+        let len = usize::try_from(number(record, "read_len")?)?;
+        ensure!(offset >= source_end, "overlapping read ranges");
+        expanded.resize(offset, 0);
+        let compact_end = binary_cursor
+            .checked_add(len)
+            .context("binary cursor overflow")?;
+        ensure!(
+            compact_end <= binary.len(),
+            "binary is shorter than retained reads"
+        );
+        expanded.extend_from_slice(&binary[binary_cursor..compact_end]);
+        binary_cursor = compact_end;
+        source_end = offset.checked_add(len).context("read offset overflow")?;
+    }
+    expanded.extend_from_slice(&binary[binary_cursor..]);
+    replay(&expanded, &records, gap_us)
+}
+
+fn compact_record(sequence: usize, mut value: Value) -> Result<Value> {
+    if sequence == 0 {
+        ensure!(
+            value["event"] == "metadata" && value["version"] == 2,
+            "expected version 2 metadata"
+        );
+        value["version"] = Value::from(1);
+        value["sequence"] = Value::from(0);
+        value["elapsed_us"] = Value::from(0);
+        return Ok(value);
+    }
+    let fields = value
+        .as_array()
+        .with_context(|| format!("compact record {sequence} is not an array"))?;
+    let code = fields
+        .first()
+        .and_then(Value::as_str)
+        .with_context(|| format!("compact record {sequence} has no type"))?;
+    let get = |index: usize| {
+        fields
+            .get(index)
+            .cloned()
+            .with_context(|| format!("compact record {sequence} missing field {index}"))
+    };
+    let deferred = |kind: Value, opened: Value, buffered: Value| {
+        serde_json::json!({
+            "kind": kind,
+            "opened_at_elapsed_us": opened,
+            "buffered_len": buffered,
+        })
+    };
+    let elapsed = get(1)?;
+    let mut record = match code {
+        "r" => {
+            serde_json::json!({"event":"read","bin_offset":get(2)?,"read_len":get(3)?,"deferred":deferred(get(4)?,get(5)?,get(6)?)})
+        }
+        "t" => {
+            serde_json::json!({"event":"transition","action":get(2)?,"kind":get(3)?,"marker":get(4)?,"bin_offset":get(5)?,"reason":get(6)?})
+        }
+        "a" => {
+            serde_json::json!({"event":"parser_apply","bin_offset":get(2)?,"byte_len":get(3)?,"applied_offset":get(4)?})
+        }
+        "k" => {
+            serde_json::json!({"event":"app_tick_release","released_len":get(2)?,"deferred":deferred(get(3)?,get(4)?,get(5)?)})
+        }
+        "d" => {
+            serde_json::json!({"event":"app_draw","drawn":get(2)?,"applied_offset":get(3)?,"scrollback":get(4)?,"deferred":deferred(get(5)?,get(6)?,get(7)?),"repeat":get(8)?,"last_elapsed_us":get(9)?})
+        }
+        "z" => {
+            serde_json::json!({"event":"resize","rows":get(2)?,"cols":get(3)?,"clear":get(4)?,"applied_offset":get(5)?})
+        }
+        "x" => {
+            serde_json::json!({"event":"reader_exit","deferred":deferred(get(2)?,get(3)?,get(4)?)})
+        }
+        "g" => {
+            serde_json::json!({"event":"gap","bin_offset":get(2)?,"missing_raw_bytes":get(3)?,"dropped_records":get(4)?})
+        }
+        _ => bail!("unknown compact record type {code} at record {sequence}"),
+    };
+    record["sequence"] = Value::from(sequence as u64);
+    record["elapsed_us"] = elapsed;
+    Ok(record)
 }
 
 #[test]
@@ -829,6 +1045,47 @@ fn review_resize_while_bytes_held_uses_applied_position_for_raw_truth() {
     assert!(report.contains("applied burst=1 before_equals_after=false third_states=0/1"));
     assert!(report.contains("drawn burst=1 before_equals_after=false third_states=0/1"));
     assert!(report.contains("erase_rewrite kind=RESIZE_CLEAR"));
+}
+
+#[test]
+fn unavailable_apply_is_marked_unknown_and_not_processed() {
+    let binary = b"a\0b";
+    let records = vec![
+        serde_json::json!({"sequence":0,"elapsed_us":0,"event":"metadata","version":1,"rows":3,"cols":20}),
+        serde_json::json!({"sequence":1,"elapsed_us":1,"event":"read","bin_offset":0,"read_len":1}),
+        serde_json::json!({"sequence":2,"elapsed_us":2,"event":"read","bin_offset":2,"read_len":1}),
+        serde_json::json!({"sequence":3,"elapsed_us":3,"event":"parser_apply","bin_offset":0,"byte_len":3,"applied_offset":3}),
+    ];
+    let report = replay(binary, &records, DEFAULT_BURST_GAP_US).unwrap();
+    assert!(report.contains("apply_unknown record=3 offset=0 len=3 unavailable=1"));
+    assert!(report.contains("applied burst=1 before_equals_after=false third_states=0/0"));
+}
+
+#[test]
+fn replay_file_preserves_unindexed_v1_binary_tail() {
+    let root = std::env::temp_dir().join(format!(
+        "renga-replay-tail-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("pane-1.jsonl");
+    std::fs::write(root.join("pane-1.bin"), b"abcX").unwrap();
+    std::fs::write(
+        &path,
+        concat!(
+            "{\"sequence\":0,\"elapsed_us\":0,\"event\":\"metadata\",\"version\":1,\"rows\":3,\"cols\":20}\n",
+            "{\"sequence\":1,\"elapsed_us\":1,\"event\":\"read\",\"bin_offset\":0,\"read_len\":3}\n"
+        ),
+    )
+    .unwrap();
+    let report = replay_file(&path, DEFAULT_BURST_GAP_US).unwrap();
+    assert!(report.contains("unindexed_binary_tail=1"));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

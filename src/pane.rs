@@ -3026,6 +3026,7 @@ mod tests {
         let origin = Instant::now();
         let mut config = test_config("auto-negative", origin);
         config.continuous_directory = None;
+        config.automatic_dump_delay = Duration::from_millis(50);
         let _cleanup = crate::pane_capture::TestCaptureCleanup::new(&config);
         let capture = Capture::create(config.clone(), 91, None, 8, 80).unwrap();
         let mut stream = SynchronizedOutputStream {

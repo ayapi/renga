@@ -96,8 +96,10 @@ impl App {
                     Ok(captures) => {
                         let reply = Arc::new(Mutex::new(Some(reply)));
                         let worker_reply = reply.clone();
-                        let start =
-                            crate::pane_capture::dump_captures_async(captures, move |result| {
+                        let start = crate::pane_capture::dump_captures_async(
+                            captures,
+                            "ipc",
+                            move |result| {
                                 let result = result.map_err(|error| {
                                     ipc::CodedError::new(
                                         ipc::err_code::PANE_CAPTURE_DUMP_FAILED,
@@ -111,7 +113,8 @@ impl App {
                                 {
                                     let _ = reply.send(result);
                                 }
-                            });
+                            },
+                        );
                         if let Err(error) = start {
                             if let Some(reply) = reply
                                 .lock()
