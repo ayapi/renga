@@ -482,7 +482,15 @@ impl CompactRecord {
                     Some("tick_release") => 5,
                     Some("erase_conversion") => 6,
                     Some("inside_erase_hold") => 7,
-                    _ => 0,
+                    Some("idle_timeout") => 8,
+                    Some("max_duration") => 9,
+                    other => {
+                        debug_assert!(
+                            other.is_none(),
+                            "transition reason must have a compact encoding: {other:?}"
+                        );
+                        0
+                    }
                 };
             }
             Data::ParserApply {
@@ -607,7 +615,12 @@ impl CompactRecord {
                     5 => Some("tick_release"),
                     6 => Some("erase_conversion"),
                     7 => Some("inside_erase_hold"),
-                    _ => None,
+                    8 => Some("idle_timeout"),
+                    9 => Some("max_duration"),
+                    code => {
+                        debug_assert_eq!(code, 0, "unknown compact transition reason code");
+                        None
+                    }
                 },
             },
             3 => Data::ParserApply {
@@ -3206,6 +3219,43 @@ mod tests {
     }
 
     #[test]
+    fn compact_transition_reasons_round_trip_without_loss() {
+        for reason in [
+            "end_marker",
+            "timeout",
+            "byte_cap",
+            "reader_exit",
+            "tick_release",
+            "erase_conversion",
+            "inside_erase_hold",
+            "idle_timeout",
+            "max_duration",
+        ] {
+            let record = StoredRecord {
+                timestamp_unix_ms: 1_000,
+                elapsed_us: 2_000,
+                data: Data::Transition {
+                    action: "close",
+                    kind: DEFERRED_KIND_DEC2026,
+                    marker: None,
+                    bin_offset: 42,
+                    reason: Some(reason),
+                },
+                bytes: None,
+                queue_cost: 0,
+            };
+
+            match CompactRecord::from_stored(&record).data() {
+                Data::Transition {
+                    reason: compact_reason,
+                    ..
+                } => assert_eq!(compact_reason, Some(reason)),
+                data => panic!("expected transition, got {data:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn field_shape_record_eviction_is_not_an_automatic_dump_trigger() {
         let mut ring = RingState::new(40, 120, 4 * 1024 * 1024);
         let interval_us = 8_520_u64;
@@ -3335,6 +3385,8 @@ mod tests {
                         Some("tick_release") => Some("tick_release"),
                         Some("erase_conversion") => Some("erase_conversion"),
                         Some("inside_erase_hold") => Some("inside_erase_hold"),
+                        Some("idle_timeout") => Some("idle_timeout"),
+                        Some("max_duration") => Some("max_duration"),
                         _ => None,
                     },
                 },
