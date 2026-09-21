@@ -14,7 +14,7 @@ impl App {
             self.pane_capture_status = None;
             self.dirty = true;
         }
-        // Erase-keyed output produces no event while held, so this pass must
+        // Deferred pane output produces no event while held, so this pass must
         // run independently of `dirty` and before draining the channel. Its
         // generated PtyOutput is then counted and gated exactly like reader
         // output in the same UI iteration.

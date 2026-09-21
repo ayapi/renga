@@ -344,12 +344,15 @@ possible and an older server's missing key is reported as no command requested.
 Pane snapshots do not expose a partially applied DEC private mode 2026
 synchronized-output frame. Renga applies a completed frame to the terminal
 parser in one update. An incomplete frame is released on the first later PTY
-read after 350 ms, when its buffered payload exceeds 1 MiB, or when the reader
-exits.
+read or UI iteration after 250 ms without another frame read, after five
+seconds total, when its buffered payload exceeds 4 MiB, or when the reader
+exits. The UI polling interval is additional scheduling time. A frame promoted
+from an erase hold preserves both clocks and includes the clear prefix, so the
+pre-clear screen remains visible until the promoted frame is released.
 
 Outside an open DEC 2026 frame, `ESC[2J` and `ESC[3J` begin an erase-keyed
 snapshot hold. Its bytes reach the parser together on the first later PTY read
-or UI iteration at or after 40 ms, when the shared 1 MiB cap is exceeded, or
+or UI iteration at or after 40 ms, when the shared 4 MiB cap is exceeded, or
 when the reader exits. The UI iteration can add up to one polling interval:
 about 33 ms at the default 30 fps and up to 1 second at `--fps 1`. A DEC 2026
 frame that begins during the hold retains its own atomicity if the erase hold
@@ -744,10 +747,10 @@ frozen v1.0 schema. Its keys and defaults may change in a minor release under
 §5.3. Capture is on by default with no environment variable or opt-in key.
 `pane_capture_ring_bytes = 0` is an explicit opt-out.
 
-Per live pane, the named memory limits are the raw ring cap, up to 1 MiB of
+Per live pane, the named memory limits are the raw ring cap, up to 4 MiB of
 forced-cut hold slack plus one 4096-byte PTY read, an auxiliary record budget
 of `max(ring_bytes, 64 KiB)`, and a producer backlog budget of the same size,
-plus fixed bookkeeping. With the default 4 MiB ring this is about 13.004 MiB
+plus fixed bookkeeping. With the default 4 MiB ring this is about 16.004 MiB
 per live pane before fixed bookkeeping. A dump temporarily owns its snapshot
 while a writer produces the files.
 
@@ -849,11 +852,14 @@ because downstream is required to read the `[code]` token for branching.
   not a stable protocol promise.
 
 Applying a DEC private mode 2026 frame to the pane parser in one update is an
-internal timing change. `inspect_pane` may now keep returning the last complete
-screen while such a frame is in progress, then expose the completed frame all
-at once. A partially applied frame was never a documented snapshot outcome, so
-this uses section 3 of `docs/semver-policy.md` for undocumented or deferred
-behavior changes. The response schema and snapshot meaning are unchanged.
+intentional deferred-timing change. `inspect_pane` may keep returning the last
+complete screen while reads remain active, for up to the five-second absolute
+limit plus UI scheduling time, then expose up to 4 MiB in one parser update. A
+partially applied synchronized frame was never a documented snapshot outcome,
+so this uses section 3 of `docs/semver-policy.md`; no major release is needed
+because the response schema and snapshot meaning are unchanged. On the measured
+host, releasing a 363-389 KB field frame takes about 5 ms, while releasing 4 MiB
+takes about 40 ms (about 1.2 frame periods at 30 fps), paid once per frame.
 
 - **Erase-keyed pane repaint timing**: `inspect_pane` may return the pre-erase
   screen for up to 40 ms plus one UI polling interval, then expose the buffered

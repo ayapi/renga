@@ -41,18 +41,24 @@ inspection, so freezing only rendering would still expose a partially applied
 frame to automation. Buffering makes rendering and parser inspection observe
 the same complete state.
 
-Two safeguards limit a missing end marker:
+Three safeguards limit a missing end marker:
 
-- `SYNCHRONIZED_OUTPUT_TIMEOUT` is 350 ms. Because the PTY read is blocking, the
-  deadline is checked on the next read; both normal EOF and read-error exits
-  also flush the frame. A producer that opens a frame and goes silent leaves the
-  last complete screen visible until it writes again or the PTY closes. This is
-  a coherent stale screen while the producer is already stalled.
-- `SYNCHRONIZED_OUTPUT_BYTE_CAP` is 1 MiB. Exceeding that buffered byte count
-  flushes the accumulated bytes and returns the reader to pass-through mode.
+- `SYNCHRONIZED_OUTPUT_IDLE_TIMEOUT` is 250 ms from the last PTY read that
+  appended frame bytes. The check runs before an incoming read is appended, so
+  a read after an idle gap is pass-through. The UI drain checks the same clock,
+  so a producer that goes silent cannot leave the old screen frozen forever.
+- `SYNCHRONIZED_OUTPUT_MAX_DURATION` is five seconds from the begin-marker read.
+  It is an absolute limit even while reads continue. When both time rules apply,
+  the maximum-duration reason takes precedence.
+- `SYNCHRONIZED_OUTPUT_BYTE_CAP` is 4 MiB. A read that crosses the cap is applied
+  in full with the accumulated frame, after which the stream returns to
+  pass-through mode. Atomic application is therefore scoped to frames of 4 MiB
+  or less.
 
-Repeated start markers do not nest or reset the timeout. An end marker outside
-a frame has no synchronization effect. All marker bytes still reach vt100.
+Normal EOF and read-error exits also flush a frame. Repeated start markers do
+not nest, reset the begin clock, or avoid advancing the last-read clock as
+ordinary frame bytes. An end marker outside a frame has no synchronization
+effect. All marker bytes still reach vt100.
 
 ## Measured scope
 
@@ -84,12 +90,33 @@ Erase repaints were transiently wrong in 4 of 4 cases. Measured `ESC[H`-only
 repaints never exposed a third state, including the one that changed content,
 so `ESC[H` alone remains per-read and does not open a hold.
 
+The later pane-5 field capture found the reported sweep's different shape.
+Codex first emitted a 131-byte whole-screen and scrollback clear, then opened
+one DEC 2026 frame 0.4-0.9 ms later and re-emitted its complete transcript. The
+seven completed rewrites were 362,934-393,606 bytes across 967-6,924 reads and
+lasted 1.46-2.28 seconds. Their largest consecutive-read gap was 16-41 ms. The
+old 350 ms since-open rule released 57-94 KB once and streamed the remaining
+roughly 300 KB per read, producing the visible top-to-bottom sweep; each later
+end marker was unmatched.
+
+With the inactivity and absolute-duration rules, all seven retained frames
+close at Codex's end marker. The two drop-free clusters at 8374.995 s and
+8773.075 s replay as exactly one 363,050-byte and 389,325-byte parser update,
+including the 116-byte clear prefix promoted from the erase hold, with no blank
+or intermediate draw at any of eight tick phases. The pane therefore keeps its
+pre-clear screen for up to about 2.3 seconds in this measured workload, then
+changes once. On the measured host, parsing a field-sized 363-389 KB release
+takes about 5 ms; parsing a 4 MiB release takes about 40 ms, or about 1.2 frame
+periods at 30 fps. That one-time release cost is not free. A frame exceeding
+4 MiB still returns to per-read application after its cap release, so this does
+not claim atomic repaint for larger rewrites.
+
 ## Erase-keyed hold
 
 Outside an open DEC 2026 frame, `ESC[2J` or `ESC[3J` moves parser output into a
 shared pane hold. The reader continues every raw-read detector unchanged, but
 the parser and `PtyOutput` notification wait. The hold closes on the first
-later PTY read or UI iteration at or after 40 ms, when the existing 1 MiB byte
+later PTY read or UI iteration at or after 40 ms, when the shared 4 MiB byte
 cap is exceeded, or on either reader exit path. The UI scans every pane before
 draining PTY events even when no pane is dirty, so an idle Codex pane cannot
 remain frozen on its pre-erase screen. Its generated `PtyOutput` uses the full
@@ -103,15 +130,15 @@ first repaint.
 
 DEC 2026 framing and erase holds do not nest. Erases inside a frame remain
 frame data. Complete frames inside an erase hold remain held through their end
-marker. If an unmatched frame begin exists when the erase hold closes, bytes
-before that begin are released and the suffix remains an open synchronized
-frame, preserving its parser atomicity.
+marker. If an unmatched frame begin exists when the erase hold closes, the
+entire hold is promoted into that synchronized frame, including bytes before
+the begin. Its begin and last-read clocks are preserved rather than restarted,
+so the pre-clear parser screen remains visible until release.
 
 A burst stretched past 40 ms by host load is cut mid-rewrite and shows the
 same half-applied paint, rarer. An additional erase arriving inside the first
-hold's 40 ms is likewise governed by that original fixed cap. The measured
-scope is erase repaints and idle Codex; this investigation does not claim that
-the field-observed sweep is gone before the separate live field check.
+hold's 40 ms is likewise governed by that original fixed cap. Unframed repaints
+remain outside the DEC frame guarantees above.
 
 ## Field capture and replay
 
@@ -236,7 +263,7 @@ prefix already applied to vt100, starting at zero.
 | `read` | `bin_offset` (zero-based start), positive `read_len`, `deferred` after this read. Consecutive read ranges cover the binary stream. |
 | `transition` | `action`: `marker`, `open`, `close`, or `promote`; `kind`: `marker`, `dec2026`, or `erase_hold`; `marker`: `dec2026_begin`, `dec2026_end`, `erase_display`, `erase_scrollback`, or null; `bin_offset`; `reason` or null. Marker/open offsets include marker prefixes split across reads. Close offsets identify the consumed position at the release decision. |
 | `parser_apply` | `bin_offset`, `byte_len`, `applied_offset`. Applies that raw range, which starts at the previous applied offset. Ranges can end partway through a read or combine several reads. |
-| `app_tick_release` | `released_len`, resulting `deferred`; the actual App-side erase release, including its own tick timestamp. |
+| `app_tick_release` | `released_len`, resulting `deferred`; an App-side erase or DEC-frame expiry pass, including its own tick timestamp. One late tick can promote an erase hold and release the resulting expired frame in the same pass. |
 | `app_draw` | `drawn`, `applied_offset`, `scrollback`, `deferred`, and optional `repeat` / `last_elapsed_us`. True means terminal content was copied into this App frame; false means this pane was skipped. Equal consecutive draws are coalesced before both ring and continuous fanout; `repeat` preserves their logical count. A draw is an App buffer render, not confirmation of host-terminal presentation. |
 | `resize` | `rows`, `cols`, `clear: true`, `applied_offset`. At this parser position, call `set_size`, then process `ESC[2J ESC[H` (with no intervening space). These injected bytes are not raw PTY bytes and do not advance the applied offset. |
 | `reader_exit` | Resulting `deferred`; emitted after applying the reader's final released bytes, for EOF or a read error. |
@@ -249,9 +276,11 @@ offset identifies the parser state actually copied. A frame inside an erase
 hold gets its own open/end-marker close records. An unmatched frame that
 survives the erase release has action `promote`, reason `erase_conversion`;
 its original begin instant remains in the subsequent deferred state.
-Close reasons are `end_marker`, `timeout` (reader-side age check), `byte_cap`,
-`reader_exit`, and `tick_release`. Open reason `inside_erase_hold` identifies
-a frame whose bytes are still retained by an erase hold.
+Close reasons are `end_marker`, `idle_timeout`, `max_duration`, `byte_cap`,
+`reader_exit`, and `tick_release`. The first two timed DEC reasons can come from
+the reader or UI tick; `tick_release` remains the erase-hold reason. Open reason
+`inside_erase_hold` identifies a frame whose bytes are still retained by an
+erase hold.
 
 For example, the following minimal converter output corresponds to binary
 bytes `abc`. The replay helper accepts these common fields without requiring

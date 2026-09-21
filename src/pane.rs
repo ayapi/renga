@@ -17,17 +17,21 @@ use crate::pane_capture::{
 
 const MOUSE_PROTOCOL_CACHE_TTL: Duration = Duration::from_secs(2);
 
-/// Maximum time a DEC synchronized-output frame may remain buffered before
-/// the next PTY read flushes it and returns the pane to pass-through mode.
-const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_millis(350);
+/// Maximum idle time after the most recent read appended bytes to a DEC
+/// synchronized-output frame before it is flushed.
+const SYNCHRONIZED_OUTPUT_IDLE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Absolute maximum age of a DEC synchronized-output frame, measured from its
+/// begin marker, even while reads continue to arrive.
+const SYNCHRONIZED_OUTPUT_MAX_DURATION: Duration = Duration::from_secs(5);
 
 /// Minimum age of an erase-keyed repaint hold before a later PTY read or UI
 /// iteration may release it. The byte cap or reader exit can release it sooner.
 const ERASE_OUTPUT_HOLD: Duration = Duration::from_millis(40);
 
-/// Maximum byte count retained for one DEC synchronized-output frame before it
-/// is flushed and the pane returns to pass-through mode.
-const SYNCHRONIZED_OUTPUT_BYTE_CAP: usize = 1024 * 1024;
+/// Maximum byte count retained for a DEC synchronized-output frame or erase
+/// hold before it is flushed and the pane returns to pass-through mode.
+const SYNCHRONIZED_OUTPUT_BYTE_CAP: usize = 4 * 1024 * 1024;
 
 #[derive(Copy, Clone)]
 struct CachedMouseProtocol {
@@ -1008,9 +1012,10 @@ impl Pane {
         Ok(false)
     }
 
-    /// Release an erase-keyed hold on the first UI iteration at or after its
-    /// hard cap. The generated `PtyOutput` is consumed by the caller's normal
-    /// event-drain pass, preserving repaint gating and byte diagnostics.
+    /// Release expired erase holds and DEC synchronized-output frames on the
+    /// first UI iteration at or after their deadlines. The generated
+    /// `PtyOutput` is consumed by the caller's normal event-drain pass,
+    /// preserving repaint gating and byte diagnostics.
     pub(crate) fn flush_expired_output_at(&self, now: Instant, event_tx: &Sender<AppEvent>) {
         process_synchronized_output(
             &self.synchronized_output,
@@ -1018,7 +1023,7 @@ impl Pane {
             &self.mouse_protocol_cache,
             self.id,
             event_tx,
-            |stream| stream.flush_expired_erase_hold(now),
+            |stream| stream.flush_expired_output(now),
         );
     }
 
@@ -1293,13 +1298,19 @@ const ERASE_SCROLLBACK: &[u8] = b"\x1b[3J";
 
 struct SynchronizedOutputFrame {
     started_at: Instant,
+    last_read_at: Instant,
     bytes: Vec<u8>,
+}
+
+struct UnmatchedSynchronizedOutput {
+    started_at: Instant,
+    last_read_at: Instant,
 }
 
 struct EraseOutputHold {
     started_at: Instant,
     bytes: Vec<u8>,
-    unmatched_synchronized_begin: Option<(usize, Instant)>,
+    unmatched_synchronized_begin: Option<UnmatchedSynchronizedOutput>,
 }
 
 enum DeferredOutput {
@@ -1425,6 +1436,7 @@ impl SynchronizedOutputStream {
                     Self::flush_pass_through(&mut pass_through, &mut flushed);
                     self.deferred = Some(DeferredOutput::Synchronized(SynchronizedOutputFrame {
                         started_at: now,
+                        last_read_at: now,
                         bytes: Vec::new(),
                     }));
                     self.append_bytes(marker_bytes, &mut pass_through, &mut flushed);
@@ -1455,9 +1467,10 @@ impl SynchronizedOutputStream {
                         if hold.unmatched_synchronized_begin.is_none() {
                             opened = true;
                             self.capture_nested_begin = Some(marker_offset);
-                            let marker_offset =
-                                hold.bytes.len().saturating_sub(marker_match.prefix_in_tail);
-                            hold.unmatched_synchronized_begin = Some((marker_offset, now));
+                            hold.unmatched_synchronized_begin = Some(UnmatchedSynchronizedOutput {
+                                started_at: now,
+                                last_read_at: now,
+                            });
                         }
                     }
                     if opened {
@@ -1494,6 +1507,17 @@ impl SynchronizedOutputStream {
             cursor = marker_match.end;
         }
         self.append_bytes(&data[cursor..], &mut pass_through, &mut flushed);
+        if !data.is_empty() {
+            match self.deferred.as_mut() {
+                Some(DeferredOutput::Synchronized(frame)) => frame.last_read_at = now,
+                Some(DeferredOutput::Erase(hold)) => {
+                    if let Some(frame) = hold.unmatched_synchronized_begin.as_mut() {
+                        frame.last_read_at = now;
+                    }
+                }
+                None => {}
+            }
+        }
 
         Self::flush_pass_through(&mut pass_through, &mut flushed);
         if let Some(capture) = self.capture.as_ref().filter(|capture| capture.is_enabled()) {
@@ -1540,11 +1564,29 @@ impl SynchronizedOutputStream {
         }
     }
 
-    fn flush_expired_erase_hold(&mut self, now: Instant) -> Vec<Vec<u8>> {
+    fn flush_expired_output(&mut self, now: Instant) -> Vec<Vec<u8>> {
         self.capture_now = Some(now);
         let mut flushed = Vec::new();
-        if self.erase_hold_expired(now) {
-            self.flush_erase_hold(&mut flushed, "tick_release", &[]);
+        let mut released = false;
+        loop {
+            match self.deferred.as_ref() {
+                Some(DeferredOutput::Erase(hold))
+                    if now.saturating_duration_since(hold.started_at) >= ERASE_OUTPUT_HOLD =>
+                {
+                    released = true;
+                    self.flush_erase_hold(&mut flushed, "tick_release", &[]);
+                }
+                Some(DeferredOutput::Synchronized(frame)) => {
+                    let Some(reason) = Self::synchronized_expiry_reason(frame, now) else {
+                        break;
+                    };
+                    released = true;
+                    self.flush_all_deferred(&mut flushed, reason);
+                }
+                _ => break,
+            }
+        }
+        if released {
             if let Some(capture) = self.capture.as_ref().filter(|capture| capture.is_enabled()) {
                 let deferred = self.capture_state();
                 capture.set_deferred(deferred.clone());
@@ -1613,34 +1655,40 @@ impl SynchronizedOutputStream {
         loop {
             let expired = match self.deferred.as_ref() {
                 Some(DeferredOutput::Synchronized(frame)) => {
-                    now.saturating_duration_since(frame.started_at) >= SYNCHRONIZED_OUTPUT_TIMEOUT
+                    Self::synchronized_expiry_reason(frame, now)
                 }
                 Some(DeferredOutput::Erase(hold)) => {
-                    now.saturating_duration_since(hold.started_at) >= ERASE_OUTPUT_HOLD
+                    (now.saturating_duration_since(hold.started_at) >= ERASE_OUTPUT_HOLD)
+                        .then_some("timeout")
                 }
-                None => false,
+                None => None,
             };
-            if !expired {
+            let Some(reason) = expired else {
                 break;
-            }
+            };
             match self.deferred_kind() {
                 Some(DeferredOutputKind::Erase) => {
                     self.flush_erase_hold(flushed, "timeout", incoming)
                 }
-                Some(DeferredOutputKind::Synchronized) => {
-                    self.flush_all_deferred(flushed, "timeout")
-                }
+                Some(DeferredOutputKind::Synchronized) => self.flush_all_deferred(flushed, reason),
                 None => break,
             }
         }
     }
 
-    fn erase_hold_expired(&self, now: Instant) -> bool {
-        matches!(
-            self.deferred.as_ref(),
-            Some(DeferredOutput::Erase(hold))
-                if now.saturating_duration_since(hold.started_at) >= ERASE_OUTPUT_HOLD
-        )
+    fn synchronized_expiry_reason(
+        frame: &SynchronizedOutputFrame,
+        now: Instant,
+    ) -> Option<&'static str> {
+        if now.saturating_duration_since(frame.started_at) >= SYNCHRONIZED_OUTPUT_MAX_DURATION {
+            Some("max_duration")
+        } else if now.saturating_duration_since(frame.last_read_at)
+            >= SYNCHRONIZED_OUTPUT_IDLE_TIMEOUT
+        {
+            Some("idle_timeout")
+        } else {
+            None
+        }
     }
 
     fn flush_erase_hold(
@@ -1676,10 +1724,10 @@ impl SynchronizedOutputStream {
                 );
             }
         }
-        let Some(DeferredOutput::Erase(mut hold)) = self.deferred.take() else {
+        let Some(DeferredOutput::Erase(hold)) = self.deferred.take() else {
             return;
         };
-        if let Some((offset, started_at)) = hold.unmatched_synchronized_begin {
+        if let Some(frame) = hold.unmatched_synchronized_begin {
             self.capture_transition(
                 "promote",
                 DEFERRED_KIND_DEC2026,
@@ -1688,13 +1736,10 @@ impl SynchronizedOutputStream {
                 Some("erase_conversion"),
             );
             self.capture_nested_begin = None;
-            let synchronized_bytes = hold.bytes.split_off(offset.min(hold.bytes.len()));
-            if !hold.bytes.is_empty() {
-                flushed.push(hold.bytes);
-            }
             self.deferred = Some(DeferredOutput::Synchronized(SynchronizedOutputFrame {
-                started_at,
-                bytes: synchronized_bytes,
+                started_at: frame.started_at,
+                last_read_at: frame.last_read_at,
+                bytes: hold.bytes,
             }));
         } else if !hold.bytes.is_empty() {
             flushed.push(hold.bytes);
@@ -2038,10 +2083,10 @@ fn pty_reader_thread(
                 // bytes remain in the parser stream because vt100 ignores the
                 // unsupported mode harmlessly.
                 //
-                // `read` is blocking, so the timeout is intentionally checked
-                // on the next read. A producer that goes silent mid-frame leaves
-                // the last complete screen visible until it writes again or the
-                // PTY closes; both exit paths flush the buffered bytes below.
+                // Expiry is checked before this read is appended so the first
+                // read after an idle gap returns to pass-through mode. The UI
+                // drain checks the same injected-clock rules, releasing a frame
+                // even when the producer stays silent after losing its marker.
                 #[cfg(test)]
                 let now = output_clock();
                 #[cfg(not(test))]
@@ -2737,7 +2782,7 @@ mod tests {
                 &self.mouse_protocol_cache,
                 4242,
                 self.event_tx.as_ref().expect("event sender available"),
-                |stream| stream.flush_expired_erase_hold(now),
+                |stream| stream.flush_expired_output(now),
             );
         }
 
@@ -2963,7 +3008,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_capture_records_split_frames_conversion_and_all_close_reasons() {
+    fn debug_capture_records_split_frames_conversion_and_all_expiry_reasons() {
         use crate::pane_capture::test_config;
         let origin = Instant::now();
         let config = test_config("transitions", origin);
@@ -2976,17 +3021,21 @@ mod tests {
         stream.push(b"x\x1b[?20", origin);
         stream.push(b"26hy\x1b[?2026l", origin);
         stream.push(SYNCHRONIZED_OUTPUT_BEGIN, origin);
-        stream.push(b"timeout", origin + SYNCHRONIZED_OUTPUT_TIMEOUT);
+        stream.push(b"idle", origin + SYNCHRONIZED_OUTPUT_IDLE_TIMEOUT);
+        stream.push(SYNCHRONIZED_OUTPUT_BEGIN, origin + Duration::from_secs(1));
         stream.push(
-            SYNCHRONIZED_OUTPUT_BEGIN,
-            origin + SYNCHRONIZED_OUTPUT_TIMEOUT,
+            b"max-duration",
+            origin + Duration::from_secs(1) + SYNCHRONIZED_OUTPUT_MAX_DURATION,
         );
+        stream.push(SYNCHRONIZED_OUTPUT_BEGIN, origin + Duration::from_secs(7));
         stream.push(
             &vec![b'x'; SYNCHRONIZED_OUTPUT_BYTE_CAP + 1],
-            origin + SYNCHRONIZED_OUTPUT_TIMEOUT,
+            origin + Duration::from_secs(7),
         );
-        stream.push(b"\x1b[2J\x1b[?2026h", origin + Duration::from_secs(1));
-        stream.flush_expired_erase_hold(origin + Duration::from_secs(1) + ERASE_OUTPUT_HOLD);
+        stream.push(ERASE_DISPLAY, origin + Duration::from_secs(8));
+        stream.flush_expired_output(origin + Duration::from_secs(8) + ERASE_OUTPUT_HOLD);
+        stream.push(b"\x1b[2J\x1b[?2026h", origin + Duration::from_secs(9));
+        stream.flush_expired_output(origin + Duration::from_secs(9) + ERASE_OUTPUT_HOLD);
         stream.finish();
         capture.flush();
         let records: Vec<serde_json::Value> =
@@ -3003,7 +3052,8 @@ mod tests {
         assert_eq!(opens[0]["marker"], "dec2026_begin");
         for reason in [
             "end_marker",
-            "timeout",
+            "idle_timeout",
+            "max_duration",
             "byte_cap",
             "tick_release",
             "reader_exit",
@@ -3048,7 +3098,7 @@ mod tests {
         let ordinary = b"\x1b[2J\x1b[Hrewritten";
         assert!(stream.push(ordinary, origin).is_empty());
         assert_eq!(
-            stream.flush_expired_erase_hold(origin + ERASE_OUTPUT_HOLD),
+            stream.flush_expired_output(origin + ERASE_OUTPUT_HOLD),
             vec![ordinary.to_vec()]
         );
         capture.flush();
@@ -3076,7 +3126,7 @@ mod tests {
         let third = origin + Duration::from_secs(2);
         assert!(stream.push(erase_only, third).is_empty());
         assert_eq!(
-            stream.flush_expired_erase_hold(third + ERASE_OUTPUT_HOLD),
+            stream.flush_expired_output(third + ERASE_OUTPUT_HOLD),
             vec![erase_only.to_vec()]
         );
         capture.flush();
@@ -3085,7 +3135,7 @@ mod tests {
         let fourth = origin + Duration::from_secs(3);
         assert!(stream.push(erase_only, fourth).is_empty());
         assert_eq!(
-            stream.flush_expired_erase_hold(fourth + ERASE_OUTPUT_HOLD),
+            stream.flush_expired_output(fourth + ERASE_OUTPUT_HOLD),
             vec![erase_only.to_vec()]
         );
         capture.flush();
@@ -3164,20 +3214,133 @@ mod tests {
     }
 
     #[test]
-    fn synchronized_output_timeout_flushes_on_next_read() {
+    fn synchronized_output_idle_timeout_flushes_before_the_next_read() {
         let harness = ReaderHarness::new();
         let started = Instant::now();
         harness.send_at(b"\x1b[?2026hstalled", started);
         harness.wait_for_buffered_len(SYNCHRONIZED_OUTPUT_BEGIN.len() + b"stalled".len());
         harness.assert_no_event();
 
-        harness.send_at(b" resumed", started + SYNCHRONIZED_OUTPUT_TIMEOUT);
+        harness.send_at(b" resumed", started + Duration::from_millis(300));
         assert_eq!(
             harness.recv_output(),
             SYNCHRONIZED_OUTPUT_BEGIN.len() + b"stalled".len()
         );
         assert_eq!(harness.recv_output(), b" resumed".len());
-        assert!(harness.screen().starts_with("stalled resumed"));
+        harness.send_at(b" tail", started + Duration::from_millis(301));
+        assert_eq!(harness.recv_output(), b" tail".len());
+        harness.send_at(
+            SYNCHRONIZED_OUTPUT_END,
+            started + Duration::from_millis(302),
+        );
+        assert_eq!(harness.recv_output(), SYNCHRONIZED_OUTPUT_END.len());
+        assert!(harness.screen().starts_with("stalled resumed tail"));
+    }
+
+    #[test]
+    fn four_hundred_kibibyte_frame_over_two_thousand_active_reads_applies_once() {
+        let harness = ReaderHarness::new();
+        let started = Instant::now();
+        harness.send_at(b"old", started - Duration::from_millis(1));
+        assert_eq!(harness.recv_output(), b"old".len());
+        let mut frame = SYNCHRONIZED_OUTPUT_BEGIN.to_vec();
+        frame.extend_from_slice(b"\x1b[2J\x1b[H");
+        frame.extend(std::iter::repeat_n(b'x', 400 * 1024));
+        frame.extend_from_slice(SYNCHRONIZED_OUTPUT_END);
+        let read_count = 2_000;
+
+        for index in 0..read_count - 1 {
+            let start = frame.len() * index / read_count;
+            let end = frame.len() * (index + 1) / read_count;
+            harness.send_at(
+                &frame[start..end],
+                started + Duration::from_millis(index as u64),
+            );
+        }
+        harness.wait_for_buffered_len(frame.len() * (read_count - 1) / read_count);
+        harness.assert_no_event();
+        assert!(harness.screen().starts_with("old"));
+
+        let last = frame.len() * (read_count - 1) / read_count;
+        harness.send_at(
+            &frame[last..],
+            started + Duration::from_millis((read_count - 1) as u64),
+        );
+        assert_eq!(harness.recv_output(), frame.len());
+        assert!(harness.screen().starts_with('x'));
+        harness.assert_no_event();
+    }
+
+    #[test]
+    fn synchronized_output_max_duration_flushes_during_continuing_reads() {
+        let harness = ReaderHarness::new();
+        let started = Instant::now();
+        harness.send_at(SYNCHRONIZED_OUTPUT_BEGIN, started);
+        harness.wait_for_buffered_len(SYNCHRONIZED_OUTPUT_BEGIN.len());
+
+        for step in 1..500 {
+            harness.send_at(b"x", started + Duration::from_millis(step * 10));
+        }
+        harness.wait_for_buffered_len(SYNCHRONIZED_OUTPUT_BEGIN.len() + 499);
+        harness.assert_no_event();
+
+        harness.send_at(b"x", started + SYNCHRONIZED_OUTPUT_MAX_DURATION);
+        assert_eq!(harness.recv_output(), SYNCHRONIZED_OUTPUT_BEGIN.len() + 499);
+        assert_eq!(harness.recv_output(), 1);
+        for step in 501..=600 {
+            harness.send_at(b"x", started + Duration::from_millis(step * 10));
+            assert_eq!(harness.recv_output(), 1);
+        }
+        harness.assert_no_event();
+    }
+
+    #[test]
+    fn silent_synchronized_output_releases_on_idle_tick_without_another_read() {
+        let harness = ReaderHarness::new();
+        let started = Instant::now();
+        let frame = b"\x1b[?2026hstalled";
+        harness.send_at(frame, started);
+        harness.wait_for_buffered_len(frame.len());
+        harness.assert_no_event();
+
+        harness.tick_at(started + SYNCHRONIZED_OUTPUT_IDLE_TIMEOUT);
+        assert_eq!(harness.recv_output(), frame.len());
+        harness.assert_no_event();
+    }
+
+    #[test]
+    fn silent_synchronized_output_prefers_max_duration_reason_on_late_tick() {
+        use crate::pane_capture::test_config;
+        let origin = Instant::now();
+        let config = test_config("max-precedence", origin);
+        let _cleanup = crate::pane_capture::TestCaptureCleanup::new(&config);
+        let capture = Capture::create(config.clone(), 19, None, 8, 80).unwrap();
+        let mut stream = SynchronizedOutputStream {
+            capture: Some(capture.clone()),
+            ..Default::default()
+        };
+        assert!(stream.push(SYNCHRONIZED_OUTPUT_BEGIN, origin).is_empty());
+
+        assert_eq!(
+            stream.flush_expired_output(origin + SYNCHRONIZED_OUTPUT_MAX_DURATION),
+            vec![SYNCHRONIZED_OUTPUT_BEGIN.to_vec()]
+        );
+        capture.flush();
+        let records = std::fs::read_to_string(config.directory.join("pane-19.jsonl")).unwrap();
+        assert!(records.lines().any(|line| {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            record["action"] == "close" && record["reason"] == "max_duration"
+        }));
+        assert!(!records.lines().any(|line| {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            record["action"] == "close" && record["reason"] == "idle_timeout"
+        }));
+        assert!(records.lines().any(|line| {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            record["event"] == "app_tick_release"
+                && record["released_len"] == SYNCHRONIZED_OUTPUT_BEGIN.len()
+                && record["deferred"]["kind"] == "none"
+        }));
     }
 
     #[test]
@@ -3276,7 +3439,7 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_synchronized_begin_survives_erase_hold_close() {
+    fn erase_conversion_keeps_clear_prefix_hidden_until_frame_end() {
         let harness = ReaderHarness::new();
         let started = Instant::now();
         harness.send_at(b"before", started);
@@ -3289,27 +3452,19 @@ mod tests {
         harness.wait_for_buffered_len(held.len());
         harness.tick_at(started + ERASE_OUTPUT_HOLD);
 
-        let synchronized_offset = held
-            .windows(SYNCHRONIZED_OUTPUT_BEGIN.len())
-            .position(|window| window == SYNCHRONIZED_OUTPUT_BEGIN)
-            .expect("synchronized begin in held bytes");
-        assert_eq!(harness.recv_output(), synchronized_offset);
-        assert!(harness.screen().starts_with("rewrite"));
-        assert!(!harness.screen().contains("half"));
         harness.assert_no_event();
+        assert!(harness.screen().starts_with("before"));
+        assert!(!harness.screen().contains("half"));
 
         let mut end = b"-whole".to_vec();
         end.extend_from_slice(SYNCHRONIZED_OUTPUT_END);
         harness.send_at(&end, started + Duration::from_millis(45));
-        assert_eq!(
-            harness.recv_output(),
-            held.len() - synchronized_offset + end.len()
-        );
+        assert_eq!(harness.recv_output(), held.len() + end.len());
         assert!(harness.screen().contains("half-whole"));
     }
 
     #[test]
-    fn erase_hold_repeated_begin_preserves_first_unmatched_frame_start() {
+    fn erase_conversion_repeated_begin_keeps_the_whole_hold_in_first_frame() {
         let mut stream = SynchronizedOutputStream::default();
         let started = Instant::now();
         let mut held = b"\x1b[2Jprefix".to_vec();
@@ -3319,13 +3474,9 @@ mod tests {
         held.extend_from_slice(b"second-half");
 
         assert!(stream.push(&held, started).is_empty());
-        let first_begin = held
-            .windows(SYNCHRONIZED_OUTPUT_BEGIN.len())
-            .position(|window| window == SYNCHRONIZED_OUTPUT_BEGIN)
-            .expect("first synchronized begin in held bytes");
         assert_eq!(
-            stream.flush_expired_erase_hold(started + ERASE_OUTPUT_HOLD),
-            vec![held[..first_begin].to_vec()]
+            stream.flush_expired_output(started + ERASE_OUTPUT_HOLD),
+            Vec::<Vec<u8>>::new()
         );
         assert_eq!(
             stream.deferred_kind(),
@@ -3334,7 +3485,7 @@ mod tests {
 
         assert_eq!(
             stream.push(SYNCHRONIZED_OUTPUT_END, started + Duration::from_millis(45)),
-            vec![held[first_begin..]
+            vec![held
                 .iter()
                 .copied()
                 .chain(SYNCHRONIZED_OUTPUT_END.iter().copied())
@@ -3343,33 +3494,107 @@ mod tests {
     }
 
     #[test]
-    fn converted_synchronized_frame_timeout_starts_at_its_begin_read() {
+    fn promoted_frame_idle_clock_tracks_the_last_read_after_its_begin() {
+        let mut stream = SynchronizedOutputStream::default();
+        let started = Instant::now();
+        let mut held = ERASE_DISPLAY.to_vec();
+        held.extend_from_slice(SYNCHRONIZED_OUTPUT_BEGIN);
+        held.extend_from_slice(b"half");
+        assert!(stream.push(&held, started).is_empty());
+        let post_begin_read = started + Duration::from_millis(30);
+        assert!(stream.push(b"more", post_begin_read).is_empty());
+        assert_eq!(
+            stream.flush_expired_output(started + ERASE_OUTPUT_HOLD),
+            Vec::<Vec<u8>>::new()
+        );
+        assert!(stream
+            .flush_expired_output(started + Duration::from_millis(260))
+            .is_empty());
+        assert_eq!(
+            stream.deferred_kind(),
+            Some(DeferredOutputKind::Synchronized)
+        );
+
+        held.extend_from_slice(b"more");
+        assert_eq!(
+            stream.flush_expired_output(post_begin_read + SYNCHRONIZED_OUTPUT_IDLE_TIMEOUT),
+            vec![held]
+        );
+    }
+
+    #[test]
+    fn promoted_frame_read_expiry_uses_the_last_read_inside_the_erase_hold() {
+        let mut stream = SynchronizedOutputStream::default();
+        let started = Instant::now();
+        let mut held = ERASE_DISPLAY.to_vec();
+        held.extend_from_slice(SYNCHRONIZED_OUTPUT_BEGIN);
+        assert!(stream.push(&held, started).is_empty());
+        let post_begin_read = started + Duration::from_millis(30);
+        assert!(stream.push(b"inside-hold", post_begin_read).is_empty());
+        assert!(stream
+            .flush_expired_output(started + ERASE_OUTPUT_HOLD)
+            .is_empty());
+
+        let next = b"still-active";
+        assert!(stream
+            .push(next, started + Duration::from_millis(260))
+            .is_empty());
+        assert_eq!(
+            stream.deferred_kind(),
+            Some(DeferredOutputKind::Synchronized)
+        );
+
+        held.extend_from_slice(b"inside-hold");
+        held.extend_from_slice(next);
+        assert_eq!(
+            stream.flush_expired_output(
+                started + Duration::from_millis(260) + SYNCHRONIZED_OUTPUT_IDLE_TIMEOUT,
+            ),
+            vec![held]
+        );
+    }
+
+    #[test]
+    fn promoted_frame_max_duration_stays_anchored_to_its_begin_read() {
         let mut stream = SynchronizedOutputStream::default();
         let hold_started = Instant::now();
-        let frame_started = hold_started + Duration::from_millis(30);
+        let frame_started = hold_started + Duration::from_millis(10);
         assert!(stream.push(ERASE_DISPLAY, hold_started).is_empty());
-
-        let mut frame = SYNCHRONIZED_OUTPUT_BEGIN.to_vec();
-        frame.extend_from_slice(b"half");
-        assert!(stream.push(&frame, frame_started).is_empty());
-        assert_eq!(
-            stream.flush_expired_erase_hold(hold_started + ERASE_OUTPUT_HOLD),
-            vec![ERASE_DISPLAY.to_vec()]
-        );
-
         assert!(stream
-            .push(b"more", hold_started + Duration::from_millis(360))
+            .push(SYNCHRONIZED_OUTPUT_BEGIN, frame_started)
             .is_empty());
-        let mut expected = frame;
-        expected.extend_from_slice(b"more");
-        expected.extend_from_slice(SYNCHRONIZED_OUTPUT_END);
+        assert!(stream
+            .flush_expired_output(hold_started + ERASE_OUTPUT_HOLD)
+            .is_empty());
+
+        for elapsed_ms in (200..5_000).step_by(200) {
+            assert!(stream
+                .push(b"x", frame_started + Duration::from_millis(elapsed_ms))
+                .is_empty());
+        }
+        let released =
+            stream.flush_expired_output(frame_started + SYNCHRONIZED_OUTPUT_MAX_DURATION);
+        assert_eq!(released.len(), 1);
         assert_eq!(
-            stream.push(
-                SYNCHRONIZED_OUTPUT_END,
-                hold_started + Duration::from_millis(370)
-            ),
-            vec![expected]
+            released[0].len(),
+            ERASE_DISPLAY.len() + SYNCHRONIZED_OUTPUT_BEGIN.len() + 24
         );
+    }
+
+    #[test]
+    fn late_tick_promotes_erase_hold_and_releases_idle_frame_in_one_pass() {
+        let mut stream = SynchronizedOutputStream::default();
+        let started = Instant::now();
+        let mut held = ERASE_DISPLAY.to_vec();
+        held.extend_from_slice(SYNCHRONIZED_OUTPUT_BEGIN);
+        held.extend_from_slice(b"stalled");
+        assert!(stream.push(&held, started).is_empty());
+
+        assert_eq!(
+            stream.flush_expired_output(started + SYNCHRONIZED_OUTPUT_IDLE_TIMEOUT),
+            vec![held]
+        );
+        assert_eq!(stream.deferred_kind(), None);
     }
 
     #[test]
@@ -3379,7 +3604,7 @@ mod tests {
         let first = b"prefix\x1b[2J";
         assert_eq!(stream.push(first, started), vec![b"prefix".to_vec()]);
         assert_eq!(
-            stream.flush_expired_erase_hold(started + ERASE_OUTPUT_HOLD),
+            stream.flush_expired_output(started + ERASE_OUTPUT_HOLD),
             vec![ERASE_DISPLAY.to_vec()]
         );
 
@@ -3407,10 +3632,10 @@ mod tests {
         );
         assert_eq!(stream.deferred_kind(), Some(DeferredOutputKind::Erase));
         assert!(stream
-            .flush_expired_erase_hold(started + Duration::from_millis(60))
+            .flush_expired_output(started + Duration::from_millis(60))
             .is_empty());
         assert_eq!(
-            stream.flush_expired_erase_hold(started + Duration::from_millis(85)),
+            stream.flush_expired_output(started + Duration::from_millis(85)),
             vec![ERASE_SCROLLBACK.to_vec()]
         );
     }
@@ -3564,23 +3789,25 @@ mod tests {
     }
 
     #[test]
-    fn synchronized_output_repeated_begin_does_not_nest_or_reset_timeout() {
+    fn synchronized_output_repeated_begin_does_not_reset_max_duration() {
         let mut stream = SynchronizedOutputStream::default();
         let started = Instant::now();
         assert!(stream.push(SYNCHRONIZED_OUTPUT_BEGIN, started).is_empty());
-        let repeated_at = started + SYNCHRONIZED_OUTPUT_TIMEOUT / 2;
-        let mut repeated = b"first".to_vec();
-        repeated.extend_from_slice(SYNCHRONIZED_OUTPUT_BEGIN);
-        repeated.extend_from_slice(b"second");
-        assert!(stream.push(&repeated, repeated_at).is_empty());
-
         let mut expected_frame = SYNCHRONIZED_OUTPUT_BEGIN.to_vec();
-        expected_frame.extend_from_slice(b"first");
-        expected_frame.extend_from_slice(SYNCHRONIZED_OUTPUT_BEGIN);
-        expected_frame.extend_from_slice(b"second");
+        for elapsed_ms in (200..5_000).step_by(200) {
+            let data = if elapsed_ms == 4_800 {
+                SYNCHRONIZED_OUTPUT_BEGIN
+            } else {
+                b"x"
+            };
+            assert!(stream
+                .push(data, started + Duration::from_millis(elapsed_ms))
+                .is_empty());
+            expected_frame.extend_from_slice(data);
+        }
         assert_eq!(
-            stream.push(b"after", started + SYNCHRONIZED_OUTPUT_TIMEOUT),
-            vec![expected_frame, b"after".to_vec()]
+            stream.flush_expired_output(started + SYNCHRONIZED_OUTPUT_MAX_DURATION),
+            vec![expected_frame]
         );
     }
 

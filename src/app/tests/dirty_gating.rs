@@ -185,6 +185,52 @@ fn production_drain_uses_current_time_for_expired_erase_hold() {
 }
 
 #[test]
+fn production_drain_uses_current_time_for_idle_synchronized_frame() {
+    let mut app = App::new(40, 80).expect("App::new");
+    quiesce(&mut app);
+    let pane_id = app.ws().focused_pane_id;
+    let last_read_at = Instant::now() - Duration::from_millis(251);
+    let frame = b"\x1b[?2026hproduction-drain-idle-frame";
+    let event_tx = app.event_tx.clone();
+    let pane = app
+        .ws()
+        .panes
+        .get(&pane_id)
+        .expect("focused pane available");
+    pane.process_test_output_at(frame, last_read_at, &event_tx);
+    assert!(!pane
+        .parser
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .screen()
+        .contents()
+        .contains("production-drain-idle-frame"));
+
+    app.dirty = false;
+    frame_diagnostics::begin_test_frame(last_read_at);
+    assert!(app.drain_pty_events());
+
+    let pane = app
+        .ws()
+        .panes
+        .get(&pane_id)
+        .expect("focused pane available");
+    assert!(pane
+        .parser
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .screen()
+        .contents()
+        .contains("production-drain-idle-frame"));
+    assert_eq!(
+        frame_diagnostics::output_bytes_for_test(pane_id),
+        frame.len()
+    );
+    frame_diagnostics::clear_test_frame();
+    app.shutdown();
+}
+
+#[test]
 fn pty_output_for_unknown_pane_does_not_dirty() {
     // A reader thread can still drain a chunk after its pane was
     // removed from every workspace; that must not repaint either.

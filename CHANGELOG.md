@@ -74,7 +74,7 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 - **Measured erase-keyed pane repaints are now applied as one parser update.**
   Outside DEC private mode 2026 frames, `ESC[2J` and `ESC[3J` start a pane-local
   output hold. The first later PTY read or UI iteration at or after 40 ms
-  releases the buffered bytes; the 1 MiB byte cap and reader exits also release
+  releases the buffered bytes; the 4 MiB byte cap and reader exits also release
   them. A repaint stretched past the fixed 40 ms cap by host load can therefore
   still be released mid-rewrite and show the same half-applied paint, though
   less often. The UI iteration adds up to roughly 33 ms at the default 30 fps
@@ -87,10 +87,17 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 - **Pane synchronized-output frames are now applied atomically.** Bytes between
   DEC private mode 2026 start and end markers reach the terminal parser in one
   update and trigger one repaint notification, even when the frame spans
-  several PTY reads. Timeout, size-cap, and reader-exit safeguards release an
-  incomplete frame when activity resumes, its cap is reached, or the reader
-  exits. Large redraws without synchronized-output markers continue to be
-  applied per read. (renga-swk)
+  several PTY reads. The frame stays held while reads arrive less than 250 ms
+  apart, with a five-second absolute limit, a 4 MiB byte cap, and reader-exit
+  safeguards. The same clocks survive promotion from an erase hold, including
+  the clear prefix, so measured 363-389 KB Codex transcript rewrites keep the
+  pre-clear screen for up to about 2.3 seconds and then change once. Parsing
+  that field-sized release costs about 5 ms on the measured host; a 4 MiB
+  release costs about 40 ms and is paid once per frame. Larger or unframed
+  redraws return to per-read application. This is an intentional deferred-
+  timing change under
+  [`docs/semver-policy.md` section 3](./docs/semver-policy.md#3-what-counts-as-a-breaking-change).
+  (renga-swk, renga-g3s)
 
 - **Nested Claude processes no longer take over a live Codex pane's peer
   routing.** While a Codex subscriber is alive, later Claude registration and
