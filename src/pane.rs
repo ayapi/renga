@@ -3789,6 +3789,60 @@ mod tests {
     }
 
     #[test]
+    fn synchronized_output_literal_two_mibibyte_frame_waits_for_end_marker() {
+        const PAYLOAD_LEN: usize = 2 * 1024 * 1024;
+        const READ_LEN: usize = 64 * 1024;
+        let mut stream = SynchronizedOutputStream::default();
+        let started = Instant::now();
+        assert!(stream.push(SYNCHRONIZED_OUTPUT_BEGIN, started).is_empty());
+
+        let payload = vec![b'x'; PAYLOAD_LEN];
+        for (index, read) in payload.chunks(READ_LEN).enumerate() {
+            assert!(stream
+                .push(read, started + Duration::from_millis(index as u64 + 1),)
+                .is_empty());
+        }
+
+        let released = stream.push(
+            SYNCHRONIZED_OUTPUT_END,
+            started + Duration::from_millis(payload.chunks(READ_LEN).len() as u64 + 1),
+        );
+        assert_eq!(released.len(), 1);
+        assert_eq!(
+            released[0].len(),
+            SYNCHRONIZED_OUTPUT_BEGIN.len() + PAYLOAD_LEN + SYNCHRONIZED_OUTPUT_END.len()
+        );
+        assert!(released[0].starts_with(SYNCHRONIZED_OUTPUT_BEGIN));
+        assert!(released[0].ends_with(SYNCHRONIZED_OUTPUT_END));
+    }
+
+    #[test]
+    fn synchronized_output_literal_four_mibibyte_cap_releases_once_then_passes_through() {
+        const PAYLOAD_LEN: usize = 4 * 1024 * 1024 + 1;
+        const READ_LEN: usize = 64 * 1024;
+        let mut stream = SynchronizedOutputStream::default();
+        let started = Instant::now();
+        assert!(stream.push(SYNCHRONIZED_OUTPUT_BEGIN, started).is_empty());
+
+        let payload = vec![b'x'; PAYLOAD_LEN];
+        let mut outputs = Vec::new();
+        for (index, read) in payload.chunks(READ_LEN).enumerate() {
+            outputs.extend(stream.push(read, started + Duration::from_millis(index as u64 + 1)));
+        }
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(
+            outputs[0].len(),
+            SYNCHRONIZED_OUTPUT_BEGIN.len() + 4 * 1024 * 1024
+        );
+        assert!(outputs[0].starts_with(SYNCHRONIZED_OUTPUT_BEGIN));
+        assert_eq!(outputs[1], vec![b'x']);
+        assert_eq!(
+            stream.push(SYNCHRONIZED_OUTPUT_END, started + Duration::from_millis(66),),
+            vec![SYNCHRONIZED_OUTPUT_END.to_vec()]
+        );
+    }
+
+    #[test]
     fn synchronized_output_repeated_begin_does_not_reset_max_duration() {
         let mut stream = SynchronizedOutputStream::default();
         let started = Instant::now();

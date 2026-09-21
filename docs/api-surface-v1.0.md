@@ -348,7 +348,10 @@ read or UI iteration after 250 ms without another frame read, after five
 seconds total, when its buffered payload exceeds 4 MiB, or when the reader
 exits. The UI polling interval is additional scheduling time. A frame promoted
 from an erase hold preserves both clocks and includes the clear prefix, so the
-pre-clear screen remains visible until the promoted frame is released.
+pre-clear screen remains visible until the promoted frame is released. Per
+pane, this deferred-output buffer can retain up to 4 MiB plus one 4096-byte PTY
+read for up to five seconds. On the measured host, releasing 363-389 KB costs
+about 5 ms of parsing; releasing 4 MiB costs about 40 ms.
 
 Outside an open DEC 2026 frame, `ESC[2J` and `ESC[3J` begin an erase-keyed
 snapshot hold. Its bytes reach the parser together on the first later PTY read
@@ -747,10 +750,10 @@ frozen v1.0 schema. Its keys and defaults may change in a minor release under
 §5.3. Capture is on by default with no environment variable or opt-in key.
 `pane_capture_ring_bytes = 0` is an explicit opt-out.
 
-Per live pane, the named memory limits are the raw ring cap, up to 4 MiB of
+Per live pane, the named memory limits are the raw ring cap, up to 1 MiB of
 forced-cut hold slack plus one 4096-byte PTY read, an auxiliary record budget
 of `max(ring_bytes, 64 KiB)`, and a producer backlog budget of the same size,
-plus fixed bookkeeping. With the default 4 MiB ring this is about 16.004 MiB
+plus fixed bookkeeping. With the default 4 MiB ring this is about 13.004 MiB
 per live pane before fixed bookkeeping. A dump temporarily owns its snapshot
 while a writer produces the files.
 
