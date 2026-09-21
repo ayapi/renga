@@ -1097,6 +1097,149 @@ fn producer_drop_tail_apply_is_marked_unavailable() {
 }
 
 #[test]
+fn compact_v2_round_trips_every_record_and_transition_reason() {
+    let deferred = super::DeferredState {
+        kind: super::DEFERRED_KIND_ERASE_HOLD,
+        opened_at_elapsed_us: Some(17),
+        buffered_len: 23,
+    };
+    let mut variants = vec![
+        super::Data::Read {
+            bin_offset: 11,
+            read_len: 13,
+            deferred: deferred.clone(),
+        },
+        super::Data::ParserApply {
+            bin_offset: 11,
+            byte_len: 13,
+            applied_offset: 24,
+        },
+        super::Data::AppTickRelease {
+            released_len: 19,
+            deferred: deferred.clone(),
+        },
+        super::Data::AppDraw {
+            drawn: true,
+            applied_offset: 24,
+            scrollback: 7,
+            deferred: deferred.clone(),
+            repeat: 3,
+            last_elapsed_us: Some(222),
+        },
+        super::Data::Resize {
+            rows: 41,
+            cols: 121,
+            clear: true,
+            applied_offset: 24,
+        },
+        super::Data::ReaderExit {
+            deferred: deferred.clone(),
+        },
+        super::Data::Gap {
+            bin_offset: 24,
+            missing_raw_bytes: 29,
+            dropped_records: 31,
+        },
+        super::Data::Transition {
+            action: "open",
+            kind: super::DEFERRED_KIND_DEC2026,
+            marker: Some("dec2026_begin"),
+            bin_offset: 37,
+            reason: Some("inside_erase_hold"),
+        },
+        super::Data::Transition {
+            action: "promote",
+            kind: super::DEFERRED_KIND_DEC2026,
+            marker: Some("erase_display"),
+            bin_offset: 41,
+            reason: Some("erase_conversion"),
+        },
+        super::Data::Transition {
+            action: "marker",
+            kind: "marker",
+            marker: Some("erase_scrollback"),
+            bin_offset: 43,
+            reason: None,
+        },
+    ];
+    // None is the idle/no-close-reason state; the remaining values cover every
+    // close reason emitted by the pane state machine plus the two transition
+    // reasons used while an erase hold contains a synchronized-output frame.
+    for reason in [
+        None,
+        Some("end_marker"),
+        Some("timeout"),
+        Some("byte_cap"),
+        Some("reader_exit"),
+        Some("tick_release"),
+        Some("erase_conversion"),
+        Some("inside_erase_hold"),
+    ] {
+        variants.push(super::Data::Transition {
+            action: "close",
+            kind: super::DEFERRED_KIND_ERASE_HOLD,
+            marker: Some("dec2026_end"),
+            bin_offset: 47,
+            reason,
+        });
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "renga-compact-roundtrip-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("records.jsonl");
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    let elapsed_us = 123_u64;
+    for data in &variants {
+        let stored = super::StoredRecord {
+            timestamp_unix_ms: 1000,
+            elapsed_us,
+            data: data.clone(),
+            bytes: None,
+            queue_cost: 0,
+        };
+        let compact = super::CompactRecord::from_stored(&stored);
+        super::write_compact_record(&mut writer, elapsed_us, compact.data()).unwrap();
+    }
+    drop(writer);
+
+    let lines: Vec<_> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), variants.len());
+    for (index, (encoded, original)) in lines.into_iter().zip(variants).enumerate() {
+        let sequence = index + 1;
+        let decoded = compact_record(sequence, encoded).unwrap();
+        let mut expected = serde_json::to_value(original).unwrap();
+        expected["sequence"] = Value::from(sequence as u64);
+        expected["elapsed_us"] = Value::from(elapsed_us);
+        assert_eq!(decoded, expected, "variant {index} did not round-trip");
+    }
+
+    let metadata = serde_json::json!({
+        "event": "metadata",
+        "version": 2,
+        "rows": 3,
+        "cols": 8,
+        "origin_unix_ms": 1000,
+    });
+    let decoded_metadata = compact_record(0, metadata).unwrap();
+    assert_eq!(decoded_metadata["version"], 1);
+    assert_eq!(decoded_metadata["sequence"], 0);
+    assert_eq!(decoded_metadata["elapsed_us"], 0);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn replay_file_preserves_unindexed_v1_binary_tail() {
     let root = std::env::temp_dir().join(format!(
         "renga-replay-tail-{}-{}",

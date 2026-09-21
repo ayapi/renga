@@ -3859,4 +3859,126 @@ mod tests {
         assert_eq!(metadata["automatic_trigger_elapsed_us"], 0);
         assert!(metadata["achieved_delay_us"].as_u64().unwrap() < 5_000_000);
     }
+
+    #[test]
+    fn automatic_dump_releases_eviction_pin_after_completion() {
+        let origin = Instant::now();
+        let mut config = test_config("automatic-pin-release", origin);
+        let _cleanup = TestCaptureCleanup::new(&config);
+        config.continuous_directory = None;
+        config.ring_bytes = MIN_AUXILIARY_BYTES;
+        config.automatic_dump_delay = Duration::ZERO;
+        let (done, receive) = mpsc::channel();
+        config.automatic_dump_done = Some(done);
+        let capture = Capture::create(config, 93, None, 3, 8).unwrap();
+        let idle = DeferredState {
+            kind: DEFERRED_KIND_NONE,
+            ..DeferredState::default()
+        };
+
+        capture.read(origin, 0, b"trigger", idle.clone());
+        capture.applied(7);
+        capture.automatic_dump(origin, "erase_hold_cap");
+        receive
+            .recv_timeout(Duration::from_secs(2))
+            .expect("automatic dump completion");
+
+        let mut offset = 7_u64;
+        for index in 0..256_u64 {
+            let bytes = vec![index as u8; 1024];
+            capture.read(
+                origin + Duration::from_micros(index + 1),
+                offset,
+                &bytes,
+                idle.clone(),
+            );
+            capture.applied(bytes.len());
+            offset += bytes.len() as u64;
+            if index % 16 == 15 {
+                capture.flush();
+            }
+        }
+        capture.flush();
+
+        let ring = capture
+            .ring
+            .lock()
+            .unwrap_or_else(|value| value.into_inner());
+        assert!(ring.automatic_pin_start.is_none());
+        assert!(
+            ring.raw_bytes <= ring.cap,
+            "raw_bytes={} cap={} groups={} safe={} base={} latest_applied={} pin={:?}",
+            ring.raw_bytes,
+            ring.cap,
+            ring.groups.len(),
+            ring.groups.iter().filter(|group| group.safe_start).count(),
+            ring.base,
+            ring.latest_applied,
+            ring.automatic_pin_start,
+        );
+        assert!(ring.raw.len() <= ring.hard_cap);
+        assert!(ring.evicted_raw_bytes > 0);
+    }
+
+    #[test]
+    fn raw_ring_eviction_drains_the_retained_byte_prefix() {
+        let origin = Instant::now();
+        let mut config = test_config("raw-eviction-bytes", origin);
+        let _cleanup = TestCaptureCleanup::new(&config);
+        config.continuous_directory = None;
+        config.ring_bytes = 16;
+        std::fs::create_dir_all(&config.dump_root).unwrap();
+
+        let mut ring = RingState::new(3, 8, config.ring_bytes);
+        let idle = DeferredState {
+            kind: DEFERRED_KIND_NONE,
+            ..DeferredState::default()
+        };
+        for index in 0..32_u64 {
+            let bytes = vec![index as u8; 4];
+            ring.push(StoredRecord {
+                timestamp_unix_ms: 1000,
+                elapsed_us: index * 2,
+                data: Data::Read {
+                    bin_offset: index * 4,
+                    read_len: bytes.len(),
+                    deferred: idle.clone(),
+                },
+                queue_cost: bytes.len() + std::mem::size_of::<StoredRecord>() + 64,
+                bytes: Some(bytes),
+            });
+            ring.push(StoredRecord {
+                timestamp_unix_ms: 1000,
+                elapsed_us: index * 2 + 1,
+                data: Data::ParserApply {
+                    bin_offset: index * 4,
+                    byte_len: 4,
+                    applied_offset: index * 4 + 4,
+                },
+                bytes: None,
+                queue_cost: std::mem::size_of::<StoredRecord>() + 64,
+            });
+        }
+
+        let snapshot = ring.snapshot(0, 0);
+        let expected: Vec<u8> = snapshot
+            .records()
+            .filter_map(|record| match record.data() {
+                Data::Read {
+                    bin_offset,
+                    read_len,
+                    ..
+                } => Some(vec![(bin_offset / 4) as u8; read_len]),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(ring.raw_bytes <= ring.cap);
+        assert!(ring.raw.len() <= ring.cap);
+        assert_eq!(snapshot.raw.as_slice(), expected.as_slice());
+
+        let report =
+            write_snapshot(&config.dump_root, &config, 94, None, snapshot, None, false).unwrap();
+        assert_eq!(std::fs::read(report.bin_path.unwrap()).unwrap(), expected,);
+    }
 }

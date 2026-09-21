@@ -438,6 +438,12 @@ minutes against `<= 160 MB + 12 * 13.004 MiB` private memory, `<= 0.5` total
 capture CPU core, and a final 12-pane dump containing `outcome.json` plus either
 complete or path-bearing partial results.
 
+The accepted 45-minute run measured 322--326 MB private memory over its final
+20 minutes (326 MB steady for 12 busy panes on this host, versus 160 MB without
+capture), 1.2% variation, and 0.135 total CPU core. The per-pane formula above
+accounts for the charged ring, slack, and producer backlog but excludes fixed
+recorder bookkeeping; the measured process total includes that bookkeeping.
+
 The release ring microbenchmark measured 0.198 us/push in its first
 full-capacity window and 0.208 us/push in its last (1.05x; 40-byte compact
 records and 144-byte transient queue records). A corrected three-minute
