@@ -24,6 +24,7 @@ const HOLD_SLACK_BYTES: usize = 1024 * 1024;
 const MAX_PTY_READ_BYTES: usize = 4096;
 const MIN_AUXILIARY_BYTES: usize = 64 * 1024;
 const DUMP_DEADLINE: Duration = Duration::from_secs(3);
+const DUMP_REPLY_DEADLINE: Duration = Duration::from_secs(4);
 const WRITER_QUEUE_RECORDS: usize = 256;
 const AUTOMATIC_DUMP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const AUTOMATIC_DUMP_DELAY: Duration = Duration::from_secs(10);
@@ -56,7 +57,10 @@ pub(crate) struct Config {
     pub(crate) retained_automatic_dumps: usize,
     pub(crate) automatic_dump_total_bytes: usize,
     pub(crate) automatic_dump_delay: Duration,
+    dump_reply_deadline: Duration,
     automatic_dump_now: Arc<dyn Fn() -> Instant + Send + Sync>,
+    #[cfg(test)]
+    dump_write_gate: Option<Arc<TestWriteGate>>,
     #[cfg(test)]
     pub(crate) automatic_dump_done: Option<mpsc::Sender<()>>,
     session_token: u128,
@@ -69,8 +73,26 @@ thread_local! {
     };
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct TestWriteGate {
+    state: Mutex<TestWriteGateState>,
+    signal: Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestWriteGateState {
+    entered: bool,
+    released: bool,
+}
+
 fn now_since_epoch() -> Option<Duration> {
     SystemTime::now().duration_since(UNIX_EPOCH).ok()
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(not(test))]
@@ -109,6 +131,7 @@ fn resolve_config(
         retained_automatic_dumps: debug.pane_capture_auto_dumps,
         automatic_dump_total_bytes: debug.pane_capture_auto_total_bytes,
         automatic_dump_delay: AUTOMATIC_DUMP_DELAY,
+        dump_reply_deadline: DUMP_REPLY_DEADLINE,
         automatic_dump_now: Arc::new(Instant::now),
         session_token: time.as_nanos(),
     }
@@ -249,6 +272,12 @@ pub(crate) struct MetadataData {
     automatic_dump_suppressions: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     automatic_dump_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    automatic_trigger_elapsed_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_in_window: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    achieved_delay_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     partial: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -707,6 +736,7 @@ enum RecorderCommand {
         record: StoredRecord,
     },
     AutomaticDump {
+        triggered_at: Instant,
         due: Instant,
         elapsed_us: u64,
         reason: &'static str,
@@ -842,6 +872,8 @@ struct RingState {
     record_budget_evictions: u64,
     gaps: u64,
     automatic_dump_suppressions: u64,
+    automatic_pin_start: Option<u64>,
+    automatic_pin_pressure: bool,
     latest_applied: u64,
     prior_deferred: &'static str,
 }
@@ -871,6 +903,8 @@ impl RingState {
             record_budget_evictions: 0,
             gaps: 0,
             automatic_dump_suppressions: 0,
+            automatic_pin_start: None,
+            automatic_pin_pressure: false,
             latest_applied: 0,
             prior_deferred: DEFERRED_KIND_NONE,
         }
@@ -949,7 +983,11 @@ impl RingState {
         }
         self.evict_if_needed();
         if !is_read && self.record_cost > self.record_cap && self.groups.is_empty() {
-            self.drop_latest_structural_record();
+            if self.automatic_pin_start.is_some() {
+                self.automatic_pin_pressure = true;
+            } else {
+                self.drop_latest_structural_record();
+            }
         }
         self.forced_cuts != forced_before
     }
@@ -1002,6 +1040,14 @@ impl RingState {
                 break;
             }
             let next_start = next.start;
+            if self.automatic_pin_start.is_some_and(|pin_start| {
+                self.groups
+                    .front()
+                    .is_none_or(|group| group.start >= pin_start)
+            }) {
+                self.automatic_pin_pressure = true;
+                break;
+            }
             let Some(removed) = self.groups.pop_front() else {
                 break;
             };
@@ -1028,6 +1074,29 @@ impl RingState {
                 self.forced_cuts = self.forced_cuts.saturating_add(1);
             }
         }
+    }
+
+    fn pin_automatic_trigger(&mut self) {
+        if self.automatic_pin_start.is_some() {
+            return;
+        }
+        self.automatic_pin_start = self
+            .current
+            .as_ref()
+            .map(|group| group.start)
+            .or_else(|| self.groups.back().map(|group| group.start))
+            .or(Some(self.base));
+        self.automatic_pin_pressure = false;
+    }
+
+    fn take_automatic_pin_pressure(&mut self) -> bool {
+        std::mem::take(&mut self.automatic_pin_pressure)
+    }
+
+    fn release_automatic_pin(&mut self) {
+        self.automatic_pin_start = None;
+        self.automatic_pin_pressure = false;
+        self.evict_if_needed();
     }
 
     fn snapshot(&self, queued_records: u64, queued_bytes: usize) -> RingSnapshot {
@@ -1096,6 +1165,14 @@ fn record_ring_drop(records: &mut Vec<CompactRecord>, dropped: CompactRecord) {
 #[derive(Default)]
 struct AutomaticDumpLimiter {
     last_fired_elapsed_us: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingAutomaticDump {
+    triggered_at: Instant,
+    due: Instant,
+    trigger_elapsed_us: u64,
+    reason: &'static str,
 }
 
 impl AutomaticDumpLimiter {
@@ -1373,6 +1450,7 @@ impl Capture {
         }
         self.flush_pending_draw();
         let _ = self.sender.send(RecorderCommand::AutomaticDump {
+            triggered_at: at,
             due: at + self.config.automatic_dump_delay,
             elapsed_us: self.elapsed_us(at),
             reason,
@@ -1582,24 +1660,32 @@ fn recorder_loop(
     let mut automatic_sequence = 0_u64;
     let mut disk_drops = DropSummary::default();
     let mut last_disk_record: Option<StoredRecord> = None;
-    let mut pending_automatic: Option<(Instant, u64, &'static str)> = None;
+    let mut pending_automatic: Option<PendingAutomaticDump> = None;
     loop {
-        let command = if let Some((due, trigger_elapsed_us, reason)) = pending_automatic {
-            match receiver
-                .recv_timeout(due.saturating_duration_since((config.automatic_dump_now)()))
-            {
+        let command = if let Some(pending) = pending_automatic {
+            match receiver.recv_timeout(
+                pending
+                    .due
+                    .saturating_duration_since((config.automatic_dump_now)()),
+            ) {
                 Ok(command) => command,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let mut ring = ring.lock().unwrap_or_else(|value| value.into_inner());
+                    let achieved_delay_us = duration_us(
+                        (config.automatic_dump_now)()
+                            .saturating_duration_since(pending.triggered_at),
+                    );
                     write_automatic_from_ring(
                         config.clone(),
                         pane_id,
                         child_process_id,
                         &mut ring,
                         &mut automatic_sequence,
-                        trigger_elapsed_us,
-                        reason,
+                        pending.trigger_elapsed_us,
+                        pending.reason,
+                        achieved_delay_us,
                     );
+                    ring.release_automatic_pin();
                     pending_automatic = None;
                     continue;
                 }
@@ -1630,6 +1716,25 @@ fn recorder_loop(
                     last_disk_record = Some(record.clone());
                 }
                 let forced_cut = ring.push(record);
+                if ring.take_automatic_pin_pressure() {
+                    if let Some(pending) = pending_automatic.take() {
+                        let achieved_delay_us = duration_us(
+                            (config.automatic_dump_now)()
+                                .saturating_duration_since(pending.triggered_at),
+                        );
+                        write_automatic_from_ring(
+                            config.clone(),
+                            pane_id,
+                            child_process_id,
+                            &mut ring,
+                            &mut automatic_sequence,
+                            pending.trigger_elapsed_us,
+                            pending.reason,
+                            achieved_delay_us,
+                        );
+                        ring.release_automatic_pin();
+                    }
+                }
                 if forced_cut
                     && admit_automatic_dump(
                         config.clone(),
@@ -1638,18 +1743,20 @@ fn recorder_loop(
                         elapsed_us,
                     )
                 {
-                    pending_automatic = Some((
-                        config.origin
-                            + Duration::from_micros(elapsed_us)
-                            + config.automatic_dump_delay,
-                        elapsed_us,
-                        "forced_cut",
-                    ));
+                    let triggered_at = config.origin + Duration::from_micros(elapsed_us);
+                    ring.pin_automatic_trigger();
+                    pending_automatic = Some(PendingAutomaticDump {
+                        triggered_at,
+                        due: triggered_at + config.automatic_dump_delay,
+                        trigger_elapsed_us: elapsed_us,
+                        reason: "forced_cut",
+                    });
                 }
                 processed_records.fetch_add(processed, Ordering::AcqRel);
                 drain_signal.1.notify_all();
             }
             RecorderCommand::AutomaticDump {
+                triggered_at,
                 due,
                 elapsed_us,
                 reason,
@@ -1661,7 +1768,13 @@ fn recorder_loop(
                     &mut automatic_limiter,
                     elapsed_us,
                 ) {
-                    pending_automatic = Some((due, elapsed_us, reason));
+                    ring.pin_automatic_trigger();
+                    pending_automatic = Some(PendingAutomaticDump {
+                        triggered_at,
+                        due,
+                        trigger_elapsed_us: elapsed_us,
+                        reason,
+                    });
                 }
             }
             RecorderCommand::Flush(done) => {
@@ -1712,8 +1825,21 @@ fn write_automatic_from_ring(
     sequence: &mut u64,
     trigger_elapsed_us: u64,
     reason: &'static str,
+    achieved_delay_us: u64,
 ) {
     let snapshot = ring.snapshot(0, 0);
+    let first_elapsed_us = snapshot.records().next().map(|record| record.elapsed_us);
+    let last_elapsed_us = snapshot.records().last().map(|record| record.elapsed_us);
+    let trigger_in_window = first_elapsed_us.is_some_and(|first| {
+        first <= trigger_elapsed_us
+            && last_elapsed_us.is_some_and(|last| trigger_elapsed_us <= last)
+    });
+    let automatic = AutomaticSnapshotMetadata {
+        reason,
+        trigger_elapsed_us,
+        trigger_in_window,
+        achieved_delay_us,
+    };
     let current_sequence = *sequence;
     *sequence = sequence.saturating_add(1);
     #[cfg(test)]
@@ -1726,8 +1852,7 @@ fn write_automatic_from_ring(
                 pane_id,
                 child_process_id,
                 current_sequence,
-                reason,
-                trigger_elapsed_us,
+                automatic,
                 snapshot,
             )
             .is_err()
@@ -1835,6 +1960,9 @@ fn open_segment(
         gaps: Some(0),
         automatic_dump_suppressions: Some(0),
         automatic_dump_reason: None,
+        automatic_trigger_elapsed_us: None,
+        trigger_in_window: None,
+        achieved_delay_us: None,
         partial: None,
         queued_records: None,
         queued_bytes: None,
@@ -2069,8 +2197,18 @@ pub(crate) fn format_dump_report(report: &DumpReport) -> String {
         .iter()
         .filter(|pane| pane.status == "ok")
         .count();
-    let failed = report.panes.len().saturating_sub(ok);
-    if failed == 0 {
+    let writing = report
+        .panes
+        .iter()
+        .filter(|pane| pane.status == "writing")
+        .count();
+    let failed = report.panes.len().saturating_sub(ok + writing);
+    if writing > 0 {
+        format!(
+            "saved {ok} pane(s), {writing} still writing, {failed} failed; directory {}",
+            report.directory
+        )
+    } else if failed == 0 {
         format!("saved {ok} pane(s) to {}", report.directory)
     } else {
         format!(
@@ -2132,6 +2270,7 @@ where
     }
     trace_dump_attempt("started", requester, &directory, &selected_panes);
     let worker_count = captures.len();
+    let reply_deadline = Instant::now() + first.config.dump_reply_deadline;
     let (done, receive) = mpsc::channel();
     let now = Arc::new(now);
     for (index, capture) in captures.into_iter().enumerate() {
@@ -2177,29 +2316,131 @@ where
     }
     drop(done);
     let mut ordered: Vec<Option<PaneDumpReport>> = vec![None; worker_count];
-    for _ in 0..worker_count {
-        let Ok((index, report)) = receive.recv() else {
+    let mut remaining = worker_count;
+    while remaining > 0 {
+        let wait = reply_deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
             break;
-        };
-        ordered[index] = Some(report);
+        }
+        match receive.recv_timeout(wait) {
+            Ok((index, report)) => {
+                if ordered[index].replace(report).is_none() {
+                    remaining -= 1;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                remaining = 0;
+                break;
+            }
+        }
     }
-    let panes = ordered
-        .into_iter()
-        .enumerate()
-        .map(|(index, report)| {
-            report.unwrap_or_else(|| {
-                failed_dump(
-                    selected_panes[index],
-                    "timed_out",
-                    "coordinator deadline exceeded",
-                )
-            })
-        })
-        .collect();
-    let report = DumpReport {
+    if remaining == 0 {
+        let report = completed_dump_report(&directory, &selected_panes, ordered);
+        finalize_manual_outcome(&directory, requester, &selected_panes, &report)?;
+        return Ok(report);
+    }
+
+    let report = pending_dump_report(&directory, &selected_panes, &ordered);
+    let writing = serde_json::json!({
+        "state": "writing",
+        "updated_at_unix_ms": now_since_epoch().unwrap_or_default().as_millis(),
+        "requester": requester,
+        "selector": { "pane_ids": &selected_panes },
+        "panes": &report.panes,
+    });
+    std::fs::write(
+        directory.join("outcome.json"),
+        serde_json::to_vec_pretty(&writing).unwrap_or_default(),
+    )
+    .map_err(|error| format!("cannot update dump outcome: {error}"))?;
+    trace_dump_attempt("writing", requester, &directory, &selected_panes);
+
+    let final_directory = directory.clone();
+    let final_selected_panes = selected_panes.clone();
+    let spawn_failure_ordered = ordered.clone();
+    let spawn = std::thread::Builder::new()
+        .name("pane-capture-dump-finalizer".into())
+        .spawn(move || {
+            while remaining > 0 {
+                let Ok((index, pane_report)) = receive.recv() else {
+                    break;
+                };
+                if ordered[index].replace(pane_report).is_none() {
+                    remaining -= 1;
+                }
+            }
+            let final_report =
+                completed_dump_report(&final_directory, &final_selected_panes, ordered);
+            if finalize_manual_outcome(
+                &final_directory,
+                requester,
+                &final_selected_panes,
+                &final_report,
+            )
+            .is_err()
+            {
+                FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    if spawn.is_err() {
+        FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let failed_report =
+            completed_dump_report(&directory, &selected_panes, spawn_failure_ordered);
+        let _ = finalize_manual_outcome(&directory, requester, &selected_panes, &failed_report);
+        return Err("cannot start pane capture dump finalizer".into());
+    }
+    Ok(report)
+}
+
+fn pending_dump_report(
+    directory: &Path,
+    selected_panes: &[usize],
+    ordered: &[Option<PaneDumpReport>],
+) -> DumpReport {
+    DumpReport {
         directory: directory.to_string_lossy().into_owned(),
-        panes,
-    };
+        panes: ordered
+            .iter()
+            .enumerate()
+            .map(|(index, report)| {
+                report.clone().unwrap_or_else(|| {
+                    failed_dump(
+                        selected_panes[index],
+                        "writing",
+                        "dump still writing; see outcome.json",
+                    )
+                })
+            })
+            .collect(),
+    }
+}
+
+fn completed_dump_report(
+    directory: &Path,
+    selected_panes: &[usize],
+    ordered: Vec<Option<PaneDumpReport>>,
+) -> DumpReport {
+    DumpReport {
+        directory: directory.to_string_lossy().into_owned(),
+        panes: ordered
+            .into_iter()
+            .enumerate()
+            .map(|(index, report)| {
+                report.unwrap_or_else(|| {
+                    failed_dump(selected_panes[index], "failed", "dump writer stopped")
+                })
+            })
+            .collect(),
+    }
+}
+
+fn finalize_manual_outcome(
+    directory: &Path,
+    requester: &'static str,
+    selected_panes: &[usize],
+    report: &DumpReport,
+) -> Result<(), String> {
     let final_state = if report.panes.iter().all(|pane| pane.status == "ok") {
         "written"
     } else if report
@@ -2222,11 +2463,11 @@ where
         directory.join("outcome.json"),
         serde_json::to_vec_pretty(&outcome).unwrap_or_default(),
     ) {
-        trace_dump_attempt("failed", requester, &directory, &selected_panes);
+        trace_dump_attempt("failed", requester, directory, selected_panes);
         return Err(format!("cannot finalize dump outcome: {error}"));
     }
-    trace_dump_attempt(final_state, requester, &directory, &selected_panes);
-    Ok(report)
+    trace_dump_attempt(final_state, requester, directory, selected_panes);
+    Ok(())
 }
 
 fn trace_dump_attempt(state: &str, requester: &str, directory: &Path, pane_ids: &[usize]) {
@@ -2249,6 +2490,14 @@ enum DeadlineWriteError {
     Failed(String),
 }
 
+#[derive(Clone, Copy)]
+struct AutomaticSnapshotMetadata {
+    reason: &'static str,
+    trigger_elapsed_us: u64,
+    trigger_in_window: bool,
+    achieved_delay_us: u64,
+}
+
 fn write_snapshot_until(
     directory: PathBuf,
     config: Arc<Config>,
@@ -2259,6 +2508,18 @@ fn write_snapshot_until(
     now: &impl Fn() -> Instant,
 ) -> Result<PaneDumpReport, DeadlineWriteError> {
     let (snapshot, partial) = snapshot.suffix_for_deadline(deadline, now);
+    #[cfg(test)]
+    if let Some(gate) = &config.dump_write_gate {
+        let mut state = gate.state.lock().unwrap_or_else(|value| value.into_inner());
+        state.entered = true;
+        gate.signal.notify_all();
+        while !state.released {
+            state = gate
+                .signal
+                .wait(state)
+                .unwrap_or_else(|value| value.into_inner());
+        }
+    }
     let staging_directory = directory.join(format!(".pane-{pane_id}-pending"));
     std::fs::create_dir(&staging_directory)
         .map_err(|error| DeadlineWriteError::Failed(error.to_string()))?;
@@ -2318,7 +2579,7 @@ fn write_snapshot(
     pane_id: usize,
     child_process_id: Option<u32>,
     snapshot: RingSnapshot,
-    automatic_reason: Option<&'static str>,
+    automatic: Option<AutomaticSnapshotMetadata>,
     partial: bool,
 ) -> std::io::Result<PaneDumpReport> {
     let bin_path = directory.join(format!("pane-{pane_id}.bin"));
@@ -2354,7 +2615,10 @@ fn write_snapshot(
         record_budget_evictions: Some(snapshot.record_budget_evictions),
         gaps: Some(snapshot.gaps),
         automatic_dump_suppressions: Some(snapshot.automatic_dump_suppressions),
-        automatic_dump_reason: automatic_reason,
+        automatic_dump_reason: automatic.map(|metadata| metadata.reason),
+        automatic_trigger_elapsed_us: automatic.map(|metadata| metadata.trigger_elapsed_us),
+        trigger_in_window: automatic.map(|metadata| metadata.trigger_in_window),
+        achieved_delay_us: automatic.map(|metadata| metadata.achieved_delay_us),
         partial: partial.then_some(true),
         queued_records: Some(snapshot.queued_records),
         queued_bytes: Some(snapshot.queued_bytes),
@@ -2531,8 +2795,7 @@ fn write_automatic_snapshot(
     pane_id: usize,
     child_process_id: Option<u32>,
     sequence: u64,
-    reason: &'static str,
-    trigger_elapsed_us: u64,
+    automatic: AutomaticSnapshotMetadata,
     snapshot: RingSnapshot,
 ) -> std::io::Result<()> {
     // Serialize automatic writers through creation and pruning. This makes the
@@ -2555,8 +2818,10 @@ fn write_automatic_snapshot(
         serde_json::to_vec_pretty(&serde_json::json!({
             "state": "started",
             "requester": "automatic",
-            "trigger_reason": reason,
-            "trigger_elapsed_us": trigger_elapsed_us,
+            "trigger_reason": automatic.reason,
+            "trigger_elapsed_us": automatic.trigger_elapsed_us,
+            "trigger_in_window": automatic.trigger_in_window,
+            "achieved_delay_us": automatic.achieved_delay_us,
             "pane_id": pane_id,
         }))?,
     ) {
@@ -2572,7 +2837,7 @@ fn write_automatic_snapshot(
                 pane_id,
                 child_process_id,
                 snapshot,
-                Some(reason),
+                Some(automatic),
                 false,
             )
             .map(|report| pane_report = Some(report))
@@ -2583,8 +2848,10 @@ fn write_automatic_snapshot(
                 serde_json::to_vec_pretty(&serde_json::json!({
                     "state": "written",
                     "requester": "automatic",
-                    "trigger_reason": reason,
-                    "trigger_elapsed_us": trigger_elapsed_us,
+                    "trigger_reason": automatic.reason,
+                    "trigger_elapsed_us": automatic.trigger_elapsed_us,
+                    "trigger_in_window": automatic.trigger_in_window,
+                    "achieved_delay_us": automatic.achieved_delay_us,
                     "pane_id": pane_id,
                     "panes": pane_report.iter().collect::<Vec<_>>(),
                 }))?,
@@ -2597,8 +2864,10 @@ fn write_automatic_snapshot(
             serde_json::to_vec_pretty(&serde_json::json!({
                 "state": "failed",
                 "requester": "automatic",
-                "trigger_reason": reason,
-                "trigger_elapsed_us": trigger_elapsed_us,
+                "trigger_reason": automatic.reason,
+                "trigger_elapsed_us": automatic.trigger_elapsed_us,
+                "trigger_in_window": automatic.trigger_in_window,
+                "achieved_delay_us": automatic.achieved_delay_us,
                 "pane_id": pane_id,
                 "reason": error.to_string(),
             }))
@@ -2786,7 +3055,9 @@ pub(crate) fn test_config(name: &str, origin: Instant) -> Config {
         retained_automatic_dumps: 32,
         automatic_dump_total_bytes: 128 * 1024 * 1024,
         automatic_dump_delay: AUTOMATIC_DUMP_DELAY,
+        dump_reply_deadline: DUMP_REPLY_DEADLINE,
         automatic_dump_now: Arc::new(Instant::now),
+        dump_write_gate: None,
         automatic_dump_done: None,
         session_token: token as u128,
     }
@@ -3260,6 +3531,63 @@ mod tests {
     }
 
     #[test]
+    fn stalled_writer_replies_writing_then_finalizes_outcome() {
+        assert_eq!(DUMP_REPLY_DEADLINE, Duration::from_secs(4));
+        assert!(DUMP_REPLY_DEADLINE < crate::ipc::APP_REPLY_TIMEOUT);
+        let origin = Instant::now();
+        let mut config = test_config("writer-reply-deadline", origin);
+        let _cleanup = TestCaptureCleanup::new(&config);
+        config.continuous_directory = None;
+        config.dump_reply_deadline = Duration::from_millis(50);
+        let gate = Arc::new(TestWriteGate::default());
+        config.dump_write_gate = Some(gate.clone());
+        let capture = Capture::create(config, 51, None, 3, 8).unwrap();
+        capture.read(origin, 0, b"hello", DeferredState::default());
+
+        let started = Instant::now();
+        let report = dump_captures(vec![capture]).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(report.panes[0].status, "writing");
+        assert!(format_dump_report(&report).contains("still writing"));
+        assert!(format_dump_report(&report).contains(&report.directory));
+
+        let interim: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(Path::new(&report.directory).join("outcome.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(interim["state"], "writing");
+        {
+            let mut state = gate.state.lock().unwrap_or_else(|value| value.into_inner());
+            if !state.entered {
+                let result = gate
+                    .signal
+                    .wait_timeout(state, Duration::from_secs(1))
+                    .unwrap_or_else(|value| value.into_inner());
+                state = result.0;
+            }
+            assert!(state.entered);
+            state.released = true;
+            gate.signal.notify_all();
+        }
+
+        let outcome_path = Path::new(&report.directory).join("outcome.json");
+        let wait_until = Instant::now() + Duration::from_secs(2);
+        let outcome = loop {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&outcome_path).unwrap()).unwrap();
+            if value["state"] != "writing" {
+                break value;
+            }
+            assert!(Instant::now() < wait_until, "outcome did not finalize");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(outcome["state"], "written");
+        assert_eq!(outcome["panes"][0]["status"], "ok");
+        assert!(Path::new(outcome["panes"][0]["bin_path"].as_str().unwrap()).is_file());
+        assert!(Path::new(outcome["panes"][0]["jsonl_path"].as_str().unwrap()).is_file());
+    }
+
+    #[test]
     fn dump_is_replay_compatible_and_zero_based() {
         let mut config = test_config("dump", Instant::now());
         let _cleanup = TestCaptureCleanup::new(&config);
@@ -3393,6 +3721,7 @@ mod tests {
             &mut sequence,
             1,
             "forced_cut",
+            0,
         );
 
         automatic_dump_receive
@@ -3476,5 +3805,58 @@ mod tests {
             .map(|record| record[2].as_u64().unwrap())
             .collect();
         assert_eq!(offsets, vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn automatic_dump_ends_delay_before_trigger_group_eviction() {
+        let origin = Instant::now();
+        let mut config = test_config("automatic-pin", origin);
+        let _cleanup = TestCaptureCleanup::new(&config);
+        config.continuous_directory = None;
+        config.ring_bytes = MIN_AUXILIARY_BYTES;
+        config.automatic_dump_delay = Duration::from_secs(5);
+        let (done, receive) = mpsc::channel();
+        config.automatic_dump_done = Some(done);
+        let dump_root = config.dump_root.clone();
+        let capture = Capture::create(config, 92, None, 3, 8).unwrap();
+
+        capture.read(origin, 0, b"t", DeferredState::default());
+        capture.applied(1);
+        capture.automatic_dump(origin, "erase_hold_cap");
+        for index in 1..2_000_u64 {
+            let at = origin + Duration::from_micros(index);
+            capture.read(at, index, b"x", DeferredState::default());
+            capture.applied(1);
+            if index % 100 == 0 {
+                capture.flush();
+            }
+        }
+        capture.flush();
+        receive
+            .recv_timeout(Duration::from_secs(2))
+            .expect("automatic dump should end its delay under ring pressure");
+
+        let directory = std::fs::read_dir(&dump_root)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("auto-"))
+            .unwrap()
+            .path();
+        let outcome: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("outcome.json")).unwrap())
+                .unwrap();
+        assert_eq!(outcome["state"], "written");
+        assert_eq!(outcome["trigger_in_window"], true);
+        assert!(outcome["achieved_delay_us"].as_u64().unwrap() < 5_000_000);
+
+        let metadata: serde_json::Value = std::fs::read_to_string(directory.join("pane-92.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .unwrap();
+        assert_eq!(metadata["trigger_in_window"], true);
+        assert_eq!(metadata["automatic_trigger_elapsed_us"], 0);
+        assert!(metadata["achieved_delay_us"].as_u64().unwrap() < 5_000_000);
     }
 }

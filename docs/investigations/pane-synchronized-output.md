@@ -131,7 +131,9 @@ pane ids, and each pane's status, reason, paths, retained counts, and time
 range. Panes run concurrently with a fresh three-second allowance each. A pane
 that cannot finish the full snapshot in time writes its newest replayable
 suffix, marks it `partial`, and returns both paths; one slow pane does not spend
-another pane's allowance. The optional peer trace records the same lifecycle,
+another pane's allowance. The tool replies within four seconds; a filesystem
+writer still active at that point is reported as `writing`, and the named
+directory's outcome file is finalized only after all writers stop. The optional peer trace records the same lifecycle,
 but `outcome.json` is authoritative for ordinary launches without peer tracing.
 
 An erase hold that reaches its time/byte cap before the replay classifier finds
@@ -142,7 +144,11 @@ starvation past the hard ceiling when chained holds provide no safe cut.
 Ordinary structural-record eviction is not a forced cut and does not write a
 file. An admitted automatic trigger waits 10 seconds before taking its snapshot
 so the following rewrite is present; another trigger during that delay does not
-restart it. `outcome.json` records the original trigger time and reason. Each
+restart it. The trigger group and all later groups are pinned during the delay.
+If retaining that suffix would cross a raw or structural ring budget, capture
+dumps immediately rather than evicting the trigger. `outcome.json` and capture
+metadata record the original trigger time and reason, whether it remains in the
+retained interval, and the achieved delay. Each
 pane has its own limiter, driven by the capture's monotonic elapsed clock: at
 most one dump is admitted per pane per 10 minutes. Suppressions are reported in
 dump metadata as `automatic_dump_suppressions`.
@@ -400,7 +406,10 @@ coalesced on the producer side, before ring and continuous-disk fanout. The
 producer backlog, structural ring records, and raw ring bytes are independently
 charged; whole read-led groups are evicted in constant time instead of
 rescanning the ring on every event. Queue overflow is represented by a gap
-rather than silently corrupting replay.
+rather than silently corrupting replay. Replay treats explicit gap ranges and
+parser applications beyond the final retained read as unavailable data,
+resets the parser segment, and reports their apply-side counts instead of
+rejecting the dump.
 
 Both files flush at fixed 100 ms deadlines even under continuous traffic,
 on close/release (including the resulting parser application), reader exit,
@@ -415,9 +424,12 @@ inside the TUI and pane parsing continues unchanged.
 The default per-pane in-memory ceiling is approximately 13.004 MiB: 4 MiB raw
 ring, at most 1 MiB forced-cut slack plus one 4096-byte read, 4 MiB structural
 record budget, and 4 MiB producer backlog, plus fixed bookkeeping. The ring
-uses 40-byte compact records and one preallocated raw-byte allocation; vector,
+uses 40-byte compact records and one preallocated 5.004 MiB raw-byte allocation
+even while idle; vector,
 group, and deque overhead is charged to the structural budget. Snapshots share
-sealed record groups and copy the contiguous raw ring once. The acceptance
+sealed record groups and copy the contiguous raw ring once, adding up to
+5.004 MiB per actively dumped pane until its writer exits. This dump-time copy
+is transient and is not part of the 13.004 MiB steady-state figure. The acceptance
 load is 6 pane-24 streams at 10x plus 6 pane-28 streams at 30x in a maximized
 window. Its no-capture 5e402df reference was 156--160 MB private memory and
 0.061 CPU cores; b5b4dfd reached 1,363 MB at 606 seconds, averaged 11.3 cores,
@@ -426,8 +438,8 @@ minutes against `<= 160 MB + 12 * 13.004 MiB` private memory, `<= 0.5` total
 capture CPU core, and a final 12-pane dump containing `outcome.json` plus either
 complete or path-bearing partial results.
 
-The release ring microbenchmark measured 0.152 us/push in its first
-full-capacity window and 0.130 us/push in its last (0.86x; 40-byte compact
+The release ring microbenchmark measured 0.198 us/push in its first
+full-capacity window and 0.208 us/push in its last (1.05x; 40-byte compact
 records and 144-byte transient queue records). A corrected three-minute
 preflight on the same 12-pane rig reached 287 MB at 181 seconds and 29
 CPU-seconds total (about 0.160 core, or 0.099 above the no-capture reference).

@@ -447,13 +447,18 @@ Manual and automatic files use compact replay format version 2; continuous
 capture remains version 1, and replay accepts both. A ring dump begins with a
 blank parser at the retained cut, so pre/post/third-state tables before the
 first retained full clear are relative to a blank screen. Later erase clusters
-remain useful. The response and metadata report the actual retained raw bytes,
+remain useful. Explicit gaps and parser applications beyond the last retained
+read are reported as unavailable apply ranges instead of invalidating replay.
+The response and metadata report the actual retained raw bytes,
 record count, queued record/byte counts, and first/last elapsed timestamps; no
 fixed time span is promised. Every attempt creates one directory and writes
 `outcome.json` first with requester, selector, and per-pane lifecycle details.
 All selected panes dump concurrently with independent three-second allowances;
 a timeout returns the newest replayable suffix with both paths and a partial
-reason rather than an empty unexplained result.
+reason rather than an empty unexplained result. The tool reply itself is capped
+at four seconds. A pane whose filesystem writer is still active then has status
+`writing`; the reply names the dump directory, and its `outcome.json` is
+finalized after every writer stops.
 
 Manual and automatic dumps are created beneath the default platform local-data
 directory (`%LOCALAPPDATA%\renga\pane-captures` on Windows). The always-on
@@ -462,7 +467,10 @@ dumps fire when an erase-keyed hold reaches its cap before any printable
 rewrite payload, or when raw-byte starvation forces a cut. Ordinary structural
 eviction never fires one. An admitted trigger snapshots 10 seconds later and
 records the original trigger time/reason in `outcome.json`; another trigger in
-that delay does not restart it. They are limited to once per pane per ten
+that delay does not restart it. The trigger group and everything after it are
+pinned during the delay. If that retained suffix reaches a ring budget, the
+snapshot happens early instead of evicting the trigger. Automatic outcome and
+metadata include `trigger_in_window` and `achieved_delay_us`. They are limited to once per pane per ten
 monotonic minutes. By default, only marked automatic dump
 directories are pruned to 32 directories / 128 MiB; manual dumps are exempt.
 For 13 panes the raw automatic-dump maximum before retention is
@@ -641,7 +649,7 @@ Request-specific `ok.data` shapes include
 `split: { "id": usize, "startup_command"?: string | null }` and
 `new_tab: { "id": usize, "startup_command"?: string | null }` and
 `dump_pane_capture: { "directory": string, "panes": [{ "pane_id": usize,
-"status": "ok"|"timed_out"|"failed", "bin_path"?: string,
+"status": "ok"|"timed_out"|"writing"|"failed", "bin_path"?: string,
 "jsonl_path"?: string, "reason"?: string, "retained_raw_bytes": u64,
 "retained_records": u64, "first_retained_elapsed_us"?: u64|null,
 "last_retained_elapsed_us"?: u64|null }] }` and

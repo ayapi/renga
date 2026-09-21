@@ -23,12 +23,16 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
   backlog now have independent per-pane caps; draw runs are coalesced before
   ring and disk fanout, and ring eviction no longer scans retained history on
   every event. Manual/automatic dumps use compact replay schema v2, while
-  continuous v1 files remain compatible. Queue loss is explicit and legacy
-  missing read ranges replay as parser-resetting gaps. All-pane dumps use
+  continuous v1 files remain compatible. Queue loss is explicit; legacy
+  missing read ranges, explicit gap ranges, and applies beyond the final
+  retained read replay as parser-resetting unavailable data. All-pane dumps use
   parallel per-pane workers and always leave an `outcome.json`; timed-out panes
-  return a path-bearing multi-read newest suffix marked partial. Automatic
-  dumps snapshot 10 seconds after their trigger and record the original trigger
-  time, while routine structural eviction no longer fires a `forced_cut` dump.
+  return a path-bearing multi-read newest suffix marked partial. The tool reply
+  is capped at four seconds with still-active writers reported as `writing`;
+  `outcome.json` finalizes after those writers stop. Automatic dumps snapshot
+  10 seconds after their trigger and record the original trigger time. Their
+  trigger suffix is pinned, with an early snapshot before a ring budget would
+  evict it, while routine structural eviction no longer fires a `forced_cut` dump.
   Automatic dumps fire only when an erase hold reaches its cap before any
   printable rewrite payload, or when the ring must force a cut. They are
   limited per pane by a monotonic 10-minute clock and retain at most 32 marked

@@ -519,6 +519,26 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
         }
         expected_read_offset = offset.saturating_add(len);
     }
+    for record in records.iter().filter(|record| record["event"] == "gap") {
+        let offset = usize::try_from(number(record, "bin_offset")?)?;
+        let len = usize::try_from(number(record, "missing_raw_bytes")?)?;
+        if len > 0 {
+            missing_read_ranges.push(offset..offset.saturating_add(len));
+        }
+    }
+    missing_read_ranges.push(expected_read_offset..usize::MAX);
+    missing_read_ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged_missing_read_ranges = Vec::<std::ops::Range<usize>>::new();
+    for range in missing_read_ranges {
+        if let Some(last) = merged_missing_read_ranges.last_mut() {
+            if range.start <= last.end {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+        }
+        merged_missing_read_ranges.push(range);
+    }
+    let missing_read_ranges = merged_missing_read_ranges;
     let mut pending_resize_clear = false;
     let mut out = String::new();
     let mut last_draw = Screen::of(&applied);
@@ -622,7 +642,7 @@ fn replay(binary: &[u8], records: &[Value], gap_us: u64) -> Result<String> {
                 ensure!(
                     offset == applied_offset
                         && end >= offset
-                        && end <= binary.len()
+                        && (unavailable > 0 || end <= binary.len())
                         && end - offset == number(record, "byte_len")? as usize,
                     "invalid apply range at record {index}"
                 );
@@ -1059,6 +1079,21 @@ fn unavailable_apply_is_marked_unknown_and_not_processed() {
     let report = replay(binary, &records, DEFAULT_BURST_GAP_US).unwrap();
     assert!(report.contains("apply_unknown record=3 offset=0 len=3 unavailable=1"));
     assert!(report.contains("applied burst=1 before_equals_after=false third_states=0/0"));
+}
+
+#[test]
+fn producer_drop_tail_apply_is_marked_unavailable() {
+    let binary = b"a";
+    let records = vec![
+        serde_json::json!({"sequence":0,"elapsed_us":0,"event":"metadata","version":1,"rows":3,"cols":20}),
+        serde_json::json!({"sequence":1,"elapsed_us":1,"event":"read","bin_offset":0,"read_len":1}),
+        serde_json::json!({"sequence":2,"elapsed_us":2,"event":"parser_apply","bin_offset":0,"byte_len":1,"applied_offset":1}),
+        serde_json::json!({"sequence":3,"elapsed_us":3,"event":"gap","bin_offset":1,"missing_raw_bytes":4096,"dropped_records":1}),
+        serde_json::json!({"sequence":4,"elapsed_us":4,"event":"parser_apply","bin_offset":1,"byte_len":4096,"applied_offset":4097}),
+    ];
+    let report = replay(binary, &records, DEFAULT_BURST_GAP_US).unwrap();
+    assert!(report.contains("apply_unknown record=4 offset=1 len=4096 unavailable=4096"));
+    assert!(report.contains("unavailable_apply_count=1 unavailable_apply_bytes=4096"));
 }
 
 #[test]
