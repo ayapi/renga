@@ -2409,6 +2409,175 @@ fn wrapped_legacy_enter_to_send_footer_is_recognized() {
     );
 }
 
+// Codex v0.158.0 idle screen as captured from a live 58x114 pane
+// (renga-6fx): prompt row, blank row, model row, then a hint row carrying
+// `? for shortcuts` and a right-aligned `⚠ 2 warnings · f2 to view`.
+const CODEX_0158_IDLE_FOOTER: &[u8] = b"\x1b[?25h\x1b[2J\x1b[55;1H\x1b[1m\xE2\x80\xBA\x1b[22m \x1b[2mAsk Codex to do anything\x1b[22m\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n  \x1b[1m?\x1b[22m for shortcuts\x1b[K\x1b[57;3H\x1b[38;5;3mGPT-6-Astra high \x1b[m\xC2\xB7 \x1b[38;5;2m~\\Develop\\renga\x1b[K\x1b[58;89H\xE2\x9A\xA0 \x1b[38;2;196;167;103m2 warnings\x1b[m\x1b[1C\xC2\xB7\x1b[1m\x1b[1Cf2\x1b[22m\x1b[1Cto\x1b[1Cview\x1b[55;3H";
+
+fn codex_0158_screen(rows: u16, cols: u16, bytes: &[u8]) -> vt100::Parser {
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(bytes);
+    parser
+}
+
+#[test]
+fn codex_0158_two_row_footer_is_recognized_in_every_hint_shape() {
+    let idle = codex_0158_screen(58, 114, CODEX_0158_IDLE_FOOTER);
+    assert_eq!(
+        codex_prompt_allows_peer_nudge_on_screen(idle.screen()),
+        Some(true)
+    );
+    assert_eq!(
+        codex_composer_has_draft_on_screen(idle.screen()),
+        Some(false)
+    );
+
+    // Hint rows: shortcuts only, warnings only (a draft hides the shortcuts
+    // hint), a singular warning, and the busy model row with its spinner.
+    for (model, hint) in [
+        (
+            "GPT-6-Astra high \u{b7} ~\\Develop\\renga",
+            "  ? for shortcuts",
+        ),
+        (
+            "GPT-6-Astra high \u{b7} ~\\Develop\\renga",
+            "        \u{26a0} 2 warnings \u{b7} f2 to view",
+        ),
+        (
+            "GPT-6-Astra default \u{b7} ~\\Develop\\renga",
+            "  ? for shortcuts   \u{26a0} 1 warning \u{b7} f2 to view",
+        ),
+        (
+            "GPT-6-Astra xhigh \u{b7} ~\\Develop\\renga \u{b7} \u{283c}",
+            "  ? for shortcuts   \u{26a0} 12 warnings \u{b7} f2 to view",
+        ),
+    ] {
+        let screen = format!(
+            "\x1b[?25h\x1b[2J\x1b[10;1H\u{203a} \x1b[2mAsk Codex to do anything\x1b[22m\x1b[12;1H{model}\x1b[13;1H{hint}\x1b[10;3H"
+        );
+        let parser = codex_0158_screen(20, 114, screen.as_bytes());
+        assert_eq!(
+            codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+            Some(true),
+            "model {model:?} hint {hint:?}"
+        );
+    }
+}
+
+#[test]
+fn codex_0158_hint_row_wrapped_in_a_narrow_pane_is_recognized() {
+    let parser = codex_0158_screen(
+        20,
+        24,
+        "\x1b[?25h\x1b[2J\x1b[10;1H\u{203a} \x1b[2mAsk Codex\x1b[22m\x1b[12;1Hgpt-6 high \u{b7} ~\\renga\x1b[13;1H  ? for shortcuts \u{26a0} 2\x1b[14;1Hwarnings \u{b7} f2 to view\x1b[10;3H"
+            .as_bytes(),
+    );
+    assert_eq!(
+        codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+        Some(true)
+    );
+}
+
+#[test]
+fn codex_0158_unfamiliar_rows_under_the_model_row_stay_unrecognized() {
+    for hint in [
+        "  reading src/app.rs",
+        "  ? for shortcuts and more",
+        "  \u{26a0} warnings \u{b7} f2 to view",
+        "  \u{26a0} 2 warnings \u{b7} f3 to view",
+        "  2 warnings \u{b7} f2 to view",
+    ] {
+        let screen = format!(
+            "\x1b[?25h\x1b[2J\x1b[10;1H\u{203a} please refactor the parser\x1b[12;1HGPT-6-Astra high \u{b7} cwd\x1b[13;1H{hint}\x1b[10;3H"
+        );
+        let parser = codex_0158_screen(20, 114, screen.as_bytes());
+        assert_eq!(
+            codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+            None,
+            "hint {hint:?} must not be accepted as a Codex footer"
+        );
+    }
+
+    // More than two hint rows is not a wrapped hint.
+    let parser = codex_0158_screen(
+        20,
+        114,
+        "\x1b[?25h\x1b[2J\x1b[10;1H\u{203a} x\x1b[12;1HGPT-6-Astra high \u{b7} cwd\x1b[13;1H  ? for\x1b[14;1Hshortcuts\x1b[15;1H\u{26a0} 2 warnings \u{b7} f2 to view\x1b[10;3H"
+            .as_bytes(),
+    );
+    assert_eq!(
+        codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+        None
+    );
+}
+
+#[test]
+fn codex_0158_idle_pane_receives_the_peer_nudge() {
+    let mut app = App::new(58, 230).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.peer_delivery_ready.insert(codex_id);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+        .expect("refocus sender");
+    // The captured bytes, moved to rows that fit the split pane.
+    let idle = String::from_utf8(CODEX_0158_IDLE_FOOTER.to_vec())
+        .expect("utf8 fixture")
+        .replace("\x1b[55;1H", "\x1b[10;1H")
+        .replace("\x1b[57;3H", "\x1b[12;3H")
+        .replace("\x1b[58;89H", "\x1b[13;60H")
+        .replace("\x1b[55;3H", "\x1b[10;3H");
+    seed_pane_screen(&mut app, codex_id, idle.as_bytes());
+    {
+        let pane = app.ws().panes.get(&codex_id).expect("pane");
+        let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+            Some(true)
+        );
+    }
+    app.ws_mut()
+        .panes
+        .get_mut(&codex_id)
+        .expect("pane")
+        .clear_test_input();
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_id),
+        "codex 0.158".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&codex_id)
+            .and_then(|queue| queue.front()),
+        Some(PendingCodexPeerDelivery::SubmitAt { .. })
+    ));
+    assert!(
+        !app.ws()
+            .panes
+            .get(&codex_id)
+            .expect("pane")
+            .test_input()
+            .is_empty(),
+        "a Codex 0.158 idle composer must receive the peer nudge"
+    );
+    app.shutdown();
+}
+
 #[test]
 fn codex_prompt_allows_nudge_with_cursor_parked_on_footer() {
     let mut parser = vt100::Parser::new(40, 80, 0);

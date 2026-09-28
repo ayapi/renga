@@ -9,6 +9,16 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Codex v0.158.0 peer nudges.** Codex v0.158.0 draws a second footer row
+  under the model row (`? for shortcuts` and/or `⚠ N warnings · f2 to view`).
+  The composer recognizer accepted only a one-row model footer, so every peer
+  nudge to an updated Codex pane stayed pending. The model row may now be
+  followed by one hint row (two when a narrow pane wraps it) in exactly those
+  shapes, and the model row also accepts the `default` and `none` effort
+  labels; any other row under the model row still leaves the nudge pending.
+
 ### Debug
 
 - **Always-on bounded pane capture and on-demand repaint diagnostics.** Every
