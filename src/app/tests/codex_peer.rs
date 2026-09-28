@@ -2516,6 +2516,40 @@ fn codex_0158_draft_stays_protected_whatever_is_below_the_model_row() {
 }
 
 #[test]
+fn codex_0158_draft_line_that_looks_like_a_model_row_never_receives_a_nudge() {
+    // Drafts that open with an empty line and a blank line, whose next line
+    // reads like a model row, above the real footer (0.158 two rows, 0.147
+    // one row). Reproduced by review of 2946bfc as an injection into a draft.
+    for (draft_line, footer) in [
+        (
+            "high \u{b7} x",
+            "\x1b[14;1Hgpt-5.5 high \u{b7} ~\\renga\x1b[15;1H  ? for shortcuts",
+        ),
+        ("high \u{b7} x", "\x1b[14;1Hgpt-5.5 high \u{b7} ~\\renga"),
+        (
+            "please follow \u{b7} the plan",
+            "\x1b[14;1HGPT-6-Astra high \u{b7} cwd\x1b[15;1H  anything",
+        ),
+    ] {
+        let cursor_col = draft_line.chars().count() + 1;
+        let screen = format!(
+            "\x1b[?25h\x1b[2J\x1b[10;1H\u{203a} \x1b[12;1H{draft_line}{footer}\x1b[12;{cursor_col}H"
+        );
+        let parser = codex_0158_screen(20, 60, screen.as_bytes());
+        assert_ne!(
+            codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+            Some(true),
+            "draft line {draft_line:?} with footer {footer:?}"
+        );
+        assert_ne!(
+            codex_composer_has_draft_on_screen(parser.screen()),
+            Some(false),
+            "draft line {draft_line:?} with footer {footer:?}"
+        );
+    }
+}
+
+#[test]
 fn codex_0158_footer_without_a_model_row_stays_unrecognized() {
     let parser = codex_0158_screen(
         20,

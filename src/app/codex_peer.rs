@@ -427,10 +427,16 @@ fn looks_like_codex_footer_rows(rows: &[String], separator_rows: usize) -> bool 
     // remain safe because a stalled Draft surfaces through AwaitFocus.
     // The model row anchors the footer. Rows below it (Codex v0.158.0 adds
     // shortcut hints and warning counts there) may hold anything, so their
-    // content is never inspected.
-    let model_footer = rows
-        .first()
-        .is_some_and(|model| looks_like_codex_model_footer_row(model));
+    // content is not matched against a format. The one check on them: none
+    // may look like a model row too. A multi-line draft whose lower line
+    // reads like `high · x` sits above the real model row, so two model-like
+    // rows mean the anchor is ambiguous and the layout stays unrecognized.
+    let model_footer = rows.split_first().is_some_and(|(model, below)| {
+        looks_like_codex_model_footer_row(model)
+            && !below
+                .iter()
+                .any(|row| looks_like_codex_model_footer_row(row))
+    });
     (separator_rows == 1 && model_footer)
         // Codex v0.147.0 no longer shows this footer, but retain exact support
         // for older releases where the phrase may wrap in a narrow pane.
