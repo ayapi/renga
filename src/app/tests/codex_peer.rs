@@ -2465,44 +2465,62 @@ fn codex_0158_two_row_footer_is_recognized_in_every_hint_shape() {
 }
 
 #[test]
-fn codex_0158_hint_row_wrapped_in_a_narrow_pane_is_recognized() {
-    let parser = codex_0158_screen(
-        20,
-        24,
-        "\x1b[?25h\x1b[2J\x1b[10;1H\u{203a} \x1b[2mAsk Codex\x1b[22m\x1b[12;1Hgpt-6 high \u{b7} ~\\renga\x1b[13;1H  ? for shortcuts \u{26a0} 2\x1b[14;1Hwarnings \u{b7} f2 to view\x1b[10;3H"
-            .as_bytes(),
-    );
-    assert_eq!(
-        codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
-        Some(true)
-    );
+fn codex_0158_rows_below_the_model_row_are_accepted_whatever_they_hold() {
+    for below in [
+        "  reading src/app.rs",
+        "  tab to queue message",
+        "  \u{26a0} 2 warnings \u{b7} f3 to view",
+        "  \u{65b0}\u{3057}\u{3044}\u{8868}\u{793a} \u{2728}",
+        "  ? for shortcuts\x1b[14;1Hsecond hint row\x1b[15;1Hthird hint row",
+        "\x1b[14;1H  a hint after an extra blank row",
+    ] {
+        let screen = format!(
+            "\x1b[?25h\x1b[2J\x1b[10;1H\u{203a} \x1b[2mAsk Codex to do anything\x1b[22m\x1b[12;1HGPT-6-Astra high \u{b7} cwd\x1b[13;1H{below}\x1b[10;3H"
+        );
+        let parser = codex_0158_screen(20, 40, screen.as_bytes());
+        assert_eq!(
+            codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
+            Some(true),
+            "rows below the model row: {below:?}"
+        );
+        assert_eq!(
+            codex_composer_has_draft_on_screen(parser.screen()),
+            Some(false),
+            "rows below the model row: {below:?}"
+        );
+    }
 }
 
 #[test]
-fn codex_0158_unfamiliar_rows_under_the_model_row_stay_unrecognized() {
-    for hint in [
-        "  reading src/app.rs",
-        "  ? for shortcuts and more",
-        "  \u{26a0} warnings \u{b7} f2 to view",
-        "  \u{26a0} 2 warnings \u{b7} f3 to view",
-        "  2 warnings \u{b7} f2 to view",
+fn codex_0158_draft_stays_protected_whatever_is_below_the_model_row() {
+    for below in [
+        "  ? for shortcuts",
+        "  anything at all",
+        "  tab to queue message",
     ] {
         let screen = format!(
-            "\x1b[?25h\x1b[2J\x1b[10;1H\u{203a} please refactor the parser\x1b[12;1HGPT-6-Astra high \u{b7} cwd\x1b[13;1H{hint}\x1b[10;3H"
+            "\x1b[?25h\x1b[2J\x1b[10;1H\u{203a} please refactor the parser\x1b[12;1HGPT-6-Astra high \u{b7} cwd\x1b[13;1H{below}\x1b[10;29H"
         );
         let parser = codex_0158_screen(20, 114, screen.as_bytes());
         assert_eq!(
+            codex_composer_has_draft_on_screen(parser.screen()),
+            Some(true),
+            "a typed draft must stay protected: {below:?}"
+        );
+        assert_eq!(
             codex_prompt_allows_peer_nudge_on_screen(parser.screen()),
-            None,
-            "hint {hint:?} must not be accepted as a Codex footer"
+            Some(false),
+            "a typed draft must not accept a nudge: {below:?}"
         );
     }
+}
 
-    // More than two hint rows is not a wrapped hint.
+#[test]
+fn codex_0158_footer_without_a_model_row_stays_unrecognized() {
     let parser = codex_0158_screen(
         20,
         114,
-        "\x1b[?25h\x1b[2J\x1b[10;1H\u{203a} x\x1b[12;1HGPT-6-Astra high \u{b7} cwd\x1b[13;1H  ? for\x1b[14;1Hshortcuts\x1b[15;1H\u{26a0} 2 warnings \u{b7} f2 to view\x1b[10;3H"
+        "\x1b[?25h\x1b[2J\x1b[10;1H\u{203a} \x1b[2mAsk Codex to do anything\x1b[22m\x1b[12;1H  ? for shortcuts\x1b[13;1H  reading src/app.rs\x1b[10;3H"
             .as_bytes(),
     );
     assert_eq!(

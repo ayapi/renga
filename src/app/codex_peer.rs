@@ -420,42 +420,17 @@ fn looks_like_codex_model_footer_row(row: &str) -> bool {
     .any(|effort| row.contains(&format!("{effort}\u{b7}")))
 }
 
-/// Codex v0.158.0 draws a hint row under the model row: `? for shortcuts`
-/// on an empty composer, a right-aligned `⚠ N warnings · f2 to view` when
-/// the session has warnings, or both. Rows are whitespace-stripped and
-/// lowercased; anything else keeps the layout unrecognized.
-fn looks_like_codex_hint_row(row: &str) -> bool {
-    let rest = row.strip_prefix("?forshortcuts").unwrap_or(row);
-    if rest.is_empty() {
-        return !row.is_empty();
-    }
-    let Some(count_and_label) = rest.strip_prefix('\u{26a0}') else {
-        return false;
-    };
-    let digits = count_and_label
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .count();
-    digits > 0
-        && matches!(
-            &count_and_label[digits..],
-            "warning\u{b7}f2toview" | "warnings\u{b7}f2toview"
-        )
-}
-
 fn looks_like_codex_footer_rows(rows: &[String], separator_rows: usize) -> bool {
     let joined = rows.concat();
     // Position alone is insufficient when transcript output reaches the last
     // screen row. Match footer metadata instead; unfamiliar future formats
     // remain safe because a stalled Draft surfaces through AwaitFocus.
-    let model_footer = match rows {
-        [model] => looks_like_codex_model_footer_row(model),
-        // A narrow pane may wrap the hint row, so join what follows the model.
-        [model, hint @ ..] if hint.len() <= 2 => {
-            looks_like_codex_model_footer_row(model) && looks_like_codex_hint_row(&hint.concat())
-        }
-        _ => false,
-    };
+    // The model row anchors the footer. Rows below it (Codex v0.158.0 adds
+    // shortcut hints and warning counts there) may hold anything, so their
+    // content is never inspected.
+    let model_footer = rows
+        .first()
+        .is_some_and(|model| looks_like_codex_model_footer_row(model));
     (separator_rows == 1 && model_footer)
         // Codex v0.147.0 no longer shows this footer, but retain exact support
         // for older releases where the phrase may wrap in a narrow pane.

@@ -11,13 +11,14 @@ rules in [`docs/semver-policy.md`](./docs/semver-policy.md).
 
 ### Fixed
 
-- **Codex v0.158.0 peer nudges.** Codex v0.158.0 draws a second footer row
-  under the model row (`? for shortcuts` and/or `⚠ N warnings · f2 to view`).
-  The composer recognizer accepted only a one-row model footer, so every peer
-  nudge to an updated Codex pane stayed pending. The model row may now be
-  followed by one hint row (two when a narrow pane wraps it) in exactly those
-  shapes, and the model row also accepts the `default` and `none` effort
-  labels; any other row under the model row still leaves the nudge pending.
+- **Codex v0.158.0 peer nudges.** Codex v0.158.0 draws more rows under the
+  model row (`? for shortcuts`, `⚠ N warnings · f2 to view`, and whatever a
+  later release puts there). The composer recognizer accepted only a one-row
+  model footer, so every peer nudge to an updated Codex pane stayed pending.
+  The model row now anchors the footer and the rows below it are accepted
+  without inspecting their content; the model row also accepts the
+  `default` and `none` effort labels. A typed draft on the prompt row still
+  blocks the nudge.
 
 ### Debug
 
