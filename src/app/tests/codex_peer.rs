@@ -2472,7 +2472,6 @@ fn codex_0158_rows_below_the_model_row_are_accepted_whatever_they_hold() {
         "  \u{26a0} 2 warnings \u{b7} f3 to view",
         "  \u{65b0}\u{3057}\u{3044}\u{8868}\u{793a} \u{2728}",
         "  ? for shortcuts\x1b[14;1Hsecond hint row\x1b[15;1Hthird hint row",
-        "\x1b[14;1H  a hint after an extra blank row",
     ] {
         let screen = format!(
             "\x1b[?25h\x1b[2J\x1b[10;1H\u{203a} \x1b[2mAsk Codex to do anything\x1b[22m\x1b[12;1HGPT-6-Astra high \u{b7} cwd\x1b[13;1H{below}\x1b[10;3H"
@@ -2530,6 +2529,16 @@ fn codex_0158_draft_line_that_looks_like_a_model_row_never_receives_a_nudge() {
             "please follow \u{b7} the plan",
             "\x1b[14;1HGPT-6-Astra high \u{b7} cwd\x1b[15;1H  anything",
         ),
+        // Footers with no model-like row under the draft line: a model row
+        // without an effort, a truncated model row, a status row, and a
+        // hint row alone. Reproduced by review of 0c7089f.
+        (
+            "high \u{b7} x",
+            "\x1b[14;1Hgpt-5.5 \u{b7} ~\\renga\x1b[15;1H  ? for shortcuts",
+        ),
+        ("high \u{b7} x", "\x1b[14;1Hgpt-5.5 hi\u{2026}"),
+        ("high \u{b7} x", "\x1b[14;1H  reading src/app.rs"),
+        ("high \u{b7} x", "\x1b[14;1H  ? for shortcuts"),
     ] {
         let cursor_col = draft_line.chars().count() + 1;
         let screen = format!(

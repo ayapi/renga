@@ -420,23 +420,29 @@ fn looks_like_codex_model_footer_row(row: &str) -> bool {
     .any(|effort| row.contains(&format!("{effort}\u{b7}")))
 }
 
-fn looks_like_codex_footer_rows(rows: &[String], separator_rows: usize) -> bool {
+fn looks_like_codex_footer_rows(
+    rows: &[String],
+    separator_rows: usize,
+    footer_contiguous: bool,
+) -> bool {
     let joined = rows.concat();
     // Position alone is insufficient when transcript output reaches the last
     // screen row. Match footer metadata instead; unfamiliar future formats
     // remain safe because a stalled Draft surfaces through AwaitFocus.
     // The model row anchors the footer. Rows below it (Codex v0.158.0 adds
     // shortcut hints and warning counts there) may hold anything, so their
-    // content is not matched against a format. The one check on them: none
-    // may look like a model row too. A multi-line draft whose lower line
-    // reads like `high · x` sits above the real model row, so two model-like
-    // rows mean the anchor is ambiguous and the layout stays unrecognized.
-    let model_footer = rows.split_first().is_some_and(|(model, below)| {
-        looks_like_codex_model_footer_row(model)
-            && !below
-                .iter()
-                .any(|row| looks_like_codex_model_footer_row(row))
-    });
+    // content is not matched against a format. Two structural checks keep a
+    // multi-line draft whose lower line reads like `high · x` from being taken
+    // for the anchor: the real footer sits below such a line after a blank
+    // row, so the footer block must be contiguous, and no row below the
+    // anchor may look like a model row too.
+    let model_footer = footer_contiguous
+        && rows.split_first().is_some_and(|(model, below)| {
+            looks_like_codex_model_footer_row(model)
+                && !below
+                    .iter()
+                    .any(|row| looks_like_codex_model_footer_row(row))
+        });
     (separator_rows == 1 && model_footer)
         // Codex v0.147.0 no longer shows this footer, but retain exact support
         // for older releases where the phrase may wrap in a narrow pane.
@@ -467,6 +473,8 @@ fn codex_live_composer_layout(screen: &vt100::Screen) -> Option<(u16, u16, bool)
     let mut content_before_separator = false;
     let mut last_content_before_separator = prompt_row;
     let mut footer_rows = Vec::new();
+    let mut blank_inside_footer = false;
+    let mut footer_contiguous = true;
 
     for row in prompt_row.saturating_add(1)..rows {
         let normalized = normalized_screen_rows(screen, row, row.saturating_add(1));
@@ -474,6 +482,8 @@ fn codex_live_composer_layout(screen: &vt100::Screen) -> Option<(u16, u16, bool)
             if footer_rows.is_empty() {
                 separator_seen = true;
                 separator_rows += 1;
+            } else {
+                blank_inside_footer = true;
             }
             continue;
         }
@@ -482,10 +492,13 @@ fn codex_live_composer_layout(screen: &vt100::Screen) -> Option<(u16, u16, bool)
             last_content_before_separator = row;
             continue;
         }
+        if blank_inside_footer {
+            footer_contiguous = false;
+        }
         footer_rows.push(normalized);
     }
 
-    let footer_seen = looks_like_codex_footer_rows(&footer_rows, separator_rows);
+    let footer_seen = looks_like_codex_footer_rows(&footer_rows, separator_rows, footer_contiguous);
     if footer_seen
         || (footer_rows.is_empty() && !content_before_separator && cursor_row == prompt_row)
     {
