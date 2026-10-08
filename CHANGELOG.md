@@ -9,6 +9,30 @@ rules in [`docs/semver-policy-2.0.md`](./docs/semver-policy-2.0.md).
 
 ## [Unreleased]
 
+### Added
+
+- **`pane_prompt_detected` / `pane_waiting_input` events.** (#72)
+  Monitors no longer need to poll `inspect` and regex-match the screen
+  to notice a stalled worker. `pane_prompt_detected` fires when a pane
+  shows an interactive prompt — a Claude / Codex approval menu
+  (`kind: "choice"`), a `(y/n)` prompt (`"yes_no"`) or a password prompt
+  (`"password"`) — with the matched line in `prompt`.
+  `pane_waiting_input` fires once a pane has been silent for 5 s. Both
+  are heuristics (screen text and output silence, not a TTY probe), are
+  delivered on `renga events` and `poll_events`, and fire once per
+  prompt / quiet spell. New `Event` variants are minor under the
+  forward-compat rule.
+
+### Changed
+
+- **A `poll_events` call with a `types` filter no longer wakes on
+  non-matching events.** (#72) It keeps waiting until a matching event
+  or the timeout, and still advances `next_since` past what it skipped.
+  Without this, the new per-pane `pane_waiting_input` traffic would
+  wake every `types=["pane_exited"]` long-poll with `events: []`. The
+  frozen contract only said a non-matching arrival *can* early-return,
+  so this is within it.
+
 ## [3.0.0] — 2026-08-29
 
 > **Major release.** Governed by
