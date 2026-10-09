@@ -39,6 +39,16 @@ rules in [`docs/semver-policy-2.0.md`](./docs/semver-policy-2.0.md).
   `tab to queue message`) does not count, so a long turn alone never
   trips it. A Codex UI change that the readiness heuristic no longer
   recognizes used to leave the nudge queued forever without a signal.
+- **`peer_inbox_drained` event and `unread` on `list_peers`.** (#353)
+  `send_message` succeeding only meant the body reached a Codex peer's
+  MCP inbox. The peer MCP server now reports every `check_messages`
+  drain back to renga, which emits `peer_inbox_drained {pane, count}`
+  and drops the pane's not-yet-typed nudge / focused notification once
+  nothing is left unread. `list_peers` shows `unread=N` for pull-mode
+  (Codex) peers. Only messages that actually entered the pane's MCP
+  inbox are counted (not ones sent before its subprocess subscribed or
+  dropped on a full queue); the count resets when the subprocess
+  (re)registers, so messages stranded by a dead subprocess clear then.
 
 ### Changed
 

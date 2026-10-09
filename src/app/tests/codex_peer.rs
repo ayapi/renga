@@ -1903,3 +1903,199 @@ fn stall_clock_does_not_run_while_codex_is_busy() {
     assert!(app.workspaces[1].panes[&codex_pane].peer_nudge_stalled);
     app.shutdown();
 }
+
+/// Unfocused Codex sibling of the focused sender, with its MCP inbox
+/// subscribed (keep the receiver alive). Returns `(sender, codex, inbox)`.
+fn codex_sibling_unfocused(app: &mut App) -> (usize, usize, std::sync::mpsc::Receiver<ipc::Event>) {
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id), None)
+        .expect("refocus sender");
+    let (_sub, inbox) = app
+        .event_bus
+        .subscribe_scoped(ipc::EventScope::PaneInbox(codex_id));
+    (sender_id, codex_id, inbox)
+}
+
+fn listed_unread(app: &App, from: usize, pane: usize) -> Option<usize> {
+    app.handle_peer_list(from)
+        .expect("peer list")
+        .into_iter()
+        .find(|p| p.id == pane)
+        .expect("pane listed")
+        .unread
+}
+
+#[test]
+fn check_messages_drain_clears_pending_nudge_and_emits_peer_inbox_drained() {
+    // Issue #353: send, then drain, then event.
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, _inbox) = codex_sibling_unfocused(&mut app);
+    let (_sub, rx) = app.event_bus.subscribe();
+
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "do x".into())
+        .expect("peer send");
+    assert!(app.pending_codex_peer_messages.contains_key(&codex_id));
+    assert_eq!(listed_unread(&app, sender_id, codex_id), Some(1));
+    // Push-mode (Claude / unregistered) peers have no inbox to count.
+    assert_eq!(listed_unread(&app, codex_id, sender_id), None);
+
+    app.handle_peer_inbox_drained(codex_id, 1).expect("drain");
+
+    assert!(
+        !app.pending_codex_peer_messages.contains_key(&codex_id),
+        "a drained inbox must not be nudged afterwards"
+    );
+    assert_eq!(listed_unread(&app, sender_id, codex_id), Some(0));
+    let drained = rx
+        .try_iter()
+        .find(|e| matches!(e, ipc::Event::PeerInboxDrained { .. }))
+        .expect("peer_inbox_drained emitted");
+    assert!(matches!(
+        drained,
+        ipc::Event::PeerInboxDrained { pane, count: 1, .. } if pane == codex_id
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn partial_drain_keeps_the_nudge_for_a_message_sent_after_it() {
+    // The second send can land between the MCP drain and its report;
+    // that message is still unread and must keep its nudge.
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, _inbox) = codex_sibling_unfocused(&mut app);
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "one".into())
+        .expect("send one");
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "two".into())
+        .expect("send two");
+
+    app.handle_peer_inbox_drained(codex_id, 1).expect("drain");
+
+    assert!(app.pending_codex_peer_messages.contains_key(&codex_id));
+    assert_eq!(listed_unread(&app, sender_id, codex_id), Some(1));
+    app.shutdown();
+}
+
+#[test]
+fn drain_clears_focused_codex_notification_and_reregister_resets_unread() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, _inbox) = codex_sibling_unfocused(&mut app);
+    app.handle_focus(&ipc::PaneRef::Id(codex_id), None)
+        .expect("focus codex");
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "hi".into())
+        .expect("send");
+    assert!(app.codex_peer_notification.is_some());
+
+    app.handle_peer_inbox_drained(codex_id, 1).expect("drain");
+    assert!(app.codex_peer_notification.is_none());
+
+    // A restarted MCP subprocess starts with an empty inbox.
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "lost".into())
+        .expect("send");
+    app.handle_peer_register_client(codex_id, PeerClientKind::Codex)
+        .expect("re-register");
+    assert_eq!(listed_unread(&app, sender_id, codex_id), Some(0));
+
+    assert!(app.handle_peer_inbox_drained(9999, 1).is_err());
+    app.shutdown();
+}
+
+#[test]
+fn drain_keeps_an_already_typed_nudge_and_dedupe_does_not_count() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, _inbox) = codex_sibling_unfocused(&mut app);
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "x".into())
+        .expect("send");
+    // The identical re-send is deduped: no PeerInbox, so no unread.
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "x".into())
+        .expect("dup send");
+    assert_eq!(listed_unread(&app, sender_id, codex_id), Some(1));
+    // The nudge text is already in the composer; only its Enter is due.
+    app.pending_codex_peer_messages.insert(
+        codex_id,
+        [PendingCodexPeerDelivery::SubmitAt(Instant::now())].into(),
+    );
+
+    app.handle_peer_inbox_drained(codex_id, 1).expect("drain");
+
+    assert!(
+        matches!(
+            app.pending_codex_peer_messages
+                .get(&codex_id)
+                .and_then(|q| q.front()),
+            Some(PendingCodexPeerDelivery::SubmitAt(_))
+        ),
+        "dropping it would strand the half-written draft"
+    );
+    app.shutdown();
+}
+
+#[test]
+fn drain_clears_a_stalled_nudge_badge() {
+    // #354 x #353: the worker drained on its own, so the stuck nudge is
+    // moot and its badge must go on the next flush.
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_pane = app
+        .handle_new_tab(None, None, None, None, None)
+        .expect("new tab succeeds");
+    app.peer_client_kinds
+        .insert(codex_pane, PeerClientKind::Codex);
+    assert!(app.switch_tab(0), "Codex tab goes to the background");
+    app.workspaces[1].panes[&codex_pane]
+        .parser
+        .lock()
+        .unwrap()
+        .process(b"\x1b[2J\x1b[Hsomething new from Codex");
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_pane), "ping".into())
+        .expect("peer send");
+    match app
+        .pending_codex_peer_messages
+        .get_mut(&codex_pane)
+        .and_then(|q| q.front_mut())
+    {
+        Some(PendingCodexPeerDelivery::Draft(_, _, queued_at)) => {
+            *queued_at = Instant::now()
+                .checked_sub(CODEX_PEER_NUDGE_STALL_TIMEOUT + Duration::from_secs(1))
+                .expect("monotonic clock is past the stall timeout");
+        }
+        other => panic!("expected a queued draft, got {other:?}"),
+    }
+    app.flush_pending_codex_peer_messages();
+    assert!(app.workspaces[1].panes[&codex_pane].peer_nudge_stalled);
+
+    app.handle_peer_inbox_drained(codex_pane, 1).expect("drain");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(!app.pending_codex_peer_messages.contains_key(&codex_pane));
+    assert!(!app.workspaces[1].panes[&codex_pane].peer_nudge_stalled);
+    app.shutdown();
+}
+
+#[test]
+fn a_send_that_never_reached_an_inbox_is_not_unread() {
+    // Before the pane's MCP subprocess subscribes (or after it died),
+    // nothing can ever drain the message, so it must not be counted.
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, inbox) = codex_sibling_unfocused(&mut app);
+    drop(inbox);
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "early".into())
+        .expect("send");
+    assert_eq!(listed_unread(&app, sender_id, codex_id), Some(0));
+    // The nudge still goes out; only the unread accounting skips it.
+    assert!(app.pending_codex_peer_messages.contains_key(&codex_id));
+    app.shutdown();
+}

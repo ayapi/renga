@@ -446,6 +446,7 @@ const KNOWN_EVENT_TAGS: &[&str] = &[
     "events_dropped",
     "heartbeat",
     "peer_inbox",
+    "peer_inbox_drained",
 ];
 
 /// Render an error `message` plus optional machine-readable `code` as
@@ -590,6 +591,7 @@ mod tests {
             Event::EventsDropped { .. } => "events_dropped",
             Event::Heartbeat { .. } => "heartbeat",
             Event::PeerInbox { .. } => "peer_inbox",
+            Event::PeerInboxDrained { .. } => "peer_inbox_drained",
         }
     }
 
@@ -648,6 +650,11 @@ mod tests {
                 from_name: Some("sender".into()),
                 from_kind: None,
                 body: "hi".into(),
+                ts_ms: 1,
+            },
+            Event::PeerInboxDrained {
+                pane: 3,
+                count: 2,
                 ts_ms: 1,
             },
         ]
