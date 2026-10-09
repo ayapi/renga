@@ -364,6 +364,7 @@ impl App {
         if pull_mode && reached_inbox {
             *self.peer_unread.entry(target_id).or_default() += 1;
         }
+        self.sync_peer_delivery();
         Ok(())
     }
 
@@ -409,6 +410,7 @@ impl App {
         // whatever was counted against the previous one can never be
         // drained now.
         self.peer_unread.remove(&pane_id);
+        self.sync_peer_delivery();
         Ok(())
     }
 
@@ -469,6 +471,7 @@ impl App {
             count,
             ts_ms: ipc::events::now_ms(),
         });
+        self.sync_peer_delivery();
         Ok(())
     }
 
@@ -537,7 +540,16 @@ impl App {
     }
 
     pub(crate) fn dismiss_codex_peer_notification(&mut self) {
-        if self.codex_peer_notification.take().is_some() {
+        if let Some(n) = self.codex_peer_notification.take() {
+            // Nothing was handed to the pane, so its unread messages
+            // must not read as `nudged` (see `sync_peer_delivery`).
+            if let Some((ws_idx, _)) =
+                self.resolve_pane_across_workspaces(&PaneRef::Id(n.target_pane))
+            {
+                if let Some(pane) = self.workspaces[ws_idx].panes.get_mut(&n.target_pane) {
+                    pane.peer_delivery = None;
+                }
+            }
             self.dirty = true;
         }
     }
@@ -602,7 +614,125 @@ impl App {
             .remove(&notification.target_pane);
         self.codex_peer_notification = None;
         self.dirty = true;
+        self.emit_peer_nudge_submitted(notification.target_pane);
+        self.sync_peer_delivery();
         Ok(true)
+    }
+
+    fn pane_name_and_role(&self, pane_id: usize) -> (Option<String>, Option<String>) {
+        let Some((ws_idx, _)) = self.resolve_pane_across_workspaces(&PaneRef::Id(pane_id)) else {
+            return (None, None);
+        };
+        let ws = &self.workspaces[ws_idx];
+        (
+            ws.pane_names
+                .iter()
+                .find(|(_, id)| **id == pane_id)
+                .map(|(n, _)| n.clone()),
+            ws.panes.get(&pane_id).and_then(|p| p.role.clone()),
+        )
+    }
+
+    /// Only for a pane tracked as `queued`, so the event always pairs
+    /// with a `peer_nudge_queued` (an Enter after a full drain, or for
+    /// a message that never reached an inbox, owes nothing).
+    fn emit_peer_nudge_submitted(&self, pane_id: usize) {
+        let Some((ws_idx, _)) = self.resolve_pane_across_workspaces(&PaneRef::Id(pane_id)) else {
+            return;
+        };
+        let tracked = self.workspaces[ws_idx]
+            .panes
+            .get(&pane_id)
+            .and_then(|p| p.peer_delivery)
+            .is_some_and(|d| d.state == ipc::PeerDeliveryState::Queued);
+        if !tracked {
+            return;
+        }
+        let (name, role) = self.pane_name_and_role(pane_id);
+        self.event_bus.emit(ipc::Event::PeerNudgeSubmitted {
+            id: pane_id,
+            name,
+            role,
+            pending: self.peer_unread.get(&pane_id).copied().unwrap_or(0),
+            ts_ms: ipc::events::now_ms(),
+        });
+    }
+
+    /// What is still owed to `pane_id` (Issue #352): `Queued` while
+    /// renga holds the nudge (draft, overlay, or typed and awaiting its
+    /// Enter), `Nudged` once it is in the pane but `check_messages` has
+    /// not drained the messages. `pending` is the unread inbox count;
+    /// messages that never reached an inbox (or were wiped by a
+    /// re-registration) cannot be read, so they are not owed.
+    pub(crate) fn derive_peer_delivery(
+        &self,
+        pane_id: usize,
+    ) -> Option<(ipc::PeerDeliveryState, usize)> {
+        let unread = self.peer_unread.get(&pane_id).copied().unwrap_or(0);
+        if unread == 0 {
+            return None;
+        }
+        let holding = self
+            .pending_codex_peer_messages
+            .get(&pane_id)
+            .is_some_and(|q| !q.is_empty())
+            || self
+                .codex_peer_notification
+                .as_ref()
+                .is_some_and(|n| n.target_pane == pane_id);
+        let state = if holding {
+            ipc::PeerDeliveryState::Queued
+        } else {
+            ipc::PeerDeliveryState::Nudged
+        };
+        Some((state, unread))
+    }
+
+    /// Refresh every pane's `peer_delivery` badge state and emit
+    /// `peer_nudge_queued` when a pane starts holding a nudge.
+    fn sync_peer_delivery(&mut self) {
+        let now_ms = ipc::events::now_ms();
+        for ws_idx in 0..self.workspaces.len() {
+            let pane_ids: Vec<usize> = self.workspaces[ws_idx].panes.keys().copied().collect();
+            for pane_id in pane_ids {
+                let derived = self.derive_peer_delivery(pane_id);
+                let Some(pane) = self.workspaces[ws_idx].panes.get_mut(&pane_id) else {
+                    continue;
+                };
+                let prev = pane.peer_delivery;
+                // `Nudged` only continues a tracked delivery: unread
+                // messages whose nudge was dismissed were never handed
+                // to the pane.
+                let derived = derived.filter(|(state, _)| {
+                    *state == ipc::PeerDeliveryState::Queued || prev.is_some()
+                });
+                let next = derived.map(|(state, pending)| ipc::PeerDeliveryStatus {
+                    state,
+                    pending,
+                    since_ms: prev
+                        .filter(|p| p.state == state)
+                        .map_or(now_ms, |p| p.since_ms),
+                });
+                if prev == next {
+                    continue;
+                }
+                pane.peer_delivery = next;
+                self.dirty = true;
+                let queued = |d: Option<ipc::PeerDeliveryStatus>| {
+                    d.is_some_and(|d| d.state == ipc::PeerDeliveryState::Queued)
+                };
+                if queued(next) && !queued(prev) {
+                    let (name, role) = self.pane_name_and_role(pane_id);
+                    self.event_bus.emit(ipc::Event::PeerNudgeQueued {
+                        id: pane_id,
+                        name,
+                        role,
+                        pending: next.map_or(0, |d| d.pending),
+                        ts_ms: now_ms,
+                    });
+                }
+            }
+        }
     }
 
     pub(crate) fn pane_expects_codex_peer_delivery(&self, ws_index: usize, pane_id: usize) -> bool {
@@ -644,6 +774,7 @@ impl App {
         // turn the concatenation of the two (Issue #323).
         let user_turn_panes = self.panes_with_user_turn_in_flight();
         let mut empty_panes = Vec::new();
+        let mut submitted = Vec::new();
         for (ws_idx, ws) in self.workspaces.iter_mut().enumerate() {
             let pane_ids: Vec<usize> = ws.panes.keys().copied().collect();
             for pane_id in pane_ids {
@@ -768,9 +899,11 @@ impl App {
                         // deferred Enter could submit *their* content,
                         // not ours. Cancel the pending submit instead
                         // of resuming it later (Codex review of #289).
+                        // The typed nudge is the human's to submit now.
                         Some(PendingCodexPeerDelivery::SubmitAt(_)) => {
                             self.pending_codex_peer_messages.remove(&pane_id);
                             self.dirty = true;
+                            submitted.push(pane_id);
                         }
                         _ => {}
                     }
@@ -814,6 +947,7 @@ impl App {
                             if write_input_to_pane(pane, payload.as_bytes(), false).is_ok() {
                                 queue.pop_front();
                                 self.dirty = true;
+                                submitted.push(pane_id);
                             }
                         }
                     }
@@ -826,5 +960,9 @@ impl App {
         for pane_id in empty_panes {
             self.pending_codex_peer_messages.remove(&pane_id);
         }
+        for pane_id in submitted {
+            self.emit_peer_nudge_submitted(pane_id);
+        }
+        self.sync_peer_delivery();
     }
 }
