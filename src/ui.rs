@@ -14,7 +14,7 @@ const FOCUS_BORDER: Color = Color::LightBlue;
 const TEXT: Color = Color::Reset;
 const TEXT_DIM: Color = Color::DarkGray;
 const ACCENT_GREEN: Color = Color::Green;
-const ACCENT_BLUE: Color = Color::Blue;
+const ACCENT_BLUE: Color = Color::LightBlue;
 const ACCENT_CLAUDE: Color = Color::Yellow;
 const ACCENT_CODEX: Color = Color::Cyan;
 /// Amber used by the destructive-action confirmation modal, so it
@@ -58,10 +58,13 @@ fn syntax_rgb_to_ansi_color(r: u8, g: u8, b: u8) -> Color {
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     if max.saturating_sub(min) < 32 {
-        return if max < 96 {
+        // Neutral ramp: the dark end (comments) stays dim, everything
+        // lighter defers to the terminal's default foreground so plain
+        // text stays readable on light palettes too.
+        return if max < 160 {
             Color::DarkGray
         } else {
-            Color::Gray
+            Color::Reset
         };
     }
 
@@ -866,9 +869,7 @@ fn render_file_tree(app: &mut App, frame: &mut Frame, area: Rect) {
         // Selection indicator bar on the left
         let indicator = if is_selected { "\u{258e}" } else { " " }; // ▎ or space
         let indicator_style = if is_selected {
-            Style::default()
-                .fg(ACCENT_BLUE)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            Style::default().fg(ACCENT_BLUE)
         } else {
             Style::default()
         };
@@ -2162,6 +2163,21 @@ fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
 mod syntax_color_tests {
     use super::syntax_rgb_to_ansi_color;
     use ratatui::style::Color;
+
+    #[test]
+    fn maps_neutral_ramp_to_dim_or_terminal_default() {
+        // base16-eighties (the preview theme): base03 comment stays dim,
+        // base04..base07 (plain text and lighter) defer to the terminal.
+        assert_eq!(syntax_rgb_to_ansi_color(0x74, 0x73, 0x69), Color::DarkGray);
+        for (r, g, b) in [
+            (0xa0, 0x9f, 0x93),
+            (0xd3, 0xd0, 0xc8),
+            (0xe8, 0xe6, 0xdf),
+            (0xf2, 0xf0, 0xec),
+        ] {
+            assert_eq!(syntax_rgb_to_ansi_color(r, g, b), Color::Reset);
+        }
+    }
 
     #[test]
     fn maps_magenta_family_to_ansi_magenta() {
