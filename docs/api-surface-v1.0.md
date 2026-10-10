@@ -1,10 +1,18 @@
 # renga v1.0 — Frozen API Surface
 
-> **Status**: design proposal. Defines the surface that v1.0 promises to keep
-> stable under the rules in [`semver-policy.md`](./semver-policy.md).
+> **Status**: adopted and live. This is renga's current frozen-surface
+> inventory, kept in step with `main` rather than pinned to the 1.0 freeze —
+> the `v1.0` in the filename records the freeze it began as, not the version
+> it describes. It is the companion doc of
+> [`semver-policy-2.0.md`](./semver-policy-2.0.md), the live policy from the
+> 2.0 line onward; see that document's §1.1 for why the filename is retained.
+> The v1.0-line policy it supersedes is preserved at
+> [`semver-policy.md`](./semver-policy.md).
 >
-> **Source-of-truth commit**: `main` at the time this doc lands; cross-checked
-> against `Cargo.toml` `version = "0.18.5"` (the last pre-1.0 release).
+> **Source of truth**: `main`. The text as v1.0.0 actually shipped it is
+> recoverable from git history at the `v1.0.0` tag; the original design
+> proposal was cross-checked against `Cargo.toml` `version = "0.18.5"` (the
+> last pre-1.0 release).
 >
 > **Audience**: downstream callers (claude-org-ja workers, Codex peers,
 > third-party tooling that integrates with `renga-peers`).
@@ -12,7 +20,7 @@
 ## Stability legend
 
 - **stable** — frozen by v1.0. Breaking changes follow the deprecation window
-  in [`semver-policy.md`](./semver-policy.md).
+  in [`semver-policy-2.0.md`](./semver-policy-2.0.md) §4.
 - **stable-stub** — frozen as a no-op for wire-compat. Caller-visible inputs
   and outputs are part of the contract; behavior can be upgraded additively
   (a stub becoming a real implementation is *not* a break).
@@ -47,10 +55,13 @@ must accept these instead of JSON-RPC errors.
 
 | Field | Type | Notes |
 |---|---|---|
-| `scope` (in) | `"machine"\|"directory"\|"repo"` | Optional; **ignored**. Accepted for wire-compat with `claude-peers-mcp`. renga always treats scope as the current tab. |
+| `scope` (in) | `"machine"\|"directory"\|"repo"` | Optional; **ignored**. Accepted for wire-compat with `claude-peers-mcp`. Results always span every renga tab (#289; before that, the caller's tab only). |
 
 Result: text content listing `id`, `name`, `role`, `kind` (`claude`/`codex`),
-`receive_mode` (`push`/`pull`), `cwd`. Empty case: `"No peers in this tab."`.
+`receive_mode` (`push`/`pull`), `unread` (pull-mode peers only, since #353), `cwd`, plus display-only tab metadata
+(`tab` index, `tab_name`, `same_tab`) since #289. Every workspace is
+enumerated, the caller's own tab first. Empty case: `"No peers in any renga
+tab."` (#289; previously `"No peers in this tab."`).
 
 **Detached fallback (frozen prefix)**: `"(no peers — renga not reachable from
 this peer client: <reason>)"`. Downstream may match on this prefix; it is part
@@ -62,15 +73,34 @@ of the wire ABI.
 |---|---|---|---|
 | `to_id` | string | yes | Recipient pane id (numeric string) or stable name. All-digit strings are interpreted as ids (see §6.1). |
 | `message` | string | yes | Body text. |
+| `deliver` | `"channel"` \| `"user_turn"` | no (default `"channel"`) | #323. Picks the delivery *semantics*, not an encoding. `channel` is the pre-#323 behavior, byte-identical on the wire (the field is omitted when absent). `user_turn` types the body into the recipient agent's composer and submits it, so it lands as a real user turn and arms slash commands. Any other string is rejected client-side. |
 
-Result on success: `"Delivered to <to_id>."`.
+Result on success (`deliver="channel"`): `"Delivered to <to_id>."` — unchanged
+text; existing callers match on it.
+
+Result on success (`deliver="user_turn"`, #323): `"Submitted to <to_id> as a
+user turn (submission observed)."`, or `"Not re-sent to <to_id>: an identical
+user turn was accepted within the last 5s, …"` when the 5s user-turn dedupe
+window suppressed it. Both carry `structuredContent`
+`{ delivery: "user_turn", status: "submitted" | "duplicate_suppressed",
+target_id }` so a caller branches on `status` rather than on prose. The
+user-turn dedupe ledger is separate from the channel one below — neither mode
+can swallow the other.
 
 **Detached fallback (frozen prefix)**: `"(message dropped — renga not
 reachable: <reason>)"`.
 
-**Cross-tab silent no-op**: `peer_send` to a pane on another tab silently
-succeeds with no delivery (Q5). v1.0 keeps this behavior; cross-tab routing is
-deferred to a future minor release.
+**Cross-tab delivery (#289, supersedes the v1.0 Q5 silent no-op)**: a numeric
+`to_id` reaches a pane in any tab and delivers normally. A *name* resolves
+only inside the sender's own tab — pane names are unique per tab, not
+globally, so an unqualified name can never address another tab. An
+unresolvable target now fails with `pane_not_found` instead of silently
+succeeding. This is a deliberate breaking semantic change (see
+`semver-policy.md` §3) shipped without the §4 opt-in-flag window per the
+owner decision on #289: the anti-enumeration rationale for the silent drop
+moved to the security layer outside renga. Version skew fails closed via the
+`cross_tab_peers` capability (§3.4): the bundled mcp-peer refuses `list_peers`
+/ `send_message` against a server that does not advertise it.
 
 **Same-payload dedupe (post-1.1)**: identical `(target, sender, body)` triples
 arriving within a small dedupe window (~5s) are collapsed server-side to a
@@ -86,7 +116,13 @@ body is preserved verbatim after a blank line; pull-mode (Codex) deliveries
 are unaffected. See renga#221.
 
 Errors via `[code]`: `pane_not_found`, `pane_vanished`, `io_error`, plus the
-shared `app_timeout` / `shutting_down` / `internal` set.
+shared `app_timeout` / `shutting_down` / `internal` set. `deliver="user_turn"`
+adds `user_turn_not_ready`, `user_turn_busy`, `user_turn_unsupported_target`,
+`user_turn_invalid_body` and `user_turn_stalled` (§5.1) — the first four
+guarantee **nothing was written** to the PTY and are safe to retry once the
+blocker is cleared; `user_turn_stalled` does not, and the pane must be
+inspected first. Version skew fails closed on the `peer_user_turn` capability
+(§3.4).
 
 ### 1.3 `set_summary` — stable (Q1)
 
@@ -125,24 +161,39 @@ the recipient to treat each body as an *instruction*, not transcript text.
 
 ### 1.5 `list_panes` — stable
 
-Input: `{}`.
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `tab` | object | no | Tab scope selector (#329). Omitted → unchanged pre-#329 behavior: the **caller's tab** (Q4). Exactly one key: `{"name": "<label>"}` — exact display-name match, 0 matches → `tab_not_found`, several → `tab_ambiguous` (labels are not unique; never first-match); `{"index": N}` — 0-based tab index, the same index `list_peers` reports, out of range → `tab_not_found`; `{"pane_id": N}` — the tab owning that pane (stable anchor), unknown pane → `pane_not_found`; `{"all": true}` — every tab, the caller's first, then the rest in index order. The same selector shapes as `spawn_pane`'s `tab` (§1.6) minus `{"new": …}` (there is nothing to list in a tab that does not exist yet), plus `{"all": true}`. Sending any `tab` requires the server to advertise `cross_tab_list` (§3.4) — the MCP layer fails closed with `server_too_old` otherwise. Malformed selectors (no key, several keys, unknown key, `{"all": false}`) are rejected with JSON-RPC `-32602` rather than interpreted. |
 
-Result: text describing every pane in the **current tab** (Q4): `id`, `name`,
-`role`, `focused`, geometry (`x`, `y`, `width`, `height`), `cwd`, `kind`,
-`receive_mode`. Geometry fields are `0` before the first layout pass.
+Result: text describing every pane in scope — the caller's tab by default, which
+is not necessarily the tab on screen: `id`, `name`, `role`, `focused`, geometry
+(`x`, `y`, `width`, `height`), `cwd`, `kind`, `receive_mode`, plus the
+display-only `tab` / `tab_name` and, on a response that can span tabs, `same_tab`
+(§3.4). Geometry fields are `0` before the first layout pass.
+
+`tab` / `tab_name` are **display metadata only**: tab indexes shift when tabs
+close, and labels are not unique. A pane's `id` is its only tab-stable address —
+and when two independent orchestrations run in different tabs, both hold a
+`dispatcher` and a `worker-<task_id>`, so `name` cannot tell their panes apart.
+`cwd` is what does.
+
+This is an enumeration surface only: pane placement and addressing semantics are
+unchanged by #329, since numeric ids already crossed tabs.
 
 ### 1.6 `spawn_pane` — stable
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `direction` | `"vertical"\|"horizontal"` | yes | `vertical` → new pane on the right; `horizontal` → new pane on the bottom. |
-| `target` | string | no | Numeric id, name, or `"focused"`. Default `"focused"`. |
+| `direction` | `"vertical"\|"horizontal"` | conditional | `vertical` → new pane on the right; `horizontal` → new pane on the bottom. Required for every split — i.e. always, except with `tab: {new: …}`, where it is **forbidden** (a fresh tab has nothing to split). |
+| `target` | string | no | Numeric id, name, or `"focused"`. Default `"focused"`. With a `tab` selector it resolves **inside the selected tab** (`"focused"` = that tab's focused pane); a numeric id owned by a different tab fails with `target_tab_mismatch`. Forbidden with `tab: {new: …}`. |
+| `tab` | object | no | Tab placement selector (#290). Exactly one key: `{"name": "<label>"}` — exact display-name match, 0 matches → `tab_not_found`, several → `tab_ambiguous` (labels are not unique; never first-match); `{"index": N}` — 0-based tab index, the same index `list_peers` reports, out of range → `tab_not_found`; `{"pane_id": N}` — the tab owning that pane (stable anchor); `{"new": {}}` / `{"new": {"name": "<label>"}}` — create a fresh single-pane **background** tab: the visible tab does not change, geometry (rects + PTY size) is finalized before the success reply, and omitted `cwd` inherits the **caller pane's** cwd. Sending any `tab` requires the server to advertise `spawn_tab` (§3.4) — the MCP layer fails closed with `server_too_old` otherwise. |
 | `command` | string | no | Startup command. **Bare `claude [...]` is auto-rewritten to the Alt+P peer-enabled form** — see contract note below (Q3). |
 | `name` | string | no | Stable pane name, must satisfy `[A-Za-z0-9_-]`, not all-digits. |
 | `role` | string | no | Free-form label. Non-unique. |
 | `cwd` | string | no | Absolute or relative-to-caller. Validated **before** layout mutation; failure is `cwd_invalid`. |
 
-Returns: text containing the new pane's numeric id.
+Returns: text containing the new pane's numeric id (and, for `tab: {new: …}`,
+the new tab's 0-based index).
 
 **`command` rewrite contract (Q3)**: when `command` starts with the bare token
 `claude` (no `--dangerously-load-development-channels`), renga injects the
@@ -152,9 +203,14 @@ This is **frozen behavior**; no opt-out flag in v1.0. Callers that want
 verbatim execution should pick a different leading token (e.g. `bash -c
 'claude ...'`).
 
-Errors: `split_refused` (MAX_PANES = 16, or below `min_pane_width` /
-`min_pane_height`), `cwd_invalid`, `pane_not_found`, `name_in_use`,
-`name_invalid`, `io_error`.
+Errors: `target_too_small` (halving the target would fall below
+`min_pane_width` / `min_pane_height` — target-local, another target may
+still split), `pane_limit_reached` (MAX_PANES = 16 — tab-global),
+`split_refused` (neither of those; from 3.0 only a terminal below the
+layout threshold — see §5.1), `cwd_invalid`, `pane_not_found`, `name_in_use`,
+`name_invalid`, `io_error`; with a `tab` selector also `tab_not_found`,
+`tab_ambiguous`, `target_tab_mismatch`, and (for `tab: {new: …}`)
+`tab_limit_reached` (MAX_TABS = 16).
 
 ### 1.7 `spawn_claude_pane` — stable
 
@@ -162,7 +218,7 @@ Same envelope as `spawn_pane` minus `command`, plus structured Claude fields:
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `direction`, `target`, `name`, `role`, `cwd` | as in §1.6 | direction yes | |
+| `direction`, `target`, `tab`, `name`, `role`, `cwd` | as in §1.6 | direction conditional | `tab` (#290) carries over unchanged, including the `{new: …}` background form. |
 | `permission_mode` | string | no | Rendered as `--permission-mode <v>`. Not enum-validated server-side, so new Claude permission modes work without a renga release. |
 | `model` | string | no | Rendered as `--model <v>`. |
 | `args` | string[] | no | Appended after structured fields. Must NOT contain `--dangerously-load-development-channels` / `--permission-mode` / `--model` — rejected with JSON-RPC `-32602` invalid-params. |
@@ -190,6 +246,14 @@ silent-bifurcation behavior recorded in v1.0.
 
 Input: `{ target: string }` (required).
 
+**Tab scoping (#296)**: caller-scoped like the other pane tools — `"focused"`
+and stable names resolve inside the *calling pane's* tab, a numeric id may
+address any tab. Before #296 the relative selectors resolved against the tab
+the **user was viewing**, so a background orchestrator calling
+`close_pane(target: "focused")` terminated a pane on the human's screen.
+Requires the server to advertise `caller_scope_close_identity` (§3.4); the MCP
+layer fails closed with `server_too_old` otherwise.
+
 Errors: `pane_not_found`, `pane_vanished`, `last_pane` (only pane of only
 remaining tab — surfaced as an error, not silenced), `io_error`.
 
@@ -212,12 +276,16 @@ use sparingly.
 Returns: numeric pane id of the new tab's initial pane. Focus switches to the
 new tab.
 
+Errors: `tab_limit_reached` (MAX_TABS = 16, #290), `cwd_invalid`, `io_error`.
+For a **background** tab (no focus switch) use `spawn_pane` with
+`tab: {new: …}` (§1.6) — `new_tab` itself keeps its create-and-focus contract.
+
 ### 1.12 `inspect_pane` — stable
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `target` | string | yes | |
-| `lines` | int ≥ 1 | no | Bottom N rows (blank rows preserved). |
+| `lines` | int ≥ 1 | no | Last N rendered lines ending at the live bottom (blank rows preserved). Since v1.4 (#278): N beyond the visible height continues into scrollback, capped at 2000 total; scrollback rows carry negative `row` indices and `screen.line_start` may be negative. Reads are pinned to the live tail regardless of the pane's user scroll position, which is preserved. N ≤ visible height and the omitted form are unchanged. |
 | `include_cursor` | bool | no | Default `false`. |
 | `format` | `"text"\|"grid"` | no | Default `"text"`. `"grid"` returns one JSON row object per line. `structuredContent` is always populated regardless of `format`. |
 
@@ -247,8 +315,12 @@ the pane sees the bytes.
 | `name` | string \| null | no | **Three-state**: omit = leave; `null` = clear; string = set. |
 | `role` | string \| null | no | Same three-state semantics. |
 
+**Tab scoping (#296)**: same rule as `close_pane` (§1.9) — `"focused"` and
+names resolve inside the caller's tab, numeric ids cross tabs, and
+`caller_scope_close_identity` (§3.4) is required.
+
 Validation: `name` non-empty, not all-digits, `[A-Za-z0-9_-]` only, unique
-within tab.
+within the **resolved pane's** tab (uniqueness is per tab, never global).
 
 Errors: `name_in_use`, `name_invalid`, `pane_not_found`.
 
@@ -261,7 +333,7 @@ round-trip.
 |---|---|---|---|
 | `since` | string | no | Opaque cursor returned by a prior `next_since`. Omit → "start at now"; no historical replay. |
 | `timeout_ms` | int ≥ 0 | no | Default 2000, hard cap 30000. `0` = non-blocking drain. |
-| `types` | string[] | no | Filter list. Cursor advances past filtered-out events; non-matching arrival can early-return with `events: []` and an advanced cursor. |
+| `types` | string[] | no | Filter list. Cursor advances past filtered-out events. Since #72 a filtered poll keeps waiting past non-matching arrivals instead of early-returning; on timeout it returns `events: []` with the cursor advanced past them. |
 
 Returns: `{ next_since: <cursor>, events: [<event obj>] }`.
 
@@ -277,6 +349,82 @@ different use cases; neither is deprecated.
 **Counterintuitive but frozen**: a poll that filters out every buffered event
 returns `events: []` with an **advanced** cursor. Callers must re-poll on
 empty responses to make progress.
+
+### 1.16 `server_info` — stable (#304)
+
+Input: `{}`.
+
+Reports the capability token set of the **running renga server** this pane is
+attached to, without sending any capability-gated request. This is the
+pre-flight surface: a client checks it before calling something gated (e.g.
+the `tab` selector on the `spawn_*` tools needs `spawn_tab`) instead of
+sending the call and reading the token out of a `[server_too_old]` failure.
+
+Result: text + `structuredContent`:
+
+| Field | Type | Notes |
+|---|---|---|
+| `status` | `"connected"\|"detached"\|"unreachable"` | The discriminant; read it first. |
+| `reason` | string \| null | Why `status` is not `connected`. `null` exactly when connected. |
+| `server.capabilities` | string[] \| **null** | What the running server advertised, verbatim (unknown/future tokens passed through). **`[]` means the server was asked and supports nothing; `null` means it was never asked.** Never conflate the two. |
+| `server.pid` | int \| null | PID of the **server** process, not this client's. |
+| `server.endpoint` | string \| null | Socket/pipe queried — disambiguates concurrent renga instances. Retained on `unreachable` (we know what we failed to reach); `null` only when `detached`. |
+| `server.session_id` | string \| **null** | Identity of the running renga **process instance** (#326), minted once at start and changed by every restart. Pair it with any pane id you persist — see below. `null` whenever `server.capabilities` is, **and also on a `connected` pre-#326 server**, which is why it is not covered by the biconditional those two share. `null` always means unknown, never "unchanged". |
+| `client.name` | string | `"renga-peers"`. |
+| `client.version` | string | `CARGO_PKG_VERSION` of the **mcp-peer binary**, which is *not* the server's version — see below. |
+| `client.pane_id` | int \| null | Caller's pane; `null` when detached. |
+| `client.capabilities` | string[] | Tokens this build understands. **Never null** — a build always knows its own. |
+| `effective_capabilities` | string[] \| null | `server.capabilities` ∩ `client.capabilities`, in `SERVER_CAPABILITIES` order. **This is the field to gate on.** `null` whenever `server.capabilities` is. |
+
+Every key is always present, explicitly `null` when unknown, so a typed
+consumer gets `None` rather than a silently-plausible default. Two
+biconditionals are pinned by test: `server.capabilities != null` ⟺
+`status == "connected"`, and `effective_capabilities != null` ⟺
+`status == "connected"`.
+
+**Persist pane ids as `(session_id, pane_id)`, never bare (#326).** Pane ids
+come from a counter that restarts at zero with the daemon, so a stored id
+outlives the pane it named and — after a restart — resolves cleanly to a
+*different, live* pane. No error is raised; the caller simply addresses a
+stranger. Before reusing a stored pane id, read `server.session_id` and drop
+the id unless it matches the session the id was minted in. `server.pid` and
+`server.endpoint` cannot substitute: the endpoint embeds the pid, so they are
+one fact, and the OS recycles pids. A `null` session id means the check is
+unavailable — re-resolve panes by name instead of reusing the id.
+
+**Gate on `effective_capabilities`, not `server.capabilities`.** The token
+describes the last hop only; the real question is end-to-end. An older
+mcp-peer talking to a newer server sees a token advertised truthfully, yet
+its own handler never reads the corresponding argument — MCP arguments are
+read by key and unknown keys are dropped — so the request would be silently
+degraded. The intersection is what closes that.
+
+**Never returns a JSON-RPC error**, in any state — a caller pre-flighting
+capabilities must be able to read the answer out of a normal result, since
+being forced back to parsing failure strings is the problem this tool exists
+to remove. Ungated by construction: it completes only the `hello` handshake
+and sends no `Request` beyond it, so it answers against every renga server
+that has ever shipped, including pre-#288 ones that advertise nothing.
+
+**Version skew, and why `client.version` is not the server's version**: renga
+registers `renga mcp-peer` by absolute path, so upgrading the binary on disk
+leaves the *old* server process running while newly spawned mcp-peers are the
+*new* one. The two halves are reported separately and must not be conflated;
+`client.version` describes the on-disk binary, never the process serving the
+socket. This release exposes no server-side version field — capability tokens
+are the contract, and a version→feature table maintained client-side rots.
+
+**Pre-flight is advisory, not a lease.** The server can die between the probe
+and the call, and every tool call opens a fresh connection. The
+`send_request_requiring` gate and the `[server_too_old]` error remain the
+authoritative check. This tool converts a guaranteed-wrong operator
+configuration into a rare race; it does not remove the failure class.
+
+**Absence is itself the answer** (#304 acceptance): a renga too old to have
+this tool simply does not list it in `tools/list`, and a call yields
+`-32601 unknown tool`. That is distinguishable from a server that merely
+advertises fewer tokens, which returns `status: "connected"` with a short or
+empty `capabilities` list.
 
 ### Common error wire format
 
@@ -311,6 +459,7 @@ already-running renga server).
 | `--ime-freeze-panes[=BOOL]` | bool | Suppress repaints while IME overlay open. Default `true`. |
 | `--ime-overlay-catchup-ms <MS>` | u64 | Periodic repaint interval while frozen. Default 3000, clamped ≥ 100; `0` = pure freeze. |
 | `--lang <auto\|ja\|en>` | enum | UI language. |
+| `--fps <FPS>` | u16 | Main event-loop target rate. Overrides `[ui] fps`. Default 30; `0` is accepted and clamped to 1 at runtime to avoid a busy loop. Added in 1.1.0 (#213). |
 | `--min-pane-width <COLS>` | u16 | Default 20. `0` clamps to 1. Process-global; not exposed per-call (see §6 *Out of scope*). |
 | `--min-pane-height <ROWS>` | u16 | Default 5. `0` clamps to 1. Same scope as `--min-pane-width`. |
 | `--no-macos-tip` / `--show-macos-tip` | bool | macOS Option-as-Meta first-launch banner override. Mutually exclusive. |
@@ -332,12 +481,32 @@ command (clap `conflicts_with_all`). When no selector is given, the default is
 | `renga new-tab` | `--command`, `--id`, `--label`, `--role`, `--cwd` | `Request::NewTab` |
 | `renga split` | `--target-name\|--target-id\|--target-focused`, `--direction <vertical\|horizontal>`, `--command`, `--id`, `--role`, `--cwd` | `Request::Split` |
 | `renga inspect` | `--name\|--id\|--focused`, `--lines`, `--cursor` | `Request::Inspect` |
-| `renga events` | `--timeout <humantime::Duration>`, `--count <usize>` | `Request::Subscribe` + stream |
+| `renga events` | `--timeout <humantime::Duration>`, `--count <usize>` | `Request::Subscribe { from_pane: None }` + stream |
 | `renga rename` | `--name\|--id\|--focused`, `--to-name`/`--clear-name` (mutex), `--to-role`/`--clear-role` (mutex) | `Request::SetPaneIdentity` |
 | `renga mcp-peer` | — | (not IPC) handed off to `mcp_peer::run` for the stdio MCP loop |
+| `renga capabilities` | `--text` | `hello` handshake only — prints the `server_info` payload (§1.16) |
 | `renga mcp install` | `--client <claude\|codex>` (default `claude`), `--force`, `--codex-auto-approve-peer-tools` | (writes Claude/Codex MCP config; not an IPC call) |
 | `renga mcp uninstall` | `--client <claude\|codex>` | (config write) |
 | `renga mcp status` | `--client <claude\|codex>` | (config read) |
+
+**`renga list` and cross-tab enumeration (#329)**: the CLI sends `Request::List`
+with neither `from_pane` nor `tab`, so its scope is unchanged — the active tab,
+exactly as before. Its records do pick up the new display-only `tab` / `tab_name`
+fields (§3.4); `same_tab` stays omitted, because a call with no caller pane has no
+tab for a record to share. No new flags: a CLI selector for the `tab` scope is
+deferred (§6.2), and the cross-tab surface is the `list_panes` MCP tool (§1.5).
+
+**`renga capabilities` (#313)**: the `server_info` tool (§1.16) for callers that
+are not MCP clients. Stdout is the same JSON object as `server_info`'s
+`structuredContent` — same keys, same nullability rules, built by the same code —
+so a shell script or a Python program reads it with `jq` / `json.loads` instead of
+implementing the JSON-RPC stdio handshake. `--text` prints `server_info`'s text
+block instead. It exits 0 in every state: `detached` and `unreachable` are answers
+carried in `status`, not failures. It reads `RENGA_PANE_ID` / `RENGA_SOCKET` /
+`RENGA_TOKEN` exactly as `renga mcp-peer` does, so run from outside a renga pane it
+reports `detached`; the answer is only meaningful when invoked inside the pane
+whose server you will call. `client.*` describes this binary, which for the CLI is
+the on-disk `renga`, not the running server.
 
 **`renga rename` (Q6)**: same semantics as `set_pane_identity` (§1.14) —
 three-state via `--to-X` / `--clear-X` flags. Frozen in v1.0.
@@ -346,6 +515,15 @@ three-state via `--to-X` / `--clear-X` flags. Frozen in v1.0.
 connection (good for shell pipelines and `tail -F`-style tooling); the MCP
 form cursor-paginates (good for cooperative pull from peer agents). Both are
 frozen.
+
+**`renga events` is an unscoped subscriber (#306)**: it sends no `from_pane`,
+so its stream is the full one it has always been — every event, `peer_inbox`
+lines included, whatever pane they are addressed to (§3.3, §3.5). The
+`from_pane` added in #306 is there for the *other* kind of consumer, one that
+speaks IPC on behalf of a single pane and wants only that pane's peer traffic;
+the CLI deliberately does not send it, because narrowing this stream would
+change output that has been observable since v1.0. `poll_events` is untouched
+either way: it never surfaced `peer_inbox` to MCP callers.
 
 ### 2.3 Environment variables — stable (Q7)
 
@@ -383,7 +561,7 @@ secrecy boundary — same-user processes are inside the trust boundary.
 Short-lived per request:
 
 1. Client opens connection, sends `Hello { client_pid }`.
-2. Server replies `Response::Hello { server_pid, session_token }`. Client
+2. Server replies `Response::Hello { server_pid, session_token, capabilities }`. Client
    verifies `session_token == $RENGA_TOKEN`; mismatch → reject (PID-reuse
    defense).
 3. Client sends exactly one `Request`.
@@ -393,6 +571,9 @@ Short-lived per request:
 Exception: `Request::Subscribe` switches the connection to event-stream mode —
 server replies `Response::Subscribed`, then emits `Event` JSON Lines until the
 client disconnects. No further `Request`s are accepted on that connection.
+Since #306 a `from_pane` on that request, when present, also narrows *which*
+slice of the stream the connection gets; absent, the connection gets the whole
+stream as it always did (§3.3).
 
 Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 5 s `CLIENT_MARGIN` → 10 s `RESPONSE_TIMEOUT` from the client's perspective.
@@ -404,21 +585,42 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | Variant | Fields | Notes |
 |---|---|---|
 | `hello` | `client_pid: u32` | Required first message. |
-| `list` | — | |
-| `send` | `target: PaneRef`, `data: string`, `append_enter: bool` (default false) | |
-| `split` | `target: PaneRef`, `direction: vertical\|horizontal`, `command?`, `id?`, `role?`, `cwd?` | |
-| `focus` | `target: PaneRef` | |
-| `close` | `target: PaneRef` | |
-| `new_tab` | `command?`, `id?`, `label?`, `role?`, `cwd?` | |
-| `subscribe` | — | Switches to event-stream mode after ack. |
-| `inspect` | `target: PaneRef`, `lines?`, `include_cursor: bool` (default false) | |
+| `list` | `from_pane?: usize`, `tab?: ListTabSelector` | `from_pane` added in #288; optional, omitted on the wire when absent, so `{"cmd":"list"}` is unchanged. `tab` (#329) is likewise omitted on the wire when absent — with both fields absent the request is byte-identical to `{"cmd":"list"}` — and senders must gate it on `cross_tab_list` (§3.4). `{new: …}` is not valid here; `"all"` is. |
+| `send` | `target: PaneRef`, `data: string`, `append_enter: bool` (default false), `from_pane?: usize` | |
+| `split` | `target: PaneRef`, `direction: vertical\|horizontal`, `command?`, `id?`, `role?`, `cwd?`, `from_pane?: usize`, `tab?: TabSelector` | Relative `cwd` resolves against the **target** pane, not `from_pane`. `tab` (#290) is omitted on the wire when absent; senders must gate it on `spawn_tab` (§3.4). `{new: …}` is not valid here — that is `spawn_tab`'s job. |
+| `focus` | `target: PaneRef`, `from_pane?: usize` | Resolving outside the visible tab switches the visible tab. |
+| `close` | `target: PaneRef`, `from_pane?: usize` | `from_pane` added in #296; optional and omitted on the wire when absent, so `{"cmd":"close","target":"focused"}` is unchanged. Unlike the #288 five, the **legacy** (`from_pane` absent) branch searches every workspace — `renga close --id/--name` has always been cross-tab. Senders must gate `from_pane` on `caller_scope_close_identity` (§3.4). |
+| `new_tab` | `command?`, `id?`, `label?`, `role?`, `cwd?` | Creates **and focuses** — unchanged by #290. |
+| `spawn_tab` | `command?`, `id?`, `label?`, `role?`, `cwd?`, `from_pane?: usize` | #290. Creates a single-pane tab **in the background**: the active tab is untouched, geometry (rects + PTY size) is finalized before the reply, exactly one `pane_started` is emitted after name/role attach. Relative / omitted `cwd` follows the **caller pane** (falls back to the server cwd without `from_pane`). Replies `{ id, tab }` with the new pane id and 0-based tab index. Senders must gate on `spawn_tab` (§3.4). |
+| `subscribe` | `from_pane?: usize` | Switches to event-stream mode after ack. `from_pane` (#306) scopes the subscription to a pane **inbox** — note this is not the caller-tab scoping the same-named field means on the requests above. Present → lifecycle events plus only the `peer_inbox` whose `target_pane` is that pane; **absent → unchanged pre-#306 behavior**: every event, including every `peer_inbox` whatever its `target_pane`. Optional and omitted on the wire when absent, so `{"cmd":"subscribe"}` is unchanged and so is what that request yields — a new optional input whose default preserves prior behavior, not a break (`docs/semver-policy-2.0.md` §3). Needs no capability gate (see `subscribe_pane_scope` in §3.4). |
+| `inspect` | `target: PaneRef`, `lines?`, `include_cursor: bool` (default false) | `lines` beyond the visible height reads scrollback since v1.4 (#278) — see §1.12. |
 | `peer_list` | `from_pane: usize` | |
-| `peer_send` | `from_pane: usize`, `target: PaneRef`, `body: string` | Cross-tab silently no-ops (Q5). |
-| `peer_register_client` | `pane_id: usize`, `kind: claude\|codex` | Posted by `renga mcp-peer` on startup. |
-| `set_pane_identity` | `target: PaneRef`, `name?`, `role?` (three-state: missing / null / value) | Uses serde `double_option`. |
+| `peer_send` | `from_pane: usize`, `target: PaneRef`, `body: string`, `deliver?: channel\|user_turn` | Cross-tab ids deliver since #289; names resolve in the sender's tab only; unresolvable targets fail `pane_not_found`. `deliver` (#323) is `skip_serializing_if = "is_channel"`, so a channel send is byte-identical on the wire to a pre-#323 one; senders must gate `user_turn` on `peer_user_turn` (§3.4). |
+| `peer_register_client` | `pane_id: usize`, `kind: claude\|codex` | Posted by `renga mcp-peer` on startup. Resets the pane's unread count. |
+| `peer_inbox_drained` | `pane_id: usize`, `count: usize`, `ids?: [u64]` | #353. Posted by `renga mcp-peer` after a `check_messages` that returned `count` peer messages. Emits `peer_inbox_drained`. Fire-and-forget: older servers reject the unknown `cmd`, which the client only logs. Since #369 `ids` names the drained messages by `peer_inbox.msg_id`, so a message reported twice (two subscribers on one pane) is cleared once; omitted when empty, in which case the server clears `count` messages, oldest first. |
+| `set_pane_identity` | `target: PaneRef`, `name?`, `role?` (three-state: missing / null / value), `from_pane?: usize` | Uses serde `double_option`. `from_pane` (#296) behaves exactly as on `close`. |
 | `set_summary` | `from_pane: usize`, `summary: string` | Empty `summary` clears. >256 `chars` rejected with `summary_too_long`. |
 
 `PaneRef` = `{ id: usize } | { name: string } | "focused"`.
+
+`TabSelector` (#290) = `{ name: string } | { index: usize } | { pane_id: usize }
+| { new: { name?: string } }`. Externally tagged like `PaneRef`. `name` is an
+exact display-name match (0 → `tab_not_found`, >1 → `tab_ambiguous`; never
+first-match), `index` is the 0-based tab index `list_peers` reports, `pane_id`
+selects the owning tab (the stable anchor), `new` creates a background tab. A
+tagged object rather than an overloaded string so a tab literally named "new"
+stays addressable.
+
+`ListTabSelector` (#329) = `{ name: string } | { index: usize } | { pane_id:
+usize } | "all"`. The three shared shapes are byte-identical to `TabSelector`'s
+and resolve through the same server-side resolver, so `{name: …}` means the same
+thing and produces the same `tab_not_found` / `tab_ambiguous` / `pane_not_found`
+codes on both surfaces — the vocabulary is reused, not extended. The two enums
+differ at exactly the two points where they must: `ListTabSelector` has `All` and
+no `New` (there is nothing to enumerate in a tab that does not exist yet), and
+`TabSelector` has `New` and no `All` (a pane lands in exactly one tab). `All` is a
+unit variant, so on the wire it is the bare string `"all"`, the shape
+`PaneRef::Focused` also uses.
 
 ### 3.4 Response envelope — stable
 
@@ -427,16 +629,123 @@ Server budgets: 5 s `APP_REPLY_TIMEOUT` (server → app event loop) +
 | Variant | Fields | When |
 |---|---|---|
 | `ok` | `data: Value` (request-specific shape) | Most success paths. |
-| `hello` | `server_pid: u32`, `session_token: string` | Reply to `Hello` only. |
+| `hello` | `server_pid: u32`, `session_token: string`, `capabilities?: string[]`, `session_id?: string` | Reply to `Hello` only. `capabilities` is `default` + `skip_serializing_if = "Vec::is_empty"`, so a pre-#288 server omits the key entirely and it decodes as `[]`. `session_id` (#326) is `default` + `skip_serializing_if = "Option::is_none"`, so a pre-#326 server omits it and it decodes as `None` = unknown. Both are exposed to peers by the `server_info` MCP tool (§1.16); `session_token` is **not** — it is the value clients check against `RENGA_TOKEN` and stays off introspection surfaces. |
 | `subscribed` | — | Ack of `Subscribe`; event lines follow on same connection. |
 | `err` | `message: string`, `code?: string` | Failure. `code` is `Option<String>` with `skip_serializing_if = "Option::is_none"`. |
 
 `PaneInfo` payload (used by `list` data, `set_pane_identity` ok data, embedded
 in `peer_list` data):
-`{ id, name?, role?, focused, x, y, width, height, cwd?, kind?, receive_mode?, summary? }`.
+`{ id, name?, role?, focused, x, y, width, height, cwd?, kind?, receive_mode?,
+summary?, tab?, tab_name?, same_tab?, peer_delivery? }`.
+
+`peer_delivery?` (#352, additive serde) is `{ state, pending, since_ms }` for a
+pull-mode (Codex) pane with undrained peer messages: `state` is `queued` (renga
+still holds the nudge — waiting for the pane to look ready, for the human to
+answer the focused-pane overlay, or for the Enter after a typed nudge) or
+`nudged` (the nudge is in the pane; the messages wait for `check_messages`),
+`pending` the undrained count, `since_ms` the Unix ms the pane entered `state`.
+Omitted when nothing is pending and by older servers. The pane border shows
+the same state as a `✉ queued N` / `✉ nudged N` badge.
+
+The last three are additive serde (`default` + `skip_serializing_if`), added in
+#329, and carry the same meaning as their `PeerInfo` namesakes below: `tab?`
+(0-based workspace index; display metadata that shifts when tabs close, never an
+address), `tab_name?` (display label, not unique), `same_tab?` (whether the pane
+shares the caller's tab, i.e. is addressable by bare name). `same_tab` is emitted
+**only on a response whose set can span tabs** — one whose request carried both a
+`tab` selector and a `from_pane`; on the default single-tab list it would be
+`true` on every record, and without `from_pane` there is no caller pane for it to
+be true of, so it is omitted rather than emitted as a constant. Since `id` is the
+only tab-stable address, and two independent orchestrations in different tabs both
+hold a `dispatcher` and a `worker-<task_id>`, `cwd` — not `name`, not `tab_name` —
+is what discriminates identically-named panes.
 
 `PeerInfo` = `PaneInfo` minus the focused flag and geometry (purposefully
-hidden from cross-pane callers).
+hidden from cross-pane callers), plus — since #289 — optional display-only
+tab metadata: `tab?` (workspace index; shifts when tabs close, never an
+address), `tab_name?` (display label), `same_tab?` (whether the pane shares
+the caller's tab, i.e. is addressable by bare name). All three are additive
+serde (`default` + `skip_serializing_if`), so both old-client × new-server
+and new-client × old-server decode cleanly. Since #353 it also carries
+`unread?`: peer messages sent to a pull-mode (Codex) peer that its
+`check_messages` has not drained yet; omitted for push-mode peers and by
+older servers (same additive serde).
+
+Servers advertising cross-tab peer messaging include `cross_tab_peers` in the
+`hello` capability list (#289), alongside `caller_scope` (#288). The bundled
+mcp-peer requires `cross_tab_peers` for `list_peers` / `send_message` and
+fails closed (`server_too_old`) when it is absent — a #288 server advertises
+`caller_scope` yet still silently drops cross-tab sends, so the two tokens
+are deliberately distinct.
+
+Servers supporting tab-directed spawning additionally advertise `spawn_tab`
+(#290). Any `spawn_*` call carrying a `tab` selector — including one that
+resolves to the caller's own tab — is sent with `spawn_tab` required and
+fails closed (`server_too_old`) when it is absent: `Request` tolerates
+unknown fields, so a #289-era server would silently drop the selector and
+split in the caller's tab, the wrong-tab accident again. Calls without `tab`
+keep requiring only `caller_scope`, so pre-#290 behavior is untouched.
+
+Servers that also scope `close` / `set_pane_identity` to the caller advertise
+`caller_scope_close_identity` (#296). The bundled mcp-peer sends `from_pane`
+on those two requests and requires this token, failing closed
+(`server_too_old`) when it is absent: a #290-era server advertises the three
+earlier tokens yet drops the unknown `from_pane` and closes a pane in the
+visible tab — irreversibly. A token of its own, for the same reason
+`cross_tab_peers` and `spawn_tab` are separate.
+
+Servers that can deliver a peer message **as a user turn** advertise
+`peer_user_turn` (#323). The bundled mcp-peer requires it for any
+`send_message(deliver="user_turn")` and fails closed (`server_too_old`) when it
+is absent; `deliver="channel"` keeps requiring only `cross_tab_peers`, so
+pre-#323 behavior is untouched. A token of its own because the skew here is the
+silent-wrong-answer kind: `Request` tolerates unknown fields, so a pre-#323
+server drops `deliver`, performs a **channel** send, and answers `Ok` — the
+caller reads a submitted turn where a channel tag was delivered, and the `/loop`
+or `/clear` it was arming never ran.
+
+Servers that honor `subscribe.from_pane` advertise `subscribe_pane_scope`
+(#306). Unlike every token above it is **advertise-only**: no client gates on
+it, nothing is sent with it required, and its absence changes no client
+behavior. That is safe here because the skew is benign in a way the wrong-tab
+accidents are not — a pre-#306 server drops the unknown `from_pane` and
+broadcasts as it always did, and the client's own `target_pane` check
+discards what is not addressed to it, so a new client degrades to client-side
+filtering instead of acting on someone else's message: a cost in queue
+pressure, never a wrong result. The token says nothing about subscriptions
+that omit `from_pane` — those behave identically on either server. It exists
+so a caller, an operator, or a test can read off `hello` / `server_info`
+(§1.16) whether a `from_pane` it sends will actually narrow the stream,
+rather than inferring it from observed traffic.
+
+Servers that understand the `tab` selector on `list` advertise `cross_tab_list`
+(#329), appended last to the capability list. Any `list_panes` carrying a `tab`
+selector — including one that resolves to the caller's own tab — is sent with
+`cross_tab_list` required and fails closed (`server_too_old`) when it is absent:
+`Request` tolerates unknown fields, so a pre-#329 server drops the selector and
+answers with the caller's tab alone — a well-formed `Ok` a client cannot tell
+apart from a correct answer. That is a worse failure than the wrong-tab accidents
+`cross_tab_peers` / `spawn_tab` fence, because an orchestrator reading a silently
+truncated population does not error: it retires live panes it can no longer see
+and under-counts its own capacity. Gating on the request *shape* rather than on
+the resolved tab is what keeps that failure uniform. Calls without `tab` keep
+requiring only `caller_scope`, so pre-#329 behavior is untouched.
+
+Servers that report a refused split **by cause** advertise
+`split_refusal_causes` (#335), appended last to the capability list. This is
+the capability path of `semver-policy-2.0.md` §7 used as intended: the
+behavior flips in a **major** release (3.0), and the clients that need it gate
+on the token and fail closed. Every `split` the bundled mcp-peer sends is gated
+on it — including one with no `tab` selector, which used to require only
+`caller_scope` — because `spawn_pane`'s contract now states that a refusal
+which is not `pane_limit_reached` is target-local, and a 2.x server cannot keep
+that promise: it answers both causes with `split_refused`. The breach would be
+silent (a `split_refused` is a valid answer on either server) and expensive
+(the caller gives up on a tab that still has room), so the call is refused with
+`server_too_old` instead. `{new: …}` placements keep gating on `spawn_tab`:
+they send `spawn_tab`, whose refusals #335 did not touch. Gating is directional
+(§7): an old client meeting a 3.0 server still receives the new codes, and that
+residual direction is why this is a major-release change.
 
 ### 3.5 Event envelope — stable
 
@@ -446,9 +755,16 @@ hidden from cross-pane callers).
 |---|---|---|
 | `pane_started` | `id`, `name?`, `role?`, `ts_ms` | One per pane creation. |
 | `pane_exited` | `id`, `name?`, `role?`, `ts_ms` | Exactly once per pane id. |
+| `pane_prompt_detected` | `id`, `name?`, `role?`, `kind`, `prompt`, `ts_ms` | Since #72. Heuristic screen scan for an interactive prompt. `kind` is `choice` (Claude / Codex `1. Yes` approval menu), `yes_no` (`(y/n)`-style on the cursor row) or `password` (`password:` / `passphrase:` on the cursor row); `prompt` is the matched line (the question line for `choice`). Once per distinct prompt; re-armed when it leaves the screen or changes. |
+| `pane_waiting_input` | `id`, `name?`, `role?`, `idle_ms`, `ts_ms` | Since #72. The pane has produced no PTY output for 5 s. Once per quiet spell; the next output re-arms it. Heuristic: a silent long-running command looks the same as a pane waiting for input. |
+| `pane_mode_changed` | `id`, `name?`, `role?`, `mode`, `prev_mode?`, `ts_ms` | Since #49. Claude Code permission mode read from the mode line under its input box (Claude panes only). `mode` is `default` (only recognized from the `? for shortcuts` hint), `plan`, `accept_edits`, `bypass_permissions`, `auto` or `unknown` (an unrecognized `shift+tab to cycle` line). `prev_mode` is the previous reading, absent on the first. Fires on change only; frames without a mode line are not a reading. |
+| `peer_nudge_stalled` | `id`, `name?`, `role?`, `queued_ms`, `ts_ms` | Since #354. A peer-message nudge for this Codex pane has been queued undelivered for `queued_ms` (≥ 30 s) because the pane never looked ready. Time while Codex shows it is busy (`esc to interrupt` / `tab to queue message`) does not count. Once per stuck nudge; delivering or dropping it re-arms. The pane title shows a badge meanwhile. |
+| `peer_nudge_queued` | `id`, `name?`, `role?`, `pending`, `ts_ms` | Since #352. The Codex pane's `peer_delivery` went to `queued`. Once per queued spell; messages joining the held nudge do not repeat it. |
+| `peer_nudge_submitted` | `id`, `name?`, `role?`, `pending`, `ts_ms` | Since #352. renga finished handing the held nudge to the pane: pressed Enter after typing it, typed it on the human's accept of the focused-pane overlay, or left a typed nudge to a human who focused the pane before its Enter. Only follows a `peer_nudge_queued`. `pending` is the unread count at that moment. |
+| `peer_inbox_drained` | `pane: usize`, `count: usize`, `ts_ms` | Since #353. `pane`'s agent drained `count` peer messages with `check_messages`, as reported by its MCP peer subprocess. Pull-mode (Codex) peers only. |
 | `events_dropped` | `count: u64`, `ts_ms` | Synthesized when a slow subscriber missed events. Per-subscriber. |
 | `heartbeat` | `ts_ms` | Periodic; only purpose is to detect half-closed connections. Buffer cap 256/subscriber. |
-| `peer_inbox` | `target_pane: usize`, `from_pane: usize`, `from_name?`, `from_kind?`, `body`, `ts_ms` | Always intra-tab by construction. Subscribers filter on `target_pane`. |
+| `peer_inbox` | `target_pane: usize`, `from_pane: usize`, `from_name?`, `from_kind?`, `body`, `ts_ms`, `msg_id?: u64` | `msg_id` (since #369) is the id a drain report acks; absent from older servers. May originate from any tab since #289 (previously intra-tab by construction). **The only variant whose delivery depends on who is listening**: since #306 a subscription that sent `subscribe.from_pane` (§3.3) receives only the ones matching its pane — all such subscriptions, if several named it — while a subscription that sent no `from_pane`, `renga events` among them, still receives every one of them as before. Pane ids are session-unique, so the routing needs no tab awareness. Clients keep their own `target_pane` check as a backstop, which is what keeps them correct against a pre-#306 server that broadcasts to scoped subscriptions too. |
 
 **`heartbeat` audience (Q10)**: emitted into the subscribe-stream
 (`renga events` / `Request::Subscribe`). The MCP-side `poll_events` consumes
@@ -474,6 +790,8 @@ overlay_catchup_ms = 3000        # default 3000; non-zero clamped >= 100; 0 = pu
 
 [ui]
 lang = "auto"             # "auto" (default) | "ja" | "en"; case-insensitive
+org_sidebar = "coexist"   # "coexist" (default) | "replace" | "off"; case-insensitive
+fps = 30                  # default 30; clamped to >= 1 (0 would busy-loop). Added in 1.1.0
 ```
 
 Missing or malformed file → warning to stderr, defaults apply (never fails
@@ -536,14 +854,26 @@ these as `[<code>] <human message>` in JSON-RPC error message strings.
 | `internal` | every request | Server invariant violation. |
 | `pane_not_found` | pane-targeted requests | `PaneRef` did not resolve. |
 | `pane_vanished` | pane-targeted requests | Resolved then disappeared mid-flight. Rare. |
-| `split_refused` | `split`, `spawn_*`, `new_tab` (and layout TOML apply) | MAX_PANES = 16, or below `min_pane_width` / `min_pane_height`. |
+| `split_refused` | `split`, `spawn_*` (and layout TOML apply); `spawn_tab` only for a terminal below the layout threshold | **Narrowed in 3.0 (#335)** — through 2.x it folded the two causes below into one code, so a caller could not tell a retryable target from a full tab. From 3.0 it means *neither* of them: a terminal below the layout threshold, or the workspace-vanished race. Read from a 2.x server it still means "one of the two, unspecified", so a client that has not confirmed `split_refusal_causes` (§3.4) must keep that weaker reading. Corrected in #290: `new_tab` never returned this — its capacity failure is `tab_limit_reached`. |
+| `target_too_small` | `split`, `spawn_pane` / `spawn_claude_pane` / `spawn_codex_pane` (#335, 3.0) | Halving the **target pane** along the requested axis would fall below `min_pane_width` / `min_pane_height`. **Target-local**: the tab is not full, and the message carries the observed numbers (the target's extent on the split axis, the size each half would get, the minimum required, and the tab's pane count against MAX_PANES) so a caller can retry against a bigger target or the other direction. |
+| `pane_limit_reached` | `split`, `spawn_pane` / `spawn_claude_pane` / `spawn_codex_pane` (#335, 3.0) | The **tab** already holds MAX_PANES = 16 panes. **Tab-global**: no target in it will split; close a pane or use `tab: {new: …}`. Checked before geometry, so it wins over `target_too_small`. Distinct from `tab_limit_reached`, which is about the number of tabs. |
 | `io_error` | requests with PTY side-effects | OS-level write/spawn failure. |
 | `last_pane` | `close` | Refused to remove the only pane of the only tab. |
-| `cwd_invalid` | `split`, `new_tab` | `cwd` missing or not a directory. Pre-mutation rejection — no half-mutated layout. |
+| `cwd_invalid` | `split`, `new_tab`, `spawn_tab` | `cwd` missing or not a directory. Pre-mutation rejection — no half-mutated layout. |
 | `name_in_use` | `split`, `new_tab`, `set_pane_identity` | Another pane in the same tab holds the requested name. |
-| `name_invalid` | `split`, `new_tab`, `set_pane_identity` | Name empty / all-digits / non-`[A-Za-z0-9_-]`. |
+| `name_invalid` | `split`, `new_tab`, `set_pane_identity`, `spawn_tab` | Name empty / all-digits / non-`[A-Za-z0-9_-]`. `spawn_tab` rejects **before** creating the tab (#290). |
 | `summary_too_long` | `set_summary` | Summary input exceeds 256 Unicode scalar values. Pre-mutation rejection. |
+| `tab_not_found` | `split` with `tab`; `list` with `tab` (#329) | Selector's display name matched no tab, or the 0-based index is out of range. Pre-mutation rejection. |
+| `tab_ambiguous` | `split` with `tab`; `list` with `tab` (#329) | `{name}` matched several tabs. Labels are not unique; the server never first-matches — re-address via `{index}` or `{pane_id}`. |
+| `target_tab_mismatch` | `split` with `tab` | Numeric `target` lives in a different tab than the selector picked. The request contradicts itself; refused instead of following either half. |
+| `tab_limit_reached` | `new_tab`, `spawn_tab` | MAX_TABS = 16 tabs already open. Deliberately not `pane_limit_reached`, which is about pane capacity inside one tab. |
+| `user_turn_not_ready` | `peer_send` with `deliver: user_turn`, `send_message` (#323) | No empty, focused agent composer could be positively identified on the target's screen — a modal, a permission prompt, a folder-trust dialog, an existing draft, a scrolled-back pane, or a screen renga cannot read. Detection is *positive*, so an unrecognized Claude/Codex UI revision fails closed here. **Nothing was written**; clear the blocker (usually with `send_keys`) and retry. |
+| `user_turn_busy` | `peer_send` with `deliver: user_turn`, `send_message` (#323) | The target agent is mid-turn. Refused rather than queued, so "this call submitted a turn" never degrades into "this may become a turn later". **Nothing was written.** |
+| `user_turn_unsupported_target` | `peer_send` with `deliver: user_turn`, `send_message` (#323) | The target pane is not running an agent that takes turns (a plain shell, another full-screen TUI, or a pane whose startup command has not run yet). Distinct from `user_turn_not_ready`: retrying will not help until what the pane runs changes. **Nothing was written.** |
+| `user_turn_invalid_body` | `peer_send` with `deliver: user_turn`, `send_message` (#323) | The body cannot be typed as a turn: empty/whitespace, carries control characters, or is multi-line against a target that has not enabled bracketed paste (raw newlines would submit the first line and drive the UI with the rest). Retryable only with a different body; **nothing was written**. |
+| `user_turn_stalled` | `peer_send` with `deliver: user_turn`, `send_message` (#323) | Body bytes reached the composer but submission was never observed. **The outcome is uncertain and bytes were written** — the only user-turn code for which that is true. Inspect the pane before retrying; an immediate identical retry is suppressed by the 5s user-turn dedupe window rather than firing a second `/clear`. |
 | `codex_not_installed` | `spawn_codex_pane` | Codex's `~/.codex/config.toml` is missing the renga-peers entry, the file is unreadable, or the `RENGA_PEER_CLIENT_KIND=codex` env-var passthrough is absent. Surfaced from the MCP layer (not `renga::ipc::err_code`); branch on the `[code]` token same as the others. Run `renga mcp install --client codex` to remediate. |
+| `server_too_old` | any capability-gated call (§3.4) | The connected server did not advertise the capability the call needs, so the client refused to send it. Raised **client-side** by `require_capability` and surfaced from the MCP layer (not `renga::ipc::err_code`); branch on the `[code]` token same as the others. The message names the advertised set and the remedy: the running renga *process* predates the feature even when the binary on disk does not, so restart renga. |
 
 ### 5.2 JSON-RPC numeric codes (Q9)
 
@@ -581,12 +911,44 @@ major version.
   `"focused"` only where documented (`spawn_*`, `set_pane_identity`); other
   tools require an explicit `target`.
 - **Tab scoping (Q4)**: `list_panes`, `focus_pane`, `send_message`,
-  `inspect_pane`, `send_keys`, `set_pane_identity`, `close_pane`, and
-  `peer_send` are **scoped to the current tab**. Panes on other tabs are not
-  addressable in v1.0.
-- **Cross-tab `peer_send` is a silent no-op (Q5)**: no error is raised;
-  delivery silently fails. v1.0 keeps this for backward compat; the
-  cross-tab story is reopened in v1.1+.
+  `inspect_pane`, `send_keys`, `spawn_pane`, `spawn_claude_pane`,
+  `spawn_codex_pane`, `close_pane`, `set_pane_identity`, and `peer_send` are
+  **scoped to the caller's tab** — the tab the calling pane lives in, *not*
+  whichever tab the user is currently looking at (Issue #288; before that fix
+  these resolved against the visible tab, which silently misdirected every
+  call made from a background tab. `close_pane` / `set_pane_identity` were
+  the two stragglers, fixed in #296).
+  Relative selectors (`"focused"`, a stable name) never leave the caller's tab.
+  An explicit **numeric pane id** may address a pane in another tab — the
+  deliberate escape hatch, and the one thing #296 preserved unchanged.
+  For `send_message` / `peer_send` the numeric-id escape hatch actually
+  *delivers* across tabs since #289 (see Q5 below); the relative-selector
+  rule is unchanged. `focus_pane` additionally switches the visible tab
+  whenever the resolved pane is not in it — focus the keyboard cannot reach
+  would not be focus.
+  Since #329 `list_panes` additionally accepts an explicit `tab` selector
+  (§1.5) that reads another tab, or every tab at once. That is an
+  **enumeration** opt-out only, and only for the tool that reads: the default
+  with no `tab` argument is unchanged, and no pane's placement or addressing
+  changes — numeric ids already crossed tabs.
+
+  Wire-level: the five stable IPC requests (`list`, `send`, `split`, `focus`,
+  `inspect`) carry an **optional** `from_pane`; `close` and `set_pane_identity`
+  gained the same field in #296. Omitting it preserves each request's
+  pre-existing semantics exactly, which is what the `renga` CLI sends — note
+  that "pre-existing" differs between the two groups: active-tab-only for the
+  #288 five, all-workspace search for the #296 two.
+  Servers advertise a `caller_scope` capability in the `hello` reply (plus
+  `caller_scope_close_identity` since #296); clients that depend on caller
+  scoping refuse to run against a server that does not advertise it rather
+  than degrade silently.
+- **Cross-tab `peer_send` delivers (Q5, revised by #289)**: v1.0 froze the
+  cross-tab silent no-op; #289 removed it. A numeric-id target in another tab
+  delivers; an unresolvable target fails `pane_not_found`; `peer_list` spans
+  every tab. Callers must no longer rely on the tab boundary to contain peer
+  discovery or delivery — the anti-enumeration property moved to the security
+  layer outside renga (owner decision on #289). Version skew is fenced by the
+  `cross_tab_peers` capability token (§3.4).
 - **Detached-mode ok-text fallbacks**: `list_peers` and `send_message` return
   the documented ok-text prefixes (§1.1, §1.2) instead of JSON-RPC errors when
   the renga IPC server is unreachable. The prefixes are part of the wire ABI.
@@ -597,9 +959,13 @@ The following are **not** part of the v1.0 frozen surface. They may exist in
 the codebase but downstream must not depend on them; they may change in any
 minor release.
 
-- **Cross-tab selectors** for `list_panes` / `focus_pane` / `send_message`
-  etc. (Q4 → v1.1+). Workers needing cross-tab coordination must continue to
-  use the "all workers in one tab" pattern.
+- **Cross-tab selectors** for `focus_pane` etc. (Q4 → v1.1+).
+  `send_message` gained cross-tab delivery by numeric id in #289, and
+  `list_panes` gained a `tab` selector — including `{"all": true}` — in #329
+  (§1.5), so both are now delivered rather than deferred; a `renga list`
+  equivalent on the CLI is still deferred (§2.2). For the remaining tab-scoped
+  tools, workers needing cross-tab coordination continue to use numeric-id
+  escape hatches or the "all workers in one tab" pattern.
 - **`spawn_pane.command` opt-out flag** for the `claude → claude
   --dangerously-load-...` rewrite (Q3). Callers who need verbatim execution
   must use a non-`claude` leading token (e.g. `bash -c '…'`).
@@ -623,13 +989,13 @@ minor release.
 
 | Section | Count |
 |---|---|
-| MCP tools (§1) | 15 |
-| CLI top-level flags (§2.1) | 11 |
+| MCP tools (§1) | 16 |
+| CLI top-level flags (§2.1) | 12 |
 | CLI IPC subcommands (§2.2) | 13 |
 | Env vars (§2.3) | 6 |
-| IPC `Request` variants (§3.3) | 14 |
+| IPC `Request` variants (§3.3) | 15 |
 | IPC `Response` variants (§3.4) | 4 |
 | IPC `Event` variants (§3.5) | 5 |
-| Error codes (§5.1) | 15 |
+| Error codes (§5.1) | 27 |
 | Config schema sections (§4.1) | 2 |
 | Layout TOML node types (§4.2) | 2 |

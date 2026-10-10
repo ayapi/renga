@@ -78,17 +78,24 @@ impl ClaudeState {
     /// into the JSONL, **without** the `[1m]` suffix even when the
     /// session is running the 1M variant. Opus 4.6 ships with a 1M
     /// context by default for Pro / Max users, so it's treated as 1M
-    /// here. Older Opus uses a 500K baseline so the status-bar usage
-    /// ratio better reflects the practical working window on those
-    /// models. Haiku and Sonnet keep their native 200K window — the
-    /// `[1m]` extended variants are still picked up by the explicit
-    /// `[1m]` / `-1m` suffix path above. Unknown models fall back to
-    /// 200K as the safe default.
+    /// here, as are the newer 1M-default tiers: Fable 5 / Mythos 5
+    /// (1M is both default and maximum, no `[1m]` variant exists) and
+    /// Opus 4.7 / 4.8 / 5. Older Opus uses a 500K baseline so the
+    /// status-bar usage ratio better reflects the practical working
+    /// window on those models. Haiku and Sonnet keep their native 200K
+    /// window — the `[1m]` extended variants are still picked up by
+    /// the explicit `[1m]` / `-1m` suffix path above. Unknown models
+    /// fall back to 200K as the safe default.
     pub fn context_limit(&self) -> u64 {
         match self.model.as_deref() {
             Some(m) if m.contains("[1m]") || m.contains("-1m") => 1_000_000,
-            // Opus 4.6+: 1M context is default.
+            // Fable 5 / Mythos 5: 1M context is default and maximum.
+            Some(m) if m.contains("fable") || m.contains("mythos") => 1_000_000,
+            // Opus 4.6+ (4-6 / 4-7 / 4-8 / 5): 1M context is default.
+            // Keep these specific arms before the catch-all `opus` 500K arm.
             Some(m) if m.contains("opus-4-6") => 1_000_000,
+            Some(m) if m.contains("opus-4-7") || m.contains("opus-4-8") => 1_000_000,
+            Some(m) if m.contains("opus-5") => 1_000_000,
             Some(m) if m.contains("haiku") => 200_000,
             Some(m) if m.contains("sonnet") => 200_000,
             Some(m) if m.contains("opus") => 500_000,
@@ -115,10 +122,51 @@ impl ClaudeState {
             Some("sonnet")
         } else if full.contains("haiku") {
             Some("haiku")
+        } else if full.contains("fable") {
+            Some("fable")
+        } else if full.contains("mythos") {
+            Some("mythos")
         } else {
             Some(full)
         }
     }
+}
+
+/// Lightweight, display-only view of a pane's `ClaudeState`.
+///
+/// The org sidebar needs to read Claude status for every pane across every
+/// tab, once per frame (or per background poll tick). Cloning the full
+/// `ClaudeState` for that purpose would clone each pane's `Vec<TodoItem>`
+/// and `Vec<String>` / `String` fields on every check — heap churn
+/// multiplied by (tab count × pane count) per frame. `ClaudeSnapshot`
+/// carries only the small set of fields the sidebar actually renders, all
+/// `Copy` or cheap-to-clone, and implements `PartialEq` so callers can
+/// compare against a cached previous snapshot and skip a redraw when
+/// nothing changed.
+///
+/// `context_usage` is stored as a rounded 0-100 percentage (`u8`) rather
+/// than the underlying `f64`/`f32` ratio — this sidesteps float
+/// `PartialEq` entirely (bitwise float equality is fragile and clippy-unfriendly)
+/// while still being precise enough for display.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ClaudeSnapshot {
+    /// Whether Claude is actively working (thinking or mid-tool-use).
+    pub is_working: bool,
+    /// Name of the most recently invoked tool, if any.
+    pub current_tool: Option<String>,
+    /// Number of currently active sub-agents (Task/Agent tool spawns).
+    pub subagent_count: usize,
+    /// Completed todo count (from the latest TodoWrite call).
+    pub todo_done: usize,
+    /// Total todo count (from the latest TodoWrite call).
+    pub todo_total: usize,
+    /// Context window usage as a rounded percentage (0-100).
+    pub context_usage: u8,
+    /// Short model name (e.g. "opus", "sonnet"), if known.
+    pub short_model: Option<String>,
+    /// Whether this pane has a Claude session (JSONL file) attached at all.
+    /// Distinguishes "no session found yet" from "session found, idle".
+    pub has_session: bool,
 }
 
 /// Per-pane monitor state.
@@ -126,6 +174,9 @@ struct PaneMonitor {
     jsonl_path: Option<PathBuf>,
     file_position: u64,
     last_mtime: Option<SystemTime>,
+    /// Paired with `last_mtime`: coarse file-time ticks can leave mtime
+    /// unchanged across two writes, but an append still changes the size.
+    last_len: u64,
     /// Last time we did a metadata check (for throttling).
     last_check: Instant,
     /// Last time we ran a full directory scan for new JSONL files.
@@ -143,6 +194,7 @@ impl PaneMonitor {
             jsonl_path: None,
             file_position: 0,
             last_mtime: None,
+            last_len: 0,
             last_check: Instant::now() - Duration::from_secs(10),
             last_rescan: Instant::now() - Duration::from_secs(60),
             state: ClaudeState::default(),
@@ -159,7 +211,17 @@ pub struct ClaudeMonitor {
 }
 
 /// Throttle interval for file metadata checks (to avoid per-frame syscalls).
-const CHECK_INTERVAL: Duration = Duration::from_millis(500);
+/// Public so the org sidebar's cross-tab sweep can ask for the same
+/// cadence on the visible tab that `render_panes` has always used.
+pub const CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Throttle interval for panes that don't need live updates right now —
+/// namely panes in tabs the user isn't currently looking at. The org
+/// sidebar polls Claude status for every pane in every tab, so visible-tab
+/// panes use `CHECK_INTERVAL` for responsiveness while background-tab
+/// panes use this looser cadence to keep the aggregate per-frame cost
+/// bounded by tab count rather than growing with `CHECK_INTERVAL`'s rate.
+pub const BACKGROUND_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Maximum cached request IDs for token dedup. JSONL is read sequentially
 /// and we never re-read old lines, so clearing the set is safe — the only
@@ -182,22 +244,47 @@ impl ClaudeMonitor {
     }
 
     /// Update monitoring for a pane with its current cwd.
-    /// Throttled to CHECK_INTERVAL to avoid per-frame syscalls.
+    /// Throttled to `CHECK_INTERVAL` to avoid per-frame syscalls.
+    ///
+    /// Thin wrapper over `update_throttled` kept with its original
+    /// signature so the existing (visible-pane) call site is unaffected;
+    /// see `update_throttled` for the return-value semantics this discards.
     pub fn update(&self, pane_id: usize, cwd: &Path) {
+        self.update_throttled(pane_id, cwd, CHECK_INTERVAL);
+    }
+
+    /// Update monitoring for a pane with its current cwd, throttled to
+    /// `min_interval` instead of the fixed `CHECK_INTERVAL`. This lets
+    /// callers poll the visible tab's panes tightly (`CHECK_INTERVAL`) and
+    /// background/off-screen tabs' panes loosely
+    /// (`BACKGROUND_CHECK_INTERVAL`) through the same code path.
+    ///
+    /// Returns whether this call may have changed the pane's
+    /// `ClaudeState`. This is a **conservative** signal, not an exact
+    /// diff: `true` means "the JSONL path was (re)located/reset, or at
+    /// least one new JSONL line was read and applied" — the state *may*
+    /// have changed, but an applied line is not guaranteed to have altered
+    /// any field. `false` is the guarantee callers can rely on: no line
+    /// was read and no reset happened, so the state is unchanged since the
+    /// previous call. Callers that skip a redraw on `false` are therefore
+    /// safe; callers must not assume `true` implies a *visible* change.
+    pub fn update_throttled(&self, pane_id: usize, cwd: &Path, min_interval: Duration) -> bool {
         // Phase 1: check if we should run at all (short lock)
-        let (path_to_read, read_from) = {
+        let (path_to_read, read_from, changed) = {
             let mut map = match self.inner.lock() {
                 Ok(m) => m,
-                Err(_) => return,
+                Err(_) => return false,
             };
 
             let monitor = map.entry(pane_id).or_insert_with(PaneMonitor::new);
 
             // Throttle: skip if checked recently
-            if monitor.last_check.elapsed() < CHECK_INTERVAL {
-                return;
+            if monitor.last_check.elapsed() < min_interval {
+                return false;
             }
             monitor.last_check = Instant::now();
+
+            let mut changed = false;
 
             // Locate or re-locate the JSONL file.
             // Full directory scan every 5s or when our path disappears,
@@ -213,24 +300,26 @@ impl ClaudeMonitor {
                     monitor.state = ClaudeState::default();
                     monitor.active_task_ids.clear();
                     monitor.counted_request_ids.clear();
+                    changed = true;
                 }
             }
 
             let path = match &monitor.jsonl_path {
                 Some(p) => p.clone(),
-                None => return,
+                None => return changed,
             };
 
             // Check file metadata — skip if unchanged, detect truncation/rotation
             let meta = match std::fs::metadata(&path) {
                 Ok(m) => m,
-                Err(_) => return,
+                Err(_) => return changed,
             };
             let mtime = meta.modified().ok();
-            if mtime == monitor.last_mtime {
-                return;
+            if mtime == monitor.last_mtime && meta.len() == monitor.last_len {
+                return changed;
             }
             monitor.last_mtime = mtime;
+            monitor.last_len = meta.len();
 
             // File truncation/rotation detection: if file shrank, reset state
             if meta.len() < monitor.file_position {
@@ -238,19 +327,20 @@ impl ClaudeMonitor {
                 monitor.state = ClaudeState::default();
                 monitor.active_task_ids.clear();
                 monitor.counted_request_ids.clear();
+                changed = true;
             }
 
-            (path, monitor.file_position)
+            (path, monitor.file_position, changed)
         };
 
         // Phase 2: read file without holding the lock
         let file = match File::open(&path_to_read) {
             Ok(f) => f,
-            Err(_) => return,
+            Err(_) => return changed,
         };
         let mut reader = BufReader::new(file);
         if reader.seek(SeekFrom::Start(read_from)).is_err() {
-            return;
+            return changed;
         }
 
         let mut new_lines = Vec::new();
@@ -272,15 +362,54 @@ impl ClaudeMonitor {
 
         // Phase 3: apply parsed events (short lock)
         if new_lines.is_empty() {
-            return;
+            return changed;
         }
+        let mut changed = changed;
         if let Ok(mut map) = self.inner.lock() {
             if let Some(monitor) = map.get_mut(&pane_id) {
                 monitor.file_position = new_position;
                 for line in &new_lines {
                     process_event(monitor, line);
                 }
+                changed = true;
             }
+        }
+        changed
+    }
+
+    /// Build a lightweight snapshot of a pane's Claude status for display.
+    ///
+    /// Unlike `state()`, this does not clone the full `ClaudeState`
+    /// (`Vec<TodoItem>`, `Vec<String>`, etc.) — it takes the lock once and
+    /// reads only the handful of fields `ClaudeSnapshot` needs directly off
+    /// `PaneMonitor`/`ClaudeState`. See `ClaudeSnapshot`'s docs for why
+    /// that distinction matters for the org sidebar's per-frame,
+    /// all-pane-all-tab polling. Returns `ClaudeSnapshot::default()` for a
+    /// `pane_id` that has never been passed to `update`/`update_throttled`.
+    pub fn snapshot(&self, pane_id: usize) -> ClaudeSnapshot {
+        let map = match self.inner.lock() {
+            Ok(m) => m,
+            Err(_) => return ClaudeSnapshot::default(),
+        };
+        let monitor = match map.get(&pane_id) {
+            Some(m) => m,
+            None => return ClaudeSnapshot::default(),
+        };
+
+        let (todo_done, todo_total) = monitor.state.todo_progress();
+        let context_usage_pct = (monitor.state.context_usage() * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8;
+
+        ClaudeSnapshot {
+            is_working: monitor.state.is_working,
+            current_tool: monitor.state.current_tool.clone(),
+            subagent_count: monitor.state.subagent_count,
+            todo_done,
+            todo_total,
+            context_usage: context_usage_pct,
+            short_model: monitor.state.short_model().map(|s| s.to_string()),
+            has_session: monitor.jsonl_path.is_some(),
         }
     }
 
@@ -626,5 +755,186 @@ mod tests {
         assert_eq!(state.context_limit(), 200_000);
         state.model = Some("claude-haiku-4-5".to_string());
         assert_eq!(state.context_limit(), 200_000);
+    }
+
+    #[test]
+    fn test_context_limit_fable_and_mythos_is_1m() {
+        // Fable 5 / Mythos 5 ship with a 1M context window as both the
+        // default and the maximum (no [1m] variant exists).
+        let mut state = ClaudeState {
+            model: Some("claude-fable-5".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(state.context_limit(), 1_000_000);
+
+        state.model = Some("claude-mythos-5".to_string());
+        assert_eq!(state.context_limit(), 1_000_000);
+    }
+
+    #[test]
+    fn test_context_limit_opus_5_tier_is_1m() {
+        // Opus 5 / 4.7 / 4.8 all ship with 1M context by default and
+        // must not fall through to the catch-all 500K `opus` arm.
+        let mut state = ClaudeState {
+            model: Some("claude-opus-5".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(state.context_limit(), 1_000_000);
+
+        state.model = Some("claude-opus-4-7".to_string());
+        assert_eq!(state.context_limit(), 1_000_000);
+
+        state.model = Some("claude-opus-4-8".to_string());
+        assert_eq!(state.context_limit(), 1_000_000);
+    }
+
+    #[test]
+    fn test_short_model_fable_and_mythos() {
+        let mut state = ClaudeState {
+            model: Some("claude-fable-5".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(state.short_model(), Some("fable"));
+
+        state.model = Some("claude-mythos-5".to_string());
+        assert_eq!(state.short_model(), Some("mythos"));
+
+        // Opus tiers keep the existing short name.
+        state.model = Some("claude-opus-5".to_string());
+        assert_eq!(state.short_model(), Some("opus"));
+        state.model = Some("claude-opus-4-8".to_string());
+        assert_eq!(state.short_model(), Some("opus"));
+    }
+
+    /// Registers `pane_id` with `path` already resolved as its JSONL file,
+    /// bypassing `find_jsonl_path`'s `~/.claude/projects` layout so tests
+    /// don't depend on the real home directory. `last_rescan` is set fresh
+    /// so the first `update_throttled` call doesn't trigger a rescan (which
+    /// would call `find_jsonl_path` and clobber `jsonl_path` back to
+    /// whatever it resolves to for the test's fake cwd).
+    fn register_pane_with_path(monitor: &ClaudeMonitor, pane_id: usize, path: PathBuf) {
+        let mut map = monitor.inner.lock().unwrap();
+        let mut pm = PaneMonitor::new();
+        pm.jsonl_path = Some(path);
+        pm.last_check = Instant::now() - Duration::from_secs(10);
+        pm.last_rescan = Instant::now();
+        map.insert(pane_id, pm);
+    }
+
+    #[test]
+    fn test_update_throttled_skips_io_within_min_interval() {
+        let monitor = ClaudeMonitor::new();
+        let path = std::env::temp_dir().join(format!(
+            "renga_claude_monitor_test_throttle_{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&path, "").unwrap();
+        register_pane_with_path(&monitor, 1, path.clone());
+
+        let cwd = Path::new("/unused");
+        let min_interval = Duration::from_millis(200);
+
+        // First call: not throttled, but the file is empty so nothing new
+        // was read and no reset happened — reports no change.
+        assert!(!monitor.update_throttled(1, cwd, min_interval));
+
+        // Immediately calling again must be throttled (min_interval hasn't
+        // elapsed): no metadata/file I/O, and conservatively reports false.
+        assert!(!monitor.update_throttled(1, cwd, min_interval));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_update_throttled_reports_true_when_new_lines_applied() {
+        let monitor = ClaudeMonitor::new();
+        let path = std::env::temp_dir().join(format!(
+            "renga_claude_monitor_test_apply_{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&path, "").unwrap();
+        register_pane_with_path(&monitor, 2, path.clone());
+
+        let cwd = Path::new("/unused");
+        let min_interval = Duration::from_millis(50);
+
+        // Baseline call against the empty file establishes last_mtime.
+        assert!(!monitor.update_throttled(2, cwd, min_interval));
+
+        // Sleep so the second call clears the `Instant`-based throttle.
+        // Change detection compares mtime *and* size, so a same-tick
+        // mtime (coarse file-time clock, ~15.6ms on Windows) is harmless.
+        std::thread::sleep(Duration::from_millis(60));
+
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","id":"t1","input":{}}],"stop_reason":"tool_use"}}
+"#;
+        std::fs::write(&path, line).unwrap();
+
+        assert!(monitor.update_throttled(2, cwd, min_interval));
+        assert_eq!(monitor.state(2).current_tool.as_deref(), Some("Bash"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_claude_snapshot_partial_eq() {
+        let a = ClaudeSnapshot {
+            is_working: true,
+            current_tool: Some("Bash".to_string()),
+            subagent_count: 1,
+            todo_done: 2,
+            todo_total: 3,
+            context_usage: 42,
+            short_model: Some("opus".to_string()),
+            has_session: true,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+
+        let mut c = a.clone();
+        c.is_working = false;
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_snapshot_unregistered_pane_returns_default() {
+        let monitor = ClaudeMonitor::new();
+        assert_eq!(monitor.snapshot(999), ClaudeSnapshot::default());
+    }
+
+    #[test]
+    fn test_snapshot_reflects_pane_state() {
+        let monitor = ClaudeMonitor::new();
+        {
+            let mut map = monitor.inner.lock().unwrap();
+            let mut pm = PaneMonitor::new();
+            pm.jsonl_path = Some(PathBuf::from("/fake/session.jsonl"));
+            pm.state.is_working = true;
+            pm.state.current_tool = Some("Edit".to_string());
+            pm.state.subagent_count = 2;
+            pm.state.todos = vec![
+                TodoItem {
+                    content: "a".to_string(),
+                    status: "completed".to_string(),
+                },
+                TodoItem {
+                    content: "b".to_string(),
+                    status: "pending".to_string(),
+                },
+            ];
+            pm.state.model = Some("claude-sonnet-4-6".to_string());
+            pm.state.context_tokens = 100_000; // sonnet's 200K limit -> 50%
+            map.insert(3, pm);
+        }
+
+        let snap = monitor.snapshot(3);
+        assert!(snap.is_working);
+        assert_eq!(snap.current_tool.as_deref(), Some("Edit"));
+        assert_eq!(snap.subagent_count, 2);
+        assert_eq!(snap.todo_done, 1);
+        assert_eq!(snap.todo_total, 2);
+        assert_eq!(snap.context_usage, 50);
+        assert_eq!(snap.short_model.as_deref(), Some("sonnet"));
+        assert!(snap.has_session);
     }
 }

@@ -25,6 +25,33 @@ impl App {
             return Ok(true);
         }
 
+        // Ctrl+W close confirmation (Issue #285) — a true modal.
+        //
+        // Position is load-bearing: *after* the Ctrl+Q escape hatch
+        // above so a pending prompt can never trap the user, and
+        // *before* the overlay / rename / regular handlers so no
+        // keystroke reaches the PTY while the prompt is up. `y`/`Y`
+        // execute, `n`/`N`/`Esc` cancel, and every other key is
+        // swallowed with the prompt left standing — a stray keypress
+        // must neither close a pane nor leak a character into the
+        // shell underneath.
+        if self.close_confirm.is_some() {
+            // Ctrl+Y / Alt+Y are not "yes". Only an unmodified (or
+            // merely shifted) y/n counts as an answer. Allowlist rather
+            // than denylist: under crossterm's enhanced keyboard
+            // protocol META and HYPER are reported independently of
+            // ALT / SUPER, and naming the rejected flags one by one
+            // would silently accept whatever the next protocol adds.
+            let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') if plain => self.confirm_close_now(),
+                KeyCode::Char('n') | KeyCode::Char('N') if plain => self.cancel_close_confirm(),
+                KeyCode::Esc => self.cancel_close_confirm(),
+                _ => {}
+            }
+            return Ok(true);
+        }
+
         // IME composition overlay — route every relevant key into the
         // buffer until the user commits or cancels. Takes precedence
         // over rename and every other handler so composition never
@@ -46,7 +73,9 @@ impl App {
                     .accept_codex_peer_notification()
                     .map_err(|e| anyhow::anyhow!(e.to_string()));
             }
-            self.dismiss_codex_peer_notification();
+            // Typing past the overlay is not an "ignore": park it so
+            // the request is still nudged once focus leaves (#197).
+            self.snooze_codex_peer_notification();
         }
 
         // Rename mode — swallow all input until Enter/Esc.
@@ -199,16 +228,25 @@ impl App {
         if (key.modifiers == KeyModifiers::CONTROL || key.modifiers == KeyModifiers::ALT)
             && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
         {
-            let new_id = self.new_tab()?;
-            self.emit_pane_started(new_id);
+            match self.create_tab_with_cwd(None, true) {
+                Ok((_, new_id)) => self.emit_pane_started(new_id),
+                // The MAX_TABS refusal must not bubble into the event
+                // loop — `run_event_loop`'s `?` would tear down the
+                // whole multiplexer over a full tab strip. Consume the
+                // keypress instead, matching how a split at MAX_PANES
+                // and the tab-bar `+` click already no-op at their
+                // caps. Genuine failures (PTY spawn I/O) keep the
+                // pre-#290 propagation.
+                Err(e) if e.code == Some(ipc::err_code::TAB_LIMIT_REACHED) => {}
+                Err(e) => return Err(anyhow::anyhow!(e.to_string())),
+            }
             return Ok(true);
         }
 
         // Alt+Right — next tab
         if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Right {
             if !self.workspaces.is_empty() {
-                self.active_tab = (self.active_tab + 1) % self.workspaces.len();
-                self.suspend_overlay();
+                self.switch_tab((self.active_tab + 1) % self.workspaces.len());
             }
             return Ok(true);
         }
@@ -216,12 +254,12 @@ impl App {
         // Alt+Left — previous tab
         if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Left {
             if !self.workspaces.is_empty() {
-                self.active_tab = if self.active_tab == 0 {
+                let target = if self.active_tab == 0 {
                     self.workspaces.len() - 1
                 } else {
                     self.active_tab - 1
                 };
-                self.suspend_overlay();
+                self.switch_tab(target);
             }
             return Ok(true);
         }
@@ -270,8 +308,7 @@ impl App {
             if let KeyCode::Char(c) = key.code {
                 if let Some(digit) = c.to_digit(10) {
                     if digit >= 1 && (digit as usize) <= self.workspaces.len() {
-                        self.active_tab = (digit as usize) - 1;
-                        self.suspend_overlay();
+                        self.switch_tab((digit as usize) - 1);
                         return Ok(true);
                     }
                 }
@@ -290,13 +327,49 @@ impl App {
             return Ok(true);
         }
 
+        // Ctrl+B — toggle the org sidebar. Kept off Ctrl+F so the file
+        // tree binding users already have in their fingers is untouched
+        // (the two panels coexist by default).
+        //
+        // Checked *before* the per-panel dispatch below so it reaches
+        // the sidebar from any focus, the way Ctrl+F already does from
+        // the file tree. Gated on `org_sidebar_enabled` rather than
+        // swallowed unconditionally: `[ui] org_sidebar = "off"` is the
+        // documented escape hatch for users who need Ctrl+B in their
+        // shell / tmux / readline, so with the feature off the key has
+        // to fall through to the PTY untouched.
+        if key.modifiers == KeyModifiers::CONTROL
+            && key.code == KeyCode::Char('b')
+            && self.org_sidebar_enabled()
+        {
+            self.toggle_org_sidebar();
+            return Ok(true);
+        }
+
+        // Org sidebar mode.
+        //
+        // This dispatch chain is `if` / `==`, not an exhaustive `match`,
+        // so the compiler will *not* flag a missing arm: leaving this
+        // branch out would let sidebar-focused keys fall through into
+        // the pane handlers below. Also gated on `org_sidebar_active`
+        // so focus stranded on a panel that has since been toggled off
+        // does not swallow input.
+        if self.ws().focus_target == FocusTarget::OrgSidebar && self.org_sidebar_painted() {
+            return self.handle_org_sidebar_key(key);
+        }
+
         // Preview mode
-        if self.ws().focus_target == FocusTarget::Preview {
+        if self.ws().focus_target == FocusTarget::Preview && self.preview_painted() {
             return self.handle_preview_key(key);
         }
 
-        // File tree mode
-        if self.ws().focus_target == FocusTarget::FileTree {
+        // File tree mode. Gated on `file_tree_painted` for the same
+        // reason as the sidebar above: a panel can hold focus while
+        // being nowhere on screen — `replace` mode takes the tree's
+        // slot, and the degrade ladder drops it on a narrow terminal —
+        // and routing keys there swallows them (turning a bare `c` /
+        // `v` into a pane split).
+        if self.ws().focus_target == FocusTarget::FileTree && self.file_tree_painted() {
             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('f') {
                 self.toggle_file_tree();
                 return Ok(true);
@@ -339,10 +412,14 @@ impl App {
                     self.ws_mut().focus_target = FocusTarget::Pane;
                     Ok(true)
                 } else if multi_pane {
-                    self.close_focused_pane();
+                    // Ask first — the actual close happens in
+                    // `confirm_close_now` once the user presses `y`.
+                    // Closing the preview above stays unconfirmed: it
+                    // destroys no process and reopens with one click.
+                    self.request_close_focused_pane();
                     Ok(true)
                 } else if multi_tab {
-                    self.close_tab(self.active_tab);
+                    self.request_close_focused_tab();
                     Ok(true)
                 } else {
                     Ok(false)
@@ -362,6 +439,14 @@ impl App {
     /// `forward_paste_to_pty`. Centralizing the routing here keeps
     /// `main.rs` from having to reach into overlay internals.
     pub fn handle_paste(&mut self, text: &str) -> Result<bool> {
+        // Close confirmation is modal for pastes too. Drop the whole
+        // payload: a pasted "y" must not read as consent, and letting
+        // the rest through would type into the pane the user is being
+        // asked about. Reported as "handled" so the caller skips the
+        // post-paste render cooldown.
+        if self.close_confirm.is_some() {
+            return Ok(true);
+        }
         if let Some(overlay) = self.overlay.as_mut() {
             overlay.insert_str(text);
             self.dirty = true;

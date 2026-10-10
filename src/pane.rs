@@ -95,6 +95,34 @@ pub struct Pane {
     /// pane. Guards the multiple exit pathways (explicit close, tab
     /// close, natural shell exit) so subscribers see exactly one event.
     pub exit_event_emitted: bool,
+    /// Issue #72 prompt / idle tracking, maintained by
+    /// `App::tick_prompt_events`. `last_output_at` and `output_seen`
+    /// are bumped on every `PtyOutput`; `output_seen` tells the sweep
+    /// the screen may have changed since its last scan.
+    pub last_output_at: Instant,
+    pub output_seen: bool,
+    /// Dedupe key of the prompt last reported via
+    /// `pane_prompt_detected`, so one prompt sitting on screen is
+    /// reported once.
+    pub reported_prompt: Option<String>,
+    /// Set once `pane_waiting_input` fired for the current quiet spell.
+    pub waiting_input_reported: bool,
+    /// Claude permission mode last reported via `pane_mode_changed`
+    /// (Issue #49).
+    pub reported_mode: Option<&'static str>,
+    /// A peer nudge for this pane has sat undelivered past
+    /// `CODEX_PEER_NUDGE_STALL_TIMEOUT` (Issue #354). Drives the title
+    /// badge; `peer_nudge_stalled` fires on the false → true edge.
+    pub peer_nudge_stalled: bool,
+    /// Pending peer delivery shown as a title badge and on `list_panes`
+    /// (Issue #352). Re-derived on every Codex peer flush.
+    pub peer_delivery: Option<crate::ipc::PeerDeliveryStatus>,
+    /// Kill-on-close Job Object holding the pane shell and every
+    /// descendant the kernel added since spawn. `None` when job
+    /// creation/assignment failed at spawn time — `kill()` then falls
+    /// back to the legacy `taskkill /F /T` tree walk.
+    #[cfg(windows)]
+    job: Option<crate::win_job::PaneJob>,
 }
 
 impl Pane {
@@ -122,8 +150,24 @@ impl Pane {
 
         let pair = pty_system.openpty(pty_size).context("Failed to open PTY")?;
 
-        let shell = detect_shell();
+        #[cfg(test)]
+        let inert = INERT_SPAWN.with(|c| c.get());
+        #[cfg(not(test))]
+        let inert = false;
+        let shell = if inert {
+            PathBuf::from(if cfg!(windows) { "cmd.exe" } else { "sleep" })
+        } else {
+            detect_shell()
+        };
         let mut cmd = CommandBuilder::new(&shell);
+        if inert {
+            // Silent and long-lived; killed by `App::shutdown`.
+            if cfg!(windows) {
+                cmd.args(["/c", "pause >nul"]);
+            } else {
+                cmd.arg("3600");
+            }
+        }
 
         let shell_name = shell
             .file_name()
@@ -149,6 +193,14 @@ impl Pane {
             .slave
             .spawn_command(cmd)
             .context("Failed to spawn shell")?;
+
+        // Windows: capture the shell (and, via kernel-side inheritance,
+        // every future descendant) in a kill-on-close Job Object so
+        // pane close can reap the whole tree even after intermediate
+        // parents exit — `taskkill /T` can't reach those. Assignment
+        // failure is non-fatal: `kill()` falls back to taskkill.
+        #[cfg(windows)]
+        let job = child.process_id().and_then(crate::win_job::PaneJob::assign);
 
         // Drop the slave side — we only use master
         drop(pair.slave);
@@ -222,6 +274,15 @@ impl Pane {
             role: None,
             summary: None,
             exit_event_emitted: false,
+            last_output_at: Instant::now(),
+            output_seen: false,
+            reported_prompt: None,
+            waiting_input_reported: false,
+            reported_mode: None,
+            peer_nudge_stalled: false,
+            peer_delivery: None,
+            #[cfg(windows)]
+            job,
         };
 
         // Inject OSC 7 hook after shell starts
@@ -325,6 +386,15 @@ impl Pane {
     pub fn scroll_reset(&self) {
         let mut parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
         parser.screen_mut().set_scrollback(0);
+    }
+
+    /// Simulate the PTY writer failing, which is what `write_input`
+    /// detects by flipping `exited`. Tests need this to cover the
+    /// "the pane died between readiness and the write" path, which is
+    /// otherwise only reachable by racing a real child process.
+    #[cfg(test)]
+    pub(crate) fn writer_fail_for_test(&mut self) {
+        self.exited = true;
     }
 
     /// Check if the terminal is scrolled back.
@@ -614,9 +684,12 @@ impl Pane {
     /// grandchildren (e.g. `claude`/`node.exe` launched from the shell
     /// via `pending_startup`) survive and keep open handles on the
     /// pane's working directory. That blocks `git worktree remove` /
-    /// `rmdir` until the renga process itself exits (#214). Walk the
-    /// tree first via `taskkill /F /T` so directory handles in the
-    /// pane's cwd are released as soon as the pane is closed.
+    /// `rmdir` until the renga process itself exits (#214). The pane's
+    /// Job Object (assigned at spawn) terminates every descendant in
+    /// one call, independent of the parent/child links still being
+    /// intact; `taskkill /F /T` remains only as the fallback for the
+    /// rare spawn where job assignment failed, with its known holes
+    /// (can't reach children of already-dead intermediates).
     pub fn kill(&mut self) {
         // `try_wait` distinguishes "child still alive, needs killing"
         // from "child already exited, just needs reaping" — important
@@ -627,15 +700,30 @@ impl Pane {
         // gone so the close+Drop pair doesn't double-spawn taskkill on
         // Windows (#214 review), but `wait()` always runs to reap.
         let alive = !matches!(self.child.try_wait(), Ok(Some(_)));
+        // Terminate the job even when the shell itself already exited:
+        // orphaned grandchildren (dev servers, `run_in_background`
+        // jobs, mcp-peer, …) stay in the job after their parents die,
+        // and this is the only close path that can still reach them.
+        // `take()` keeps the close+Drop pair single-shot. A job that
+        // refuses to terminate reports `false`, so the taskkill
+        // fallback below still runs instead of being skipped on the
+        // strength of a call that did nothing.
+        #[cfg(windows)]
+        let job_terminated = match self.job.take() {
+            Some(job) => job.terminate(),
+            None => false,
+        };
         if alive {
             #[cfg(windows)]
-            if let Some(pid) = self.child.process_id() {
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/F", "/T", "/PID", &pid.to_string()])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .stdin(std::process::Stdio::null())
-                    .status();
+            if !job_terminated {
+                if let Some(pid) = self.child.process_id() {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/F", "/T", "/PID", &pid.to_string()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .stdin(std::process::Stdio::null())
+                        .status();
+                }
             }
             let _ = self.child.kill();
         }
@@ -660,6 +748,19 @@ impl Pane {
     /// Use [`queue_startup_command`] when the command should auto-run.
     pub fn queue_startup_text(&mut self, text: &str) {
         self.pending_startup = Some(text.as_bytes().to_vec());
+    }
+
+    /// Whether the shell child process has exited, for tests that need
+    /// to distinguish "shell dead" from "PTY closed" — on ConPTY the
+    /// PTY read only EOFs when the last attached client detaches, so
+    /// `exited` lags the shell's death while grandchildren are alive.
+    /// Gated on `windows` as well as `test`: the only caller is the
+    /// `#[cfg(windows)]` job-reaping test, so `#[cfg(test)]` alone
+    /// makes this dead code everywhere else and fails CI's clippy job,
+    /// which runs `-D warnings` on Linux.
+    #[cfg(all(test, windows))]
+    pub(crate) fn child_exited_for_test(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
     /// If a startup command is queued and the shell prompt has been
@@ -942,6 +1043,7 @@ fn pty_reader_thread(
     let mut tail: Vec<u8> = Vec::with_capacity(TAIL_CAP * 2);
     let mut control_tail: Vec<u8> = Vec::with_capacity(64);
     let mut osc52_tail: Vec<u8> = Vec::with_capacity(4096);
+    let mut dsr_tail: Vec<u8> = Vec::with_capacity(8);
 
     let mut buf = [0u8; 4096];
     loop {
@@ -1024,8 +1126,31 @@ fn pty_reader_thread(
                     osc52_tail.clear();
                 }
 
+                let dsr_ends = dsr_query_ends(&mut dsr_tail, data);
+
                 let mut parser = parser.lock().unwrap_or_else(|e| e.into_inner());
-                parser.process(data);
+                // Answer DSR cursor position requests with the cursor as of
+                // each query, so feed vt100 one query at a time. ConPTY
+                // sends one at startup (portable-pty 0.9 sets
+                // PSEUDOCONSOLE_INHERIT_CURSOR) and blocks until answered.
+                // Routed through the main loop rather than writing here so
+                // this thread never blocks on PTY input.
+                let mut reply = String::new();
+                let mut start = 0;
+                for end in dsr_ends {
+                    parser.process(&data[start..end]);
+                    let screen = parser.screen();
+                    let (row, col) = screen.cursor_position();
+                    // vt100 parks a pending wrap at col == width; a real
+                    // terminal reports the last column there.
+                    let col = col.min(screen.size().1.saturating_sub(1));
+                    reply.push_str(&format!("\x1b[{};{}R", row + 1, col + 1));
+                    start = end;
+                }
+                parser.process(&data[start..]);
+                if !reply.is_empty() {
+                    let _ = event_tx.send(AppEvent::PtyReply(pane_id, reply.into_bytes()));
+                }
                 let screen = parser.screen();
                 let mode = screen.mouse_protocol_mode();
                 if !matches!(mode, vt100::MouseProtocolMode::None) {
@@ -1099,6 +1224,23 @@ fn find_osc_terminator(buf: &[u8], from: usize) -> Option<(usize, usize)> {
         i += 1;
     }
     None
+}
+
+/// Offsets in `data` just past each DSR cursor position request
+/// (`ESC[6n`). A partial query is carried in `tail` so one split across
+/// two reads is still seen (its end offset then lands in the later read).
+fn dsr_query_ends(tail: &mut Vec<u8>, data: &[u8]) -> Vec<usize> {
+    const DSR: &[u8] = b"\x1b[6n";
+    let carried = tail.len();
+    tail.extend_from_slice(data);
+    let ends = tail
+        .windows(DSR.len())
+        .enumerate()
+        .filter(|(_, w)| *w == DSR)
+        .map(|(i, _)| i + DSR.len() - carried)
+        .collect();
+    keep_possible_prefix_suffix(tail, DSR);
+    ends
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1190,11 +1332,10 @@ fn extract_osc7(data: &[u8]) -> Option<PathBuf> {
         let path = if path_str.starts_with('/') {
             // No hostname (file:///path)
             path_str
-        } else if let Some(slash_pos) = path_str.find('/') {
-            // Has hostname (file://host/path)
-            &path_str[slash_pos..]
         } else {
-            return None;
+            // Has hostname (file://host/path)
+            let slash_pos = path_str.find('/')?;
+            &path_str[slash_pos..]
         };
 
         // On Windows/MSYS2, convert /c/Users/... to C:\Users\...
@@ -1270,6 +1411,106 @@ pub fn is_prompt_ready(buf: &[u8]) -> bool {
     true
 }
 
+/// Interactive-prompt scan behind `pane_prompt_detected` (Issue #72).
+/// Returns `(kind, matched line, dedupe key)`. The key is the matched
+/// line for `yes_no` / `password` and the whole menu block for
+/// `choice`, so two approvals sharing a generic question ("Do you want
+/// to proceed?") but naming different commands stay distinct.
+/// `yes_no` / `password` only count on
+/// the cursor row, so an answered prompt left in the scroll doesn't
+/// keep matching; the `choice` menu (Claude / Codex `1. Yes`) is
+/// searched bottom-up over the whole screen because those TUIs park
+/// the cursor elsewhere.
+pub fn detect_interactive_prompt(screen: &vt100::Screen) -> Option<(&'static str, String, String)> {
+    let (_, cols) = screen.size();
+    let lines: Vec<String> = screen.rows(0, cols).collect();
+    detect_prompt_in_lines(&lines, screen.cursor_position().0 as usize)
+}
+
+fn detect_prompt_in_lines(
+    lines: &[String],
+    cursor_row: usize,
+) -> Option<(&'static str, String, String)> {
+    // Box borders and the selection marker Claude / Codex draw around
+    // their menus.
+    fn strip(line: &str) -> &str {
+        line.trim_matches(|c: char| c.is_whitespace() || matches!(c, '│' | '┃' | '❯' | '›' | '>'))
+    }
+    if let Some(line) = lines.get(cursor_row) {
+        let t = strip(line);
+        let lower = t.to_lowercase();
+        if let Some(end) = ["(y/n)", "[y/n]", "(yes/no)", "[yes/no]"]
+            .iter()
+            .find_map(|m| lower.find(m).map(|i| i + m.len()))
+        {
+            // Key ends at the marker: a typed-but-unsubmitted answer
+            // echoed after it is the same prompt.
+            return Some(("yes_no", t.to_string(), lower[..end].to_string()));
+        }
+        if lower.ends_with(':') && (lower.contains("password") || lower.contains("passphrase")) {
+            return Some(("password", t.to_string(), t.to_string()));
+        }
+    }
+    let i = lines.iter().rposition(|l| strip(l).starts_with("1. Yes"))?;
+    // Report the question above the menu when there is one.
+    let block = &lines[i.saturating_sub(8)..=i];
+    let question = block[..block.len() - 1]
+        .iter()
+        .rev()
+        .map(|l| strip(l))
+        .find(|l| l.ends_with('?'));
+    Some((
+        "choice",
+        question.unwrap_or(strip(&lines[i])).to_string(),
+        // `strip` drops the selection marker, so moving the cursor
+        // within one menu doesn't change the key.
+        block
+            .iter()
+            .map(|l| strip(l))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ))
+}
+
+/// Claude Code permission mode behind `pane_mode_changed` (Issue #49),
+/// read from the rows below the input box's bottom border, where
+/// Claude draws its mode line (`⏸ plan mode on (shift+tab to cycle)`).
+/// Text above the border (conversation, the input itself) never counts. Default mode has no mode line, so it's only read off the
+/// `? for shortcuts` hint shown while the input is empty; anything else
+/// (typing, a slash-command menu, a dialog) is `None` = no reading.
+pub fn detect_claude_mode(screen: &vt100::Screen) -> Option<&'static str> {
+    let (_, cols) = screen.size();
+    let lines: Vec<String> = screen.rows(0, cols).collect();
+    detect_mode_in_lines(&lines)
+}
+
+fn detect_mode_in_lines(lines: &[String]) -> Option<&'static str> {
+    const MODES: &[(&str, &str)] = &[
+        ("plan mode on", "plan"),
+        ("accept edits on", "accept_edits"),
+        ("bypass permissions on", "bypass_permissions"),
+        ("auto mode on", "auto"),
+    ];
+    let is_border = |l: &String| {
+        let t = l.trim();
+        t.starts_with(['─', '╰']) && t.chars().all(|c| matches!(c, '─' | '╰' | '╯'))
+    };
+    let below = lines.iter().rposition(is_border)? + 1;
+    for line in &lines[below..] {
+        let lower = line.to_lowercase();
+        if let Some((_, mode)) = MODES.iter().find(|(m, _)| lower.contains(m)) {
+            return Some(mode);
+        }
+        if lower.contains("shift+tab to cycle") {
+            return Some("unknown");
+        }
+        if lower.contains("? for shortcuts") {
+            return Some("default");
+        }
+    }
+    None
+}
+
 fn strip_csi_escapes(buf: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(buf.len());
     let mut i = 0;
@@ -1301,6 +1542,14 @@ fn trim_ascii_whitespace_end(buf: &[u8]) -> &[u8] {
 
 fn title_mentions_client(title: &str, needle: &str) -> bool {
     title.to_ascii_lowercase().contains(needle)
+}
+
+// Test-only, per-thread: spawn a silent child instead of the user's
+// shell so its startup prompt cannot overwrite a screen a test seeded
+// into the parser (Issue #357).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static INERT_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Detect the appropriate shell to launch.
@@ -1362,6 +1611,148 @@ fn detect_shell_unix() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn mode_after(bytes: &str) -> Option<&'static str> {
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(bytes.as_bytes());
+        detect_claude_mode(p.screen())
+    }
+
+    #[test]
+    fn detect_mode_reads_claude_mode_line() {
+        let ui = |footer: &str| {
+            format!("● Done.\r\n\r\n────────\r\n> \r\n────────\r\n  {footer}\r\n\r\n")
+        };
+        assert_eq!(mode_after(&ui("? for shortcuts")), Some("default"));
+        assert_eq!(
+            mode_after(&ui("⏸ plan mode on (shift+tab to cycle)")),
+            Some("plan")
+        );
+        assert_eq!(
+            mode_after(&ui("⏵⏵ accept edits on (shift+tab to cycle)")),
+            Some("accept_edits")
+        );
+        assert_eq!(
+            mode_after(&ui("⏵⏵ bypass permissions on (shift+tab to cycle)")),
+            Some("bypass_permissions")
+        );
+        assert_eq!(
+            mode_after(&ui("⏵⏵ turbo mode on (shift+tab to cycle)")),
+            Some("unknown")
+        );
+        // Typing hides the default hint: no reading rather than a guess.
+        assert_eq!(mode_after(&ui("")), None);
+        // Mode text in the input or above the box doesn't count.
+        assert_eq!(
+            mode_after("plan mode on\r\n────────\r\n> plan mode on\r\n────────\r\n"),
+            None
+        );
+        assert_eq!(mode_after("plan mode on\r\nline\r\n"), None);
+        // Old-style rounded input box.
+        assert_eq!(
+            mode_after("╭──────╮\r\n│ >    │\r\n╰──────╯\r\n  ? for shortcuts\r\n"),
+            Some("default")
+        );
+    }
+
+    fn prompt_after(bytes: &[u8]) -> Option<(&'static str, String)> {
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(bytes);
+        detect_interactive_prompt(p.screen()).map(|(k, p, _)| (k, p))
+    }
+
+    #[test]
+    fn detect_prompt_claude_permission_menu_reports_the_question() {
+        let out = prompt_after(
+            "╭────╮\r\n│ Do you want to make this edit to pane.rs? │\r\n│ ❯ 1. Yes │\r\n│   2. No │\r\n\x1b[20;1H"
+                .as_bytes(),
+        );
+        assert_eq!(
+            out,
+            Some(("choice", "Do you want to make this edit to pane.rs?".into()))
+        );
+    }
+
+    #[test]
+    fn detect_prompt_codex_menu_without_question_reports_the_menu_line() {
+        let out = prompt_after("› 1. Yes, proceed (y)\r\n  2. No".as_bytes());
+        assert_eq!(out, Some(("choice", "1. Yes, proceed (y)".into())));
+    }
+
+    #[test]
+    fn detect_prompt_yes_no_and_password_only_on_the_cursor_row() {
+        assert_eq!(
+            prompt_after(b"Overwrite file? [y/N] "),
+            Some(("yes_no", "Overwrite file? [y/N]".into()))
+        );
+        assert_eq!(
+            prompt_after(b"[sudo] password for me: "),
+            Some(("password", "[sudo] password for me:".into()))
+        );
+        // Answered: the cursor moved on, the old line no longer counts.
+        assert_eq!(prompt_after(b"Overwrite file? [y/N] y\r\n$ "), None);
+        assert_eq!(prompt_after(b"plain output\r\n$ "), None);
+    }
+
+    #[test]
+    fn detect_prompt_choice_key_tells_apart_same_question_different_command() {
+        let key = |cmd: &str| {
+            let mut p = vt100::Parser::new(24, 80, 0);
+            p.process(format!("{cmd}\r\nDo you want to proceed?\r\n❯ 1. Yes").as_bytes());
+            detect_interactive_prompt(p.screen()).unwrap().2
+        };
+        assert_ne!(key("rm -rf build"), key("cargo test"));
+    }
+
+    #[test]
+    fn detect_prompt_yes_no_key_ignores_the_echoed_answer() {
+        let key = |b: &[u8]| {
+            let mut p = vt100::Parser::new(24, 80, 0);
+            p.process(b);
+            detect_interactive_prompt(p.screen()).unwrap().2
+        };
+        assert_eq!(
+            key(b"Overwrite file? [y/N] "),
+            key(b"Overwrite file? [y/N] y")
+        );
+    }
+
+    #[test]
+    fn detect_prompt_choice_key_ignores_the_selection_marker() {
+        let key = |menu: &str| {
+            let mut p = vt100::Parser::new(24, 80, 0);
+            p.process(format!("cargo test\r\nDo you want to proceed?\r\n{menu}").as_bytes());
+            detect_interactive_prompt(p.screen()).unwrap().2
+        };
+        assert_eq!(key("❯ 1. Yes\r\n  2. No"), key("  1. Yes\r\n❯ 2. No"));
+    }
+
+    /// `file:///path` — empty hostname, the path is taken verbatim.
+    #[test]
+    fn extract_osc7_reads_empty_hostname_form() {
+        assert_eq!(
+            extract_osc7(b"\x1b]7;file:///tmp/work\x07"),
+            Some(PathBuf::from("/tmp/work"))
+        );
+    }
+
+    /// `file://host/path` — the hostname is skipped from the first
+    /// slash on. Also covers the ST (`ESC \`) terminator.
+    #[test]
+    fn extract_osc7_skips_hostname_before_path() {
+        assert_eq!(
+            extract_osc7(b"\x1b]7;file://myhost/tmp/work\x1b\\"),
+            Some(PathBuf::from("/tmp/work"))
+        );
+    }
+
+    /// A hostname with no path separator at all has no path to
+    /// extract, so the whole sequence is rejected. Pins the branch the
+    /// `?` rewrite replaced (clippy::question_mark under Rust 1.97).
+    #[test]
+    fn extract_osc7_rejects_hostname_without_path() {
+        assert_eq!(extract_osc7(b"\x1b]7;file://myhost\x07"), None);
+    }
+
     #[test]
     fn drain_osc52_copies_decodes_bel_terminated_payload() {
         let mut buf = b"\x1b]52;c;aGVsbG8=\x07".to_vec();
@@ -1383,6 +1774,196 @@ mod tests {
         buf.extend_from_slice(b"bG8=\x07");
         assert_eq!(drain_osc52_copies(&mut buf), vec!["hello"]);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn dsr_query_ends_finds_whole_split_and_repeated_queries() {
+        let mut tail = Vec::new();
+        assert!(dsr_query_ends(&mut tail, b"plain output").is_empty());
+        assert_eq!(dsr_query_ends(&mut tail, b"a\x1b[6nb\x1b[6n"), vec![5, 10]);
+        // Split across reads at every possible boundary: found once, at
+        // the end of the query bytes in the later read.
+        for split in 1..4 {
+            let (head, rest) = b"\x1b[6n".split_at(split);
+            let mut tail = b"xyz".to_vec();
+            assert!(dsr_query_ends(&mut tail, head).is_empty());
+            assert_eq!(dsr_query_ends(&mut tail, rest), vec![rest.len()]);
+            assert!(dsr_query_ends(&mut tail, b"next").is_empty());
+        }
+        // Other CSI n queries are not cursor position requests.
+        assert!(dsr_query_ends(&mut Vec::new(), b"\x1b[5n\x1b[?6n").is_empty());
+    }
+
+    #[test]
+    fn reader_thread_answers_dsr_with_cursor_position() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        pty_reader_thread(
+            // Output after a query in the same read must not move the
+            // reported position; each query gets its own position.
+            Box::new(std::io::Cursor::new(
+                b"\r\nhi\x1b[6n\r\n\x1b[6nabc".to_vec(),
+            )),
+            Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
+            Arc::new(Mutex::new(String::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(false)),
+            7,
+            tx,
+        );
+        let replies: Vec<_> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                AppEvent::PtyReply(id, bytes) => Some((id, bytes)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replies, vec![(7, b"\x1b[2;3R\x1b[3;1R".to_vec())]);
+    }
+
+    #[test]
+    fn reader_thread_dsr_at_pending_wrap_reports_last_column() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut out = vec![b'x'; 10];
+        out.extend_from_slice(b"\x1b[6n");
+        pty_reader_thread(
+            Box::new(std::io::Cursor::new(out)),
+            Arc::new(Mutex::new(vt100::Parser::new(5, 10, 0))),
+            Arc::new(Mutex::new(String::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(false)),
+            7,
+            tx,
+        );
+        let replies: Vec<_> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                AppEvent::PtyReply(_, bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replies, vec![b"\x1b[1;10R".to_vec()]);
+    }
+
+    /// End-to-end acceptance for the pane Job Object (renga-trx): a
+    /// grandchild that outlives its shell — the shell spawns it
+    /// detached (`disown`) and then exits — must still die when the
+    /// pane is killed. The legacy `taskkill /F /T` path provably
+    /// leaked this shape: the shell was already gone, so the taskkill
+    /// branch was skipped and nothing reaped the orphan.
+    ///
+    /// Liveness is probed through a kernel-enforced exclusive file
+    /// lock held by the grandchild (see `win_job::tests` for why
+    /// signal-based probes don't work in sandboxed environments).
+    #[cfg(windows)]
+    #[test]
+    fn kill_reaps_grandchild_after_shell_natural_exit() {
+        use std::time::{Duration, Instant};
+
+        // The startup command below is bash syntax (`& disown; exit`).
+        // On a machine where detect_shell() falls back to PowerShell
+        // the command would fail for shell-language reasons, not
+        // product reasons — skip rather than report a false negative.
+        let shell_name = detect_shell()
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if !shell_name.contains("bash") {
+            eprintln!("skipping: test requires a bash pane shell, got {shell_name}");
+            return;
+        }
+
+        fn wait_for(mut cond: impl FnMut() -> bool, budget: Duration) -> bool {
+            let deadline = Instant::now() + budget;
+            while Instant::now() < deadline {
+                if cond() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            false
+        }
+
+        /// Removes the listed files on drop, so temp artifacts are
+        /// cleaned up even when an assertion panics mid-test.
+        struct TempFiles(Vec<std::path::PathBuf>);
+        impl Drop for TempFiles {
+            fn drop(&mut self) {
+                for p in &self.0 {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+
+        let tag = format!("renga-trx-e2e-{}", std::process::id());
+        let temp = std::env::temp_dir();
+        let lock_path = temp.join(format!("{tag}.lock"));
+        let script_path = temp.join(format!("{tag}.ps1"));
+        let _cleanup = TempFiles(vec![lock_path.clone(), script_path.clone()]);
+        std::fs::write(&lock_path, b"x").expect("create lock file");
+        // Forward slashes keep the path inert through bash quoting.
+        let lock_fwd = lock_path.display().to_string().replace('\\', "/");
+        std::fs::write(
+            &script_path,
+            format!("$f=[IO.File]::Open('{lock_fwd}','Open','ReadWrite','None'); Start-Sleep 60"),
+        )
+        .expect("write locker script");
+        let script_fwd = script_path.display().to_string().replace('\\', "/");
+
+        let lock_is_held =
+            |path: &std::path::Path| std::fs::OpenOptions::new().write(true).open(path).is_err();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut pane = Pane::new(9901, 24, 80, tx).expect("spawn pane");
+        // Detach the locker from the shell, then end the shell — the
+        // exact "natural exit leaves an orphan" scenario.
+        pane.queue_startup_command(&format!(
+            "powershell -NoProfile -ExecutionPolicy Bypass -File '{script_fwd}' & disown; exit"
+        ));
+        assert!(
+            wait_for(
+                || {
+                    // ConPTY (PSEUDOCONSOLE_INHERIT_CURSOR) holds the
+                    // shell's output until its startup DSR query is
+                    // answered. The app's main loop writes PtyReply back;
+                    // this test has no main loop, so do it here.
+                    for event in rx.try_iter() {
+                        if let AppEvent::PtyReply(_, bytes) = event {
+                            let _ = pane.write_input(&bytes);
+                        }
+                    }
+                    pane.try_flush_startup().unwrap_or(false)
+                },
+                Duration::from_secs(30)
+            ),
+            "shell prompt should be detected and startup command flushed"
+        );
+        assert!(
+            wait_for(|| lock_is_held(&lock_path), Duration::from_secs(30)),
+            "grandchild should start and hold the lock"
+        );
+        // Wait for the shell itself to exit so kill() runs down the
+        // already-exited path. Can't use PtyEof here: ConPTY only EOFs
+        // the read side once the LAST attached client detaches, and
+        // the orphaned powershell keeps the session open by design.
+        assert!(
+            wait_for(|| pane.child_exited_for_test(), Duration::from_secs(30)),
+            "shell should exit after the startup command"
+        );
+
+        pane.kill();
+
+        assert!(
+            wait_for(|| !lock_is_held(&lock_path), Duration::from_secs(30)),
+            "orphaned grandchild should be dead after pane kill"
+        );
     }
 
     #[test]

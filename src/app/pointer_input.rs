@@ -231,6 +231,25 @@ impl App {
         None
     }
 
+    /// Column the file tree starts at, derived from the panel to its
+    /// left rather than from the tree's own cached rect so it stays
+    /// answerable while the tree is not being painted (mid-drag through
+    /// the degrade ladder, or `replace` mode).
+    fn file_tree_origin_x(&self) -> u16 {
+        self.last_org_sidebar_rect
+            .map(|r| r.x + r.width)
+            .unwrap_or(0)
+    }
+
+    fn is_on_org_sidebar_border(&self, col: u16) -> bool {
+        if let Some(rect) = self.last_org_sidebar_rect {
+            let border_col = rect.x + rect.width;
+            col >= border_col.saturating_sub(1) && col <= border_col
+        } else {
+            false
+        }
+    }
+
     fn is_on_file_tree_border(&self, col: u16) -> bool {
         if let Some(rect) = self.ws().last_file_tree_rect {
             let border_col = rect.x + rect.width;
@@ -253,7 +272,39 @@ impl App {
         }
     }
 
+    /// End an in-flight drag without acting on it: balance a
+    /// forwarded press with a release so the pane's mouse-reporting
+    /// app doesn't stay stuck mid-drag, then drop the drag target.
+    /// Used by the close-confirm swallow path, which consumes every
+    /// pointer event but cannot afford to lose the release.
+    fn release_in_flight_drag(&mut self, mouse: &MouseEvent) {
+        if let Some(DragTarget::PaneMouseReport(ws_idx, pane_id, rect, btn)) = self.dragging.clone()
+        {
+            self.forward_pointer_to_pane(ws_idx, pane_id, rect, btn, PointerAction::Release, mouse);
+        }
+        self.dragging = None;
+    }
+
     pub fn handle_mouse_event(&mut self, mouse: MouseEvent) {
+        // Close confirmation swallows the pointer (Issue #285). Down /
+        // drag / scroll would otherwise be forwarded to a
+        // mouse-reporting TUI as control sequences, or move focus out
+        // from under the pinned target — neither is acceptable while a
+        // modal is asking a yes/no question.
+        //
+        // A *release* is the one event that still has to be observed.
+        // `self.dragging` is only ever cleared on `Up`, and a
+        // `PaneMouseReport` drag owes its PTY the release balancing the
+        // press already forwarded to it. Dropping that event would
+        // strand a drag target to hijack the next unrelated gesture and
+        // leave the pane's TUI stuck mid-drag.
+        if self.close_confirm.is_some() {
+            if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                self.release_in_flight_drag(&mouse);
+            }
+            return;
+        }
+
         if matches!(mouse.kind, MouseEventKind::Down(_)) && self.rename_input.is_some() {
             let needs_relayout = !self.status_bar_visible;
             self.rename_input = None;
@@ -312,19 +363,16 @@ impl App {
                                 if prev_idx == tab_idx
                                     && now.duration_since(prev_t).as_millis() < 500
                         );
-                        if self.active_tab != tab_idx {
-                            self.suspend_overlay();
-                        }
-                        self.active_tab = tab_idx;
+                        // `switch_tab` clears `last_tab_click` along with
+                        // the other tab-keyed caches, so the double-click
+                        // verdict is read above and re-armed below.
+                        self.switch_tab(tab_idx);
                         if is_double {
                             self.rename_input = Some(String::new());
                             self.last_tab_click = None;
                         } else {
                             self.last_tab_click = Some((tab_idx, now));
                         }
-                        // A tab click switches context; any in-flight
-                        // outer-edge or boundary double-click attempt is
-                        // now stale.
                         self.last_edge_click = None;
                         self.last_boundary_click = None;
                         self.dirty = true;
@@ -348,6 +396,15 @@ impl App {
                     }
                 }
 
+                // Checked before the file tree because in `coexist` the
+                // sidebar sits immediately to its left, so the two
+                // 2-column hit areas can abut. Outermost panel wins.
+                if self.is_on_org_sidebar_border(col) {
+                    self.dragging = Some(DragTarget::OrgSidebarBorder);
+                    self.last_edge_click = None;
+                    self.last_boundary_click = None;
+                    return;
+                }
                 if self.is_on_file_tree_border(col) {
                     self.dragging = Some(DragTarget::FileTreeBorder);
                     self.last_edge_click = None;
@@ -462,6 +519,43 @@ impl App {
                     }
                 }
 
+                if let Some(rect) = self.last_org_sidebar_rect {
+                    if col >= rect.x
+                        && col < rect.x + rect.width
+                        && row >= rect.y
+                        && row < rect.y + rect.height
+                    {
+                        self.ws_mut().focus_target = FocusTarget::OrgSidebar;
+                        // The rect includes the block's border rows, and
+                        // `org_sidebar_row_targets` holds *every* row,
+                        // not just the visible window. Clip to the inner
+                        // area explicitly: without it a click on the
+                        // " ORG " title row saturated to inner row 0 and
+                        // activated whatever was at the top of the view,
+                        // and a click on the bottom border resolved one
+                        // row *past* the window and jumped to a tab that
+                        // was never on screen. Activation switches tabs
+                        // and moves pane focus, so a stray hit is not a
+                        // cosmetic slip.
+                        let visible_height = rect.height.saturating_sub(2) as usize;
+                        let on_inner_row = row > rect.y && row + 1 < rect.y + rect.height;
+                        let inner_y = row.saturating_sub(rect.y + 1) as usize;
+                        if on_inner_row && inner_y < visible_height {
+                            let idx = self.org_sidebar_scroll + inner_y;
+                            // `switch_tab` re-validates the tab index
+                            // against `workspaces` regardless, since an
+                            // MCP close can land between paint and click.
+                            if let Some(&target) = self.org_sidebar_row_targets.get(idx) {
+                                self.org_sidebar_activate_target(target);
+                            }
+                        }
+                        self.last_edge_click = None;
+                        self.last_boundary_click = None;
+                        self.dirty = true;
+                        return;
+                    }
+                }
+
                 if let Some(rect) = self.ws().last_file_tree_rect {
                     if col >= rect.x
                         && col < rect.x + rect.width
@@ -571,7 +665,33 @@ impl App {
                 if let Some(ref target) = self.dragging.clone() {
                     match target {
                         DragTarget::FileTreeBorder => {
-                            self.file_tree_width = col.clamp(10, 60);
+                            // Was `col.clamp(10, 60)`, which silently
+                            // assumed the tree starts at column 0. With
+                            // the org sidebar to its left that is no
+                            // longer true.
+                            //
+                            // Derived from the sidebar's width rather
+                            // than read off `last_file_tree_rect`: a
+                            // drag wide enough to trip the degrade
+                            // ladder makes the tree's own rect `None`
+                            // mid-drag, and gating on it would freeze
+                            // the width there — dragging back left
+                            // could never restore the tree, and the
+                            // border would no longer hit-test, so there
+                            // was no way out short of resizing the
+                            // terminal.
+                            self.file_tree_width =
+                                col.saturating_sub(self.file_tree_origin_x()).clamp(10, 60);
+                        }
+                        DragTarget::OrgSidebarBorder => {
+                            // The sidebar is always the outermost panel,
+                            // so its left edge is the main area's x — no
+                            // cached rect needed, and the same mid-drag
+                            // recovery argument as above applies.
+                            self.org_sidebar_width = col.clamp(
+                                crate::app::layout_geometry::ORG_SIDEBAR_MIN_WIDTH,
+                                crate::app::layout_geometry::ORG_SIDEBAR_MAX_WIDTH,
+                            );
                         }
                         DragTarget::PreviewBorder => {
                             if let Some(rect) = self.ws().last_preview_rect {
@@ -780,7 +900,9 @@ impl App {
                 let col = mouse.column;
                 let row = mouse.row;
                 let old_hover = self.hover_border.clone();
-                if self.is_on_file_tree_border(col) {
+                if self.is_on_org_sidebar_border(col) {
+                    self.hover_border = Some(DragTarget::OrgSidebarBorder);
+                } else if self.is_on_file_tree_border(col) {
                     self.hover_border = Some(DragTarget::FileTreeBorder);
                 } else if self.is_on_preview_border(col) {
                     self.hover_border = Some(DragTarget::PreviewBorder);
@@ -800,6 +922,29 @@ impl App {
     }
 
     fn handle_wheel(&mut self, col: u16, row: u16, scroll_down: bool) {
+        if let Some(rect) = self.last_org_sidebar_rect {
+            if col >= rect.x
+                && col < rect.x + rect.width
+                && row >= rect.y
+                && row < rect.y + rect.height
+            {
+                // Scrolls the view only; the selection stays put. The
+                // renderer re-anchors on the selection only when
+                // `org_sidebar_follow_selection` is set (i.e. after a
+                // j/k/Enter), which is what keeps this from being
+                // undone on the very next frame.
+                let rows = self.org_sidebar_row_targets.len();
+                let visible = rect.height.saturating_sub(2) as usize;
+                let max_scroll = rows.saturating_sub(visible);
+                self.org_sidebar_scroll = if scroll_down {
+                    (self.org_sidebar_scroll + 3).min(max_scroll)
+                } else {
+                    self.org_sidebar_scroll.saturating_sub(3)
+                };
+                self.dirty = true;
+                return;
+            }
+        }
         if let Some(rect) = self.ws().last_file_tree_rect {
             if col >= rect.x
                 && col < rect.x + rect.width

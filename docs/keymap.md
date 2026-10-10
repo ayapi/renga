@@ -10,7 +10,7 @@ Full keybinding reference. The README only carries a "first 5–8 keys" cheat sh
 |-----|--------|
 | `Ctrl+D` | Split vertically |
 | `Ctrl+E` | Split horizontally |
-| `Ctrl+W` | Close pane / tab |
+| `Ctrl+W` | Close pane / tab — asks first. A centered `Close this pane? y / n` box appears and holds all input until you answer: `y` closes, `n` / `Esc` cancels, every other key is ignored (nothing reaches the shell underneath). `Ctrl+Q` still quits. The MCP `close_pane` tool is unaffected and closes immediately. |
 | `Alt+T` / `Ctrl+T` | New tab |
 | `Alt+1..9` | Jump to tab N |
 | `Alt+Left/Right` | Previous / next tab |
@@ -18,8 +18,9 @@ Full keybinding reference. The README only carries a "first 5–8 keys" cheat sh
 | `Alt+S` | Toggle status bar |
 | `Alt+P` | Insert the peer-enabled Claude Code launch command into the focused pane (see [`peer-messaging.md`](./peer-messaging.md)). Silently no-ops when the focused pane is in alt-screen mode (vim, less, lazygit, a running Claude / Codex TUI) or its title contains "claude" — by design, so the command bytes aren't injected as keystrokes into a running TUI. Switch focus to a shell-prompt pane and press again. |
 | `Ctrl+F` | Toggle file tree |
+| `Ctrl+B` | Toggle the org sidebar (all tabs / panes / Claude status — see [`configuration.md`](./configuration.md)). Same three-step behavior as `Ctrl+F`: visible+focused closes it, visible+unfocused just moves focus to it, hidden opens and focuses it. Inert (passes through to the pane) when `[ui] org_sidebar = "off"`. |
 | `Ctrl+P` | Swap preview/terminal layout |
-| `Ctrl+Right/Left` | Cycle focus (sidebar, preview, panes) |
+| `Ctrl+Right/Left` | Cycle focus (file tree, preview, org sidebar, panes) |
 | `Ctrl+;` / `Alt+;` / `Alt+I` | Open IME composition overlay (centered multi-line — see [`ime.md`](./ime.md)). `Alt+;` and `Alt+I` are fallbacks for terminals that swallow `Ctrl+;` (WSL under Windows Terminal, VS Code terminal on Linux, some tmux configs). |
 | `Ctrl+Q` | Quit |
 
@@ -63,6 +64,17 @@ By default macOS terminals bind `Option+<key>` to Unicode input (`å`, `∫`, `�
 | `Ctrl+W` | Close preview |
 | `Esc` | Return to pane |
 
+## Org sidebar mode (after `Ctrl+B`)
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` / `↓` / `↑` | Move selection |
+| `PageDown` / `PageUp` | Move selection by 10 rows |
+| `Home` / `End` | Jump to first / last row |
+| `Enter` | Go to the selected row — a tab row switches to that tab, a pane row switches to that tab and focuses that pane |
+| `Ctrl+W` / `Ctrl+B` | Close the org sidebar |
+| `Esc` | Return to pane |
+
 ## Mouse
 
 | Action | Effect |
@@ -73,8 +85,9 @@ By default macOS terminals bind `Option+<key>` to Unicode input (`å`, `∫`, `�
 | Click `+` | New tab |
 | Double-click pane outer edge | Split toward the clicked side. Top / Left places the new pane on the clicked side; Bottom / Right places it on the trailing side. Corner cells are ignored. Refused when the resulting pane would be smaller than `min_pane_width` / `min_pane_height` or when the workspace is already at the pane cap. |
 | Double-click shared border | Split the pane on the leading side of the divider, dropping the new pane right on the border (between the two siblings). A vertical divider splits the left pane to the right; a horizontal divider splits the top pane downward. Junction cells where two dividers cross are ignored. Same `min_pane_width` / `min_pane_height` / pane-cap refusals as above. |
-| Drag border | Resize panels |
-| Scroll wheel | Scroll file tree / preview / terminal history. In panes running a TUI that subscribed to mouse reporting (Claude Code `/tui fullscreen`, vim, lazygit, less, …) the wheel is forwarded to the app instead. |
+| Click org sidebar row | Focus the org sidebar and go to that row (same as `Enter` on the selected row) |
+| Drag border | Resize panels, including the org sidebar's right edge |
+| Scroll wheel | Scroll file tree / org sidebar / preview / terminal history. In panes running a TUI that subscribed to mouse reporting (Claude Code `/tui fullscreen`, vim, lazygit, less, …) the wheel is forwarded to the app instead. |
 | Click / drag inside a pane | Normally selects text for copy. When the pane is running a mouse-reporting TUI, the click is forwarded to the app so buttons, carets, etc. work. Hold `Shift` to force renga-side text selection (same escape hatch as tmux / alacritty). |
 
 Both wheel and click forwarding can be disabled globally with `RENGA_DISABLE_MOUSE_FORWARD=1` — useful for nested renga or terminals whose mouse-protocol encoding confuses the inner app.

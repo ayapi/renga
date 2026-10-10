@@ -13,6 +13,8 @@ mod pane;
 mod preview;
 mod ui;
 mod version_check;
+#[cfg(windows)]
+mod win_job;
 
 use std::io;
 use std::panic;
@@ -47,6 +49,7 @@ fn main() -> Result<()> {
     if let Some(cmd) = cli.command.as_ref() {
         match cmd {
             cli::IpcCommand::McpPeer => return mcp_peer::run(),
+            cli::IpcCommand::Capabilities { text } => return mcp_peer::run_capabilities(*text),
             cli::IpcCommand::Mcp { action } => return mcp_peer::install::run(action),
             _ => return run_ipc_client(cmd),
         }
@@ -390,6 +393,7 @@ fn run_event_loop(
         }
 
         app.flush_pending_codex_peer_messages();
+        app.flush_pending_user_turns();
 
         // After paste, wait a few frames for PTY echo to settle
         if app.paste_cooldown > 0 {
@@ -419,6 +423,17 @@ fn run_event_loop(
         // marker file via the same path as a key-press dismissal.
         // Cheap no-op when the banner isn't showing.
         app.check_macos_tip_timeout();
+
+        // Org sidebar (#291): refresh the cross-tab Claude status
+        // cache. Deliberately outside the `app.dirty` gate below —
+        // the whole point is to notice that a *background* tab started
+        // working, which by definition nothing else marks dirty. Self-
+        // throttled, and a no-op while the sidebar is hidden.
+        app.tick_claude_snapshots();
+
+        // Issue #72 / #49: prompt / idle / mode events for event-driven monitors.
+        // Self-throttled; never marks the UI dirty.
+        app.tick_prompt_events();
 
         // Only render when something changed (and no cooldown is active)
         if app.dirty && app.paste_cooldown == 0 && app.resize_cooldown == 0 {

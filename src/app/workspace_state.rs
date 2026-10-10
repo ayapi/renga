@@ -6,12 +6,26 @@ pub enum FocusTarget {
     Pane,
     FileTree,
     Preview,
+    /// The cross-tab org sidebar (Issue #291).
+    ///
+    /// Stored per-workspace like the others even though the panel
+    /// itself is global, because focus *is* per-tab: every other
+    /// variant means "this tab's file tree / preview / panes". What
+    /// makes the sidebar special is that [`App::switch_tab`] carries
+    /// this variant into the incoming workspace — otherwise arrowing
+    /// through the tab list would knock focus out of the very panel
+    /// the user is driving.
+    OrgSidebar,
 }
 
 /// Which border is being dragged.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DragTarget {
     FileTreeBorder,
+    /// Right-hand edge of the org sidebar. Resolved against the cached
+    /// sidebar rect rather than the raw column, because unlike the file
+    /// tree the sidebar is not guaranteed to start at x=0 forever.
+    OrgSidebarBorder,
     PreviewBorder,
     PaneSplit(Vec<bool>, SplitDirection, Rect),
     Scrollbar(usize, Rect), // pane_id, inner area

@@ -9,6 +9,7 @@
 use serde::Deserialize;
 use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 /// Top-level config schema. Extra TOML keys are ignored so we can add
 /// new sections in future releases without breaking older binaries
@@ -39,6 +40,14 @@ pub struct UiConfig {
     /// wakeups. `0` is clamped to [`MIN_UI_FPS`] so a bad config or
     /// CLI override never turns into a busy-spin.
     pub fps: u16,
+    /// How the org sidebar (Issue #291: a standing panel listing every
+    /// tab's panes/roles plus aggregated Claude activity state) relates
+    /// to the file tree panel. `coexist` (default) lets both panels be
+    /// shown at once; `replace` makes opening the org sidebar take over
+    /// the file tree's panel slot instead; `off` disables the feature
+    /// entirely, including its toggle key. Case-insensitive in TOML for
+    /// the same fat-finger-safety reason as `lang` above.
+    pub org_sidebar: OrgSidebarMode,
 }
 
 impl Default for UiConfig {
@@ -46,6 +55,7 @@ impl Default for UiConfig {
         Self {
             lang: crate::i18n::UiLang::Auto,
             fps: DEFAULT_UI_FPS,
+            org_sidebar: OrgSidebarMode::Coexist,
         }
     }
 }
@@ -156,6 +166,63 @@ impl std::str::FromStr for ImeMode {
                 "invalid ime mode: {other:?} (expected hotkey | off)"
             )),
         }
+    }
+}
+
+/// How the org sidebar (Issue #291) coexists with the file tree panel.
+/// Config/CLI-level enum. Case-insensitive in TOML via a hand-written
+/// `Deserialize` + lowercasing `FromStr`, the same pattern
+/// [`crate::i18n::UiLang`] uses (see that type's doc comment for the
+/// rationale) — `#[serde(rename_all = "lowercase")]` as used on
+/// [`ImeMode`] would reject `"Replace"` / `"OFF"` and fail the whole
+/// config parse on what's otherwise just a casing fat-finger.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum OrgSidebarMode {
+    /// Org sidebar and file tree can both be shown at the same time.
+    /// Default.
+    #[default]
+    Coexist,
+    /// Opening the org sidebar takes over the file tree's panel slot
+    /// instead of adding a new one — the two are mutually exclusive.
+    Replace,
+    /// Org sidebar feature is disabled outright; its toggle key does
+    /// nothing.
+    Off,
+}
+
+impl fmt::Display for OrgSidebarMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OrgSidebarMode::Coexist => f.write_str("coexist"),
+            OrgSidebarMode::Replace => f.write_str("replace"),
+            OrgSidebarMode::Off => f.write_str("off"),
+        }
+    }
+}
+
+impl std::str::FromStr for OrgSidebarMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "coexist" => Ok(OrgSidebarMode::Coexist),
+            "replace" => Ok(OrgSidebarMode::Replace),
+            "off" => Ok(OrgSidebarMode::Off),
+            other => Err(format!(
+                "invalid org sidebar mode: {other:?} (expected coexist | replace | off)"
+            )),
+        }
+    }
+}
+
+// Case-insensitive TOML parsing via `from_str`, mirroring
+// `UiLang`'s `Deserialize` impl: keeps config.toml forgiving of
+// `"Replace"` / `"OFF"` etc. without one `#[serde(alias = …)]` per
+// casing variant.
+impl<'de> serde::Deserialize<'de> for OrgSidebarMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        OrgSidebarMode::from_str(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -644,5 +711,110 @@ mod tests {
         .unwrap();
         cfg.apply_cli_overrides(None, None, None, None, None);
         assert_eq!(cfg.ui.lang, crate::i18n::UiLang::En);
+    }
+
+    // ── [ui] org_sidebar ─────────────────────────────────
+
+    #[test]
+    fn org_sidebar_defaults_to_coexist() {
+        let cfg = Config::default();
+        assert_eq!(cfg.ui.org_sidebar, OrgSidebarMode::Coexist);
+    }
+
+    #[test]
+    fn parses_org_sidebar_from_toml() {
+        let cfg_replace: Config = toml::from_str(
+            r#"
+            [ui]
+            org_sidebar = "replace"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg_replace.ui.org_sidebar, OrgSidebarMode::Replace);
+
+        let cfg_off: Config = toml::from_str(
+            r#"
+            [ui]
+            org_sidebar = "off"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg_off.ui.org_sidebar, OrgSidebarMode::Off);
+
+        let cfg_coexist: Config = toml::from_str(
+            r#"
+            [ui]
+            org_sidebar = "coexist"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg_coexist.ui.org_sidebar, OrgSidebarMode::Coexist);
+    }
+
+    #[test]
+    fn parses_org_sidebar_case_insensitive() {
+        // TOML config is forgiving of casing, same as `lang` above —
+        // `"Replace"` / `"OFF"` both accepted.
+        let cfg_replace: Config = toml::from_str(
+            r#"
+            [ui]
+            org_sidebar = "Replace"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg_replace.ui.org_sidebar, OrgSidebarMode::Replace);
+
+        let cfg_off: Config = toml::from_str(
+            r#"
+            [ui]
+            org_sidebar = "OFF"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg_off.ui.org_sidebar, OrgSidebarMode::Off);
+    }
+
+    #[test]
+    fn rejects_unknown_org_sidebar_value() {
+        // An unknown value must bubble up as a parse error for the
+        // whole config, mirroring `rejects_unknown_ui_lang_value` —
+        // a typo like `org_sidebar = "bogus"` must not silently
+        // masquerade as the `coexist` default.
+        let err = toml::from_str::<Config>(
+            r#"
+            [ui]
+            org_sidebar = "bogus"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("bogus") || err.to_string().contains("invalid"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn org_sidebar_mode_from_str_and_display_roundtrip() {
+        assert_eq!(
+            OrgSidebarMode::from_str("coexist").unwrap(),
+            OrgSidebarMode::Coexist
+        );
+        assert_eq!(
+            OrgSidebarMode::from_str("replace").unwrap(),
+            OrgSidebarMode::Replace
+        );
+        assert_eq!(
+            OrgSidebarMode::from_str("off").unwrap(),
+            OrgSidebarMode::Off
+        );
+        assert!(OrgSidebarMode::from_str("bogus").is_err());
+
+        for mode in [
+            OrgSidebarMode::Coexist,
+            OrgSidebarMode::Replace,
+            OrgSidebarMode::Off,
+        ] {
+            assert_eq!(OrgSidebarMode::from_str(&mode.to_string()).unwrap(), mode);
+        }
     }
 }

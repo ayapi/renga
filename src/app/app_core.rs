@@ -1,5 +1,17 @@
 use super::*;
 
+/// How often [`App::tick_claude_snapshots`] is allowed to walk every
+/// tab. The per-pane monitors have their own 500 ms / 2 s throttles;
+/// this one bounds the cost of the walk itself (a `collect_pane_ids`
+/// per tab plus a mutex round-trip per pane) so it stays a few times a
+/// second instead of once per event-loop turn (~30 Hz by default).
+const SNAPSHOT_SWEEP_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Output silence after which a pane counts as waiting for input
+/// (`pane_waiting_input`, Issue #72). Agents animate a spinner while
+/// they work, so a few seconds of silence means they stopped.
+const WAITING_INPUT_IDLE: Duration = Duration::from_secs(5);
+
 impl App {
     #[allow(dead_code)] // retained as a test-ergonomic alias for new_with_cwd(None)
     pub fn new(rows: u16, cols: u16) -> Result<Self> {
@@ -58,6 +70,7 @@ impl App {
             last_new_tab_rect: None,
             rename_input: None,
             overlay: None,
+            close_confirm: None,
             saved_overlay_drafts: HashMap::new(),
             last_tab_click: None,
             last_edge_click: None,
@@ -70,9 +83,15 @@ impl App {
             },
             claude_monitor: crate::claude_monitor::ClaudeMonitor::new(),
             peer_client_kinds: HashMap::new(),
+            peer_unread: HashMap::new(),
+            next_peer_msg_id: 1,
             pending_codex_peer_messages: HashMap::new(),
             codex_peer_notification: None,
             recent_peer_sends: HashMap::new(),
+            pending_user_turns: Vec::new(),
+            recent_user_turn_sends: HashMap::new(),
+            #[cfg(test)]
+            user_turn_writes: Vec::new(),
             clipboard: None,
             event_bus,
             ime_mode: crate::config::ImeMode::default(),
@@ -86,6 +105,20 @@ impl App {
             macos_tip_visible: false,
             macos_tip_shown_at: None,
             macos_tip_marker: None,
+            // Placeholder mode; the real `[ui] org_sidebar` value lands
+            // in `apply_config`, mirroring how `ime_mode` / `lang` are
+            // seeded here and resolved there.
+            org_sidebar_mode: crate::config::OrgSidebarMode::default(),
+            org_sidebar_visible: false,
+            org_sidebar_width: crate::app::layout_geometry::DEFAULT_ORG_SIDEBAR_WIDTH,
+            last_org_sidebar_rect: None,
+            org_sidebar_scroll: 0,
+            org_sidebar_selection: None,
+            org_sidebar_row_targets: Vec::new(),
+            org_sidebar_follow_selection: true,
+            claude_snapshots: HashMap::new(),
+            last_claude_sweep: None,
+            last_prompt_sweep: None,
         })
     }
 
@@ -183,6 +216,11 @@ impl App {
                 .overlay_catchup_ms
                 .max(crate::config::MIN_OVERLAY_CATCHUP_MS)
         };
+        self.org_sidebar_mode = cfg.ui.org_sidebar;
+        // `coexist` / `replace` both mean "the user wants this panel",
+        // so it comes up with the app; `off` leaves it disabled and
+        // makes Ctrl+B inert.
+        self.org_sidebar_visible = self.org_sidebar_enabled();
     }
 
     /// Resolved message table for the current UI language. Prefer this
@@ -237,11 +275,24 @@ impl App {
         self.min_pane_height = height.max(1);
     }
 
-    /// Emit a [`PaneStarted`] event for the given pane id. Pulls the
-    /// current name/role from the active workspace so subscribers
-    /// receive the metadata that was just attached.
+    /// Emit a [`PaneStarted`] event for a pane in the active workspace.
     pub(crate) fn emit_pane_started(&self, pane_id: usize) {
-        let ws = self.ws();
+        self.emit_pane_started_in(self.active_tab, pane_id);
+    }
+
+    /// Emit a [`PaneStarted`] event for a pane in workspace `ws_index`,
+    /// pulling the name/role that was just attached to it.
+    ///
+    /// The workspace has to be named explicitly: pane ids are unique
+    /// App-wide, so looking one up in the *active* workspace after a
+    /// cross-tab spawn silently finds nothing and emits `name: null,
+    /// role: null` instead of erroring. `poll_events` is process-wide,
+    /// so an orchestrator waiting on the worker it just named by
+    /// `spawn_claude_pane(name = ...)` would never match the event.
+    pub(crate) fn emit_pane_started_in(&self, ws_index: usize, pane_id: usize) {
+        let Some(ws) = self.workspaces.get(ws_index) else {
+            return;
+        };
         let name = ws
             .pane_names
             .iter()
@@ -318,6 +369,12 @@ fn copy_to_windows_clipboard(text: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Terminal dimensions below which the layout pass is skipped
+/// entirely — there is not enough room to place a pane area, a tab bar
+/// and borders.
+pub(crate) const MIN_LAYOUT_COLS: u16 = 20;
+pub(crate) const MIN_LAYOUT_ROWS: u16 = 5;
+
 impl App {
     /// Recompute pane rectangles and apply sizes to every PTY in the
     /// active workspace. Returns `true` if any pane was actually
@@ -325,16 +382,91 @@ impl App {
     /// cooldown). Safe to call without a Frame — uses the cached
     /// `last_term_size`.
     pub fn relayout_panes(&mut self) -> bool {
-        let (cols, rows) = self.last_term_size;
-        if cols < 20 || rows < 5 {
+        self.relayout_workspace(self.active_tab)
+    }
+
+    /// Recompute a workspace's cached rectangles **without touching its
+    /// PTYs**.
+    ///
+    /// This is the half of the layout pass that is safe to run on a
+    /// hidden tab. The other half — [`Self::relayout_workspace`] — calls
+    /// [`Pane::resize`], which clears the vt100 buffer and leaves the
+    /// child to repaint on SIGWINCH. A TUI child does repaint; a plain
+    /// shell does not, so resizing a hidden pane destroys scrollback
+    /// nobody asked to lose and that nothing regenerates. Anything that
+    /// merely wants to *report* a hidden tab's geometry (`list_panes`)
+    /// or *judge* it (the split min-size guard) wants this, not that.
+    pub(crate) fn recompute_workspace_rects(&mut self, ws_index: usize) {
+        if self.workspaces.get(ws_index).is_none() || self.terminal_too_small_for_layout() {
+            return;
+        }
+        let rects = self.workspaces[ws_index]
+            .layout
+            .calculate_rects(self.main_area_layout_for(ws_index).panes);
+        self.workspaces[ws_index].last_pane_rects = rects;
+    }
+
+    /// [`Self::relayout_panes`] for an arbitrary workspace: recompute the
+    /// rectangles *and* push the new sizes into the PTYs.
+    ///
+    /// Reserve this for a workspace whose layout actually changed (a
+    /// split, a pane close) or that is on screen. Resizing clears each
+    /// pane's screen, so calling it speculatively on a hidden tab is a
+    /// destructive read — see [`Self::recompute_workspace_rects`].
+    pub fn relayout_workspace(&mut self, ws_index: usize) -> bool {
+        if self.workspaces.get(ws_index).is_none() {
+            return false;
+        }
+        if self.terminal_too_small_for_layout() {
             return false;
         }
 
-        // Mirror the area math in ui::render / render_main_area,
-        // including the fallback where tree / preview are hidden when
-        // the terminal is too narrow. Keeping these in sync prevents
-        // PTY size drift from the actually-painted pane size.
-        const MIN_PANE_AREA_WIDTH: u16 = 20;
+        let rects = self.workspaces[ws_index]
+            .layout
+            .calculate_rects(self.main_area_layout_for(ws_index).panes);
+
+        let mut any_changed = false;
+        for (pane_id, rect) in &rects {
+            if let Some(pane) = self.workspaces[ws_index].panes.get_mut(pane_id) {
+                let inner_rows = rect.height.saturating_sub(2);
+                let inner_cols = rect.width.saturating_sub(2);
+                if pane.resize(inner_rows, inner_cols).unwrap_or(false) {
+                    any_changed = true;
+                }
+            }
+        }
+
+        self.workspaces[ws_index].last_pane_rects = rects;
+        any_changed
+    }
+
+    /// Resolve the main area's geometry from the cached terminal size,
+    /// without needing a `Frame`.
+    ///
+    /// This is what lets non-render code ask "is the file tree actually
+    /// on screen?" — a question the raw `file_tree_visible` flag cannot
+    /// answer once `replace` mode and the narrow-terminal degrade
+    /// ladder are in play, and one that focus and key routing have to
+    /// get right or they hand the keyboard to an invisible panel.
+    /// Reading `last_*_rect` instead would be wrong before the first
+    /// paint and stale right after a resize.
+    ///
+    /// The vertical slots still mirror `ui::render` by hand (tab bar,
+    /// main area, macOS tip, status bar); only the horizontal split is
+    /// shared, via `layout_geometry::compute`.
+    pub(crate) fn main_area_layout(&self) -> layout_geometry::MainAreaLayout {
+        self.main_area_layout_for(self.active_tab)
+    }
+
+    /// [`Self::main_area_layout`] for an arbitrary workspace.
+    ///
+    /// Two of the horizontal inputs — whether the file tree is open and
+    /// whether the preview is active — are per-workspace, so a hidden
+    /// tab's pane area is genuinely not the visible tab's. The PTY
+    /// resize path needs this to size a background tab's panes the way
+    /// rendering *that* tab would (Issue #288).
+    pub(crate) fn main_area_layout_for(&self, ws_index: usize) -> layout_geometry::MainAreaLayout {
+        let (cols, rows) = self.last_term_size;
         let tab_h = 1u16;
         let status_h: u16 = if self.status_bar_visible || self.rename_input.is_some() {
             1
@@ -345,52 +477,226 @@ impl App {
         // box on top of the pane area (see `ui::render_ime_overlay`),
         // so unlike the old single-row widget it does not claim a
         // layout slot — panes keep their full height whether the
-        // overlay is open or not.
-        let main_h = rows.saturating_sub(tab_h + status_h);
+        // overlay is open or not. The first-launch macOS tip *does*
+        // claim two rows, so it has to come off the pane height here
+        // as well or the PTYs spend the banner's lifetime believing
+        // they are two rows taller than what gets painted.
+        let macos_tip_h: u16 = if self.macos_tip_visible { 2 } else { 0 };
+        let main_h = rows.saturating_sub(tab_h + status_h + macos_tip_h);
+        layout_geometry::compute(
+            self.main_area_input_for(ws_index, Rect::new(0, tab_h, cols, main_h)),
+        )
+    }
 
-        let mut has_tree = self.ws().file_tree_visible;
-        let mut has_preview = self.ws().preview.is_active();
-        let tree_w_nom = self.file_tree_width;
-        let preview_w_nom = self.preview_width;
+    /// Collect the horizontal-layout inputs for `area`.
+    ///
+    /// Both callers of [`layout_geometry::compute`] go through this so
+    /// the renderer and the PTY-resize path cannot disagree about *what*
+    /// they asked for, on top of already agreeing about how it resolves.
+    ///
+    /// [`layout_geometry::compute`]: crate::app::layout_geometry::compute
+    pub(crate) fn main_area_input(&self, area: Rect) -> layout_geometry::MainAreaInput {
+        self.main_area_input_for(self.active_tab, area)
+    }
 
-        let needed = MIN_PANE_AREA_WIDTH
-            + if has_tree { tree_w_nom } else { 0 }
-            + if has_preview { preview_w_nom } else { 0 };
-        if cols < needed && has_preview {
-            has_preview = false;
+    /// [`Self::main_area_input`] for an arbitrary workspace. Falls back
+    /// to the active tab's panel state if `ws_index` is out of range, so
+    /// callers get the pre-#288 answer rather than a panic.
+    pub(crate) fn main_area_input_for(
+        &self,
+        ws_index: usize,
+        area: Rect,
+    ) -> layout_geometry::MainAreaInput {
+        let ws = self.workspaces.get(ws_index).unwrap_or_else(|| self.ws());
+        layout_geometry::MainAreaInput {
+            area,
+            org_sidebar_mode: self.org_sidebar_mode,
+            org_sidebar_visible: self.org_sidebar_visible,
+            org_sidebar_width: self.org_sidebar_width,
+            file_tree_visible: ws.file_tree_visible,
+            file_tree_width: self.file_tree_width,
+            preview_active: ws.preview.is_active(),
+            preview_width: self.preview_width,
+            layout_swapped: self.layout_swapped,
         }
-        let needed = MIN_PANE_AREA_WIDTH + if has_tree { tree_w_nom } else { 0 };
-        if cols < needed && has_tree {
-            has_tree = false;
+    }
+
+    /// Refresh the org sidebar's per-pane Claude snapshots.
+    ///
+    /// Called once per event-loop turn (alongside the other
+    /// `maybe_*` / `check_*` tickers) rather than from the renderer,
+    /// because the sidebar shows *every* tab and the renderer only ever
+    /// walks the active one. Three separate throttles keep the cost
+    /// bounded:
+    ///
+    /// * this sweep itself runs at most every [`SNAPSHOT_SWEEP_INTERVAL`],
+    /// * panes in the visible tab are polled at the usual
+    ///   `CHECK_INTERVAL` (unchanged from the pre-sidebar behaviour),
+    /// * panes in background tabs are polled at
+    ///   `BACKGROUND_CHECK_INTERVAL`, since nobody is watching them
+    ///   closely enough to notice a two-second lag.
+    ///
+    /// Repaints are only requested when a snapshot actually differs
+    /// from the cached one — without that the sweep would mark the UI
+    /// dirty several times a second forever.
+    pub(crate) fn tick_claude_snapshots(&mut self) {
+        if !self.org_sidebar_active() {
+            // Nothing reads the cache while the panel is down. The
+            // active tab keeps being polled by `render_panes`, so the
+            // pane borders and status bar are unaffected.
+            return;
         }
+        let now = Instant::now();
+        if self
+            .last_claude_sweep
+            .is_some_and(|t| now.duration_since(t) < SNAPSHOT_SWEEP_INTERVAL)
+        {
+            return;
+        }
+        self.last_claude_sweep = Some(now);
 
-        let tree_w = if has_tree { tree_w_nom } else { 0 };
-        let preview_w = if has_preview { preview_w_nom } else { 0 };
-        let pane_w = cols.saturating_sub(tree_w).saturating_sub(preview_w);
+        // Snapshot the (pane, cwd, interval) triples before touching the
+        // monitor so the workspace borrow ends first.
+        let active = self.active_tab;
+        let targets: Vec<(usize, PathBuf, Duration)> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .flat_map(|(tab, ws)| {
+                let interval = if tab == active {
+                    crate::claude_monitor::CHECK_INTERVAL
+                } else {
+                    crate::claude_monitor::BACKGROUND_CHECK_INTERVAL
+                };
+                ws.layout
+                    .collect_pane_ids()
+                    .into_iter()
+                    .filter_map(move |id| ws.panes.get(&id).map(|p| (id, p.cwd.clone(), interval)))
+            })
+            .collect();
 
-        // Mirror ui::render_main_area's chunk ordering so the cached
-        // rects reflect actual on-screen positions (not just sizes).
-        // The IPC `list` response and mouse hit-testing both read x/y
-        // from last_pane_rects, so getting the origin right matters
-        // here even between renders. Chunk order there is:
-        //   [tree?] [preview(if swapped)?] [panes] [preview(if !swapped)?]
-        let pane_x = tree_w + if self.layout_swapped { preview_w } else { 0 };
-        let pane_area = Rect::new(pane_x, tab_h, pane_w, main_h);
-        let rects = self.ws().layout.calculate_rects(pane_area);
-
-        let mut any_changed = false;
-        for (pane_id, rect) in &rects {
-            if let Some(pane) = self.ws_mut().panes.get_mut(pane_id) {
-                let inner_rows = rect.height.saturating_sub(2);
-                let inner_cols = rect.width.saturating_sub(2);
-                if pane.resize(inner_rows, inner_cols).unwrap_or(false) {
-                    any_changed = true;
+        let mut changed = false;
+        for (pane_id, cwd, interval) in &targets {
+            self.claude_monitor
+                .update_throttled(*pane_id, cwd, *interval);
+            let snapshot = self.claude_monitor.snapshot(*pane_id);
+            match self.claude_snapshots.get(pane_id) {
+                Some(prev) if *prev == snapshot => {}
+                _ => {
+                    self.claude_snapshots.insert(*pane_id, snapshot);
+                    changed = true;
                 }
             }
         }
 
-        self.ws_mut().last_pane_rects = rects;
-        any_changed
+        // Drop entries for panes that have gone away, so a long session
+        // that churns through panes doesn't grow the map forever.
+        if self.claude_snapshots.len() > targets.len() {
+            let live: HashSet<usize> = targets.iter().map(|(id, _, _)| *id).collect();
+            self.claude_snapshots.retain(|id, _| live.contains(id));
+            changed = true;
+        }
+
+        // Honour the IME overlay freeze (#37 / #82). `drain_pty_events`
+        // suppresses PTY-driven repaints while the overlay is open so
+        // composition doesn't flicker; marking dirty here on every
+        // background-tab status change would punch straight through
+        // that at up to 4 Hz. The cache is still refreshed above, so
+        // the sidebar is correct at the next repaint — which the
+        // overlay catch-up tick already schedules.
+        if changed && !(self.overlay.is_some() && self.ime_freeze_panes_on_overlay) {
+            self.dirty = true;
+        }
+    }
+
+    /// Emit `pane_prompt_detected` / `pane_waiting_input` (Issue #72)
+    /// and `pane_mode_changed` (Issue #49) for every live pane in every
+    /// tab. Throttled like the snapshot
+    /// sweep; only panes that produced output since the last pass get
+    /// their screen rescanned.
+    pub(crate) fn tick_prompt_events(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_prompt_sweep
+            .is_some_and(|t| now.duration_since(t) < SNAPSHOT_SWEEP_INTERVAL)
+        {
+            return;
+        }
+        self.last_prompt_sweep = Some(now);
+
+        let mut events = Vec::new();
+        for ws in &mut self.workspaces {
+            for (&id, pane) in ws.panes.iter_mut() {
+                if pane.exited {
+                    continue;
+                }
+                let mut found = None;
+                let mut mode = None;
+                if pane.output_seen {
+                    let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+                    // A scrolled-back view shows history, not the live
+                    // screen; leave `output_seen` set and rescan once
+                    // the user is back at the bottom.
+                    if parser.screen().scrollback() == 0 {
+                        found = Some(crate::pane::detect_interactive_prompt(parser.screen()));
+                        if pane.claude_ever_seen() {
+                            mode = crate::pane::detect_claude_mode(parser.screen());
+                        }
+                    }
+                }
+                let name = || {
+                    ws.pane_names
+                        .iter()
+                        .find(|(_, pid)| **pid == id)
+                        .map(|(n, _)| n.clone())
+                };
+                match found {
+                    Some(Some((kind, prompt, key))) => {
+                        pane.output_seen = false;
+                        if pane.reported_prompt.as_deref() != Some(key.as_str()) {
+                            pane.reported_prompt = Some(key);
+                            events.push(crate::ipc::Event::PanePromptDetected {
+                                id,
+                                name: name(),
+                                role: pane.role.clone(),
+                                kind: kind.to_string(),
+                                prompt,
+                                ts_ms: crate::ipc::events::now_ms(),
+                            });
+                        }
+                    }
+                    Some(None) => {
+                        pane.output_seen = false;
+                        pane.reported_prompt = None;
+                    }
+                    None => {}
+                }
+                if let Some(mode) = mode.filter(|m| pane.reported_mode != Some(*m)) {
+                    events.push(crate::ipc::Event::PaneModeChanged {
+                        id,
+                        name: name(),
+                        role: pane.role.clone(),
+                        mode: mode.to_string(),
+                        prev_mode: pane.reported_mode.replace(mode).map(str::to_string),
+                        ts_ms: crate::ipc::events::now_ms(),
+                    });
+                }
+                let idle = now.duration_since(pane.last_output_at);
+                if !pane.waiting_input_reported && idle >= WAITING_INPUT_IDLE {
+                    pane.waiting_input_reported = true;
+                    events.push(crate::ipc::Event::PaneWaitingInput {
+                        id,
+                        name: name(),
+                        role: pane.role.clone(),
+                        idle_ms: idle.as_millis() as u64,
+                        ts_ms: crate::ipc::events::now_ms(),
+                    });
+                }
+            }
+        }
+        for ev in events {
+            self.event_bus.emit(ev);
+        }
     }
 
     /// Mark a layout change: apply resizes immediately and, if sizes
@@ -413,10 +719,37 @@ impl App {
         self.dirty = true;
     }
 
+    /// Whether the terminal is too small for the layout pass to run at
+    /// all. Below this, [`Self::relayout_workspace`] bails and every
+    /// workspace keeps whatever `last_pane_rects` it last had — so
+    /// anything that would *act* on those rects has to treat them as
+    /// unknown rather than current.
+    pub(crate) fn terminal_too_small_for_layout(&self) -> bool {
+        let (cols, rows) = self.last_term_size;
+        cols < MIN_LAYOUT_COLS || rows < MIN_LAYOUT_ROWS
+    }
+
     /// Called from main.rs on crossterm Resize events so we can update
     /// the cached terminal size and propagate the resize into panes.
+    ///
+    /// Hidden workspaces get their *rectangles* recomputed but their
+    /// PTYs left alone. Pushing the resize into a hidden pane would
+    /// clear its screen, and a plain shell — unlike a TUI — never
+    /// repaints after SIGWINCH, so the output the user had scrolled to
+    /// (and that a caller-scoped `inspect_pane` could still read) would
+    /// simply be gone. The real resize happens when that tab is next
+    /// rendered, which is when someone is actually looking at it.
     pub fn on_terminal_resize(&mut self, cols: u16, rows: u16) {
         self.last_term_size = (cols, rows);
+        for i in 0..self.workspaces.len() {
+            if i != self.active_tab {
+                self.recompute_workspace_rects(i);
+            }
+        }
+        // The active workspace goes through `mark_layout_change` so the
+        // repaint cooldown and selection invalidation stay tied to the
+        // tab actually being painted — and it is on screen, so resizing
+        // its PTYs is exactly right.
         self.mark_layout_change();
     }
 

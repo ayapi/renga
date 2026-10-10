@@ -6,7 +6,7 @@ Split your terminal into multiple independent panes, each running its own PTY sh
 
 - `Ctrl+D` — Split vertically (left/right)
 - `Ctrl+E` — Split horizontally (top/bottom)
-- `Ctrl+W` — Close the focused pane
+- `Ctrl+W` — Close the focused pane (asks `y` / `n` first)
 - **Mouse drag on pane borders** to resize
 
 Panes can be nested: split a pane, then split one of the halves again. Up to 16 panes.
@@ -25,7 +25,7 @@ Each tab is an independent workspace with its own panes, file tree, and preview.
 - **Click a tab** to switch
 - **Double-click a tab** to rename
 - `Alt+R` — Rename tab (session only; submit empty to reset to auto name)
-- `Ctrl+W` — Close tab (when only one pane in the tab)
+- `Ctrl+W` — Close tab (when only one pane in the tab; asks `y` / `n` first)
 
 The tab name automatically updates when you `cd` to a different directory. A custom name takes precedence over the auto-derived name.
 
@@ -187,7 +187,7 @@ The status bar always shows the shortcuts available in the current mode. A summa
 | Key | Action |
 |-----|--------|
 | `Ctrl+D` / `Ctrl+E` | Split vertically / horizontally |
-| `Ctrl+W` | Close pane (close tab if only one pane) |
+| `Ctrl+W` | Close pane (close tab if only one pane), after a centered `y` / `n` confirmation |
 | `Alt+T` / `Ctrl+T` | New tab |
 | `Alt+R` | Rename tab (session only) |
 | `Alt+S` | Toggle status bar |
@@ -203,7 +203,7 @@ The status bar always shows the shortcuts available in the current mode. A summa
 | `Ctrl+D` | Vertical split | `exit` to log out |
 | `Ctrl+E` | Horizontal split | `End` key |
 | `Ctrl+F` | File tree | `/` for less/vim search |
-| `Ctrl+W` | Close (only when multiple panes) | works normally with a single pane |
+| `Ctrl+W` | Raises a close confirmation (only when multiple panes) | works normally with a single pane |
 | `Ctrl+;` | IME overlay (when `mode = "hotkey"`) | `--ime off` swallows the keystroke |
 
 ## Small Terminal Handling

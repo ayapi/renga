@@ -16,7 +16,7 @@ fn seed_focused_pane_screen(app: &mut App, bytes: &[u8]) -> usize {
 #[test]
 fn codex_peer_delivery_ready_accepts_ready_for_input_fallback() {
     let mut app = App::new(40, 80).expect("App::new");
-    let pane_id = seed_focused_pane_screen(&mut app, b"\x1b[2J\x1b[Hready for input");
+    let pane_id = seed_focused_pane_screen(&mut app, b"\x1b[2J\x1b[Hready for input\r\n");
     let pane = app.ws().panes.get(&pane_id).expect("pane");
 
     assert!(App::codex_peer_delivery_ready(true, pane));
@@ -80,6 +80,30 @@ fn format_codex_peer_message_includes_sender_and_check_messages_guidance() {
     );
 }
 
+/// The nudge is typed into the target pane's PTY and followed by
+/// Enter, so a `\r` in the sender's name would submit everything before
+/// it as a prompt in another agent's composer — and an `\x1b` would
+/// reach the terminal as a live escape sequence. Names registered
+/// through `split` / `new_tab` were unvalidated before v2.0.0, and
+/// #289 widened delivery to every tab, so this is the last line of
+/// defense for a name that predates the input check.
+#[test]
+fn format_codex_peer_message_strips_control_characters_from_the_sender_name() {
+    let formatted = format_codex_peer_message(&PendingCodexPeerMessage {
+        from_pane: 7,
+        from_name: Some("planner\r/quit\rrm -rf ~\u{1b}[2J".to_string()),
+        from_kind: Some(PeerClientKind::Claude),
+    });
+    assert!(
+        !formatted.contains('\r') && !formatted.contains('\n') && !formatted.contains('\u{1b}'),
+        "no control character may survive into the PTY payload: {formatted:?}"
+    );
+    assert!(
+        formatted.contains("name=planner/quitrm -rf ~[2J"),
+        "the printable remainder is kept so the sender is still identifiable: {formatted:?}"
+    );
+}
+
 #[test]
 fn handle_peer_send_emits_peer_inbox_to_sibling_in_same_tab() {
     // Split pane A's workspace to create a sibling. Sending from
@@ -88,7 +112,6 @@ fn handle_peer_send_emits_peer_inbox_to_sibling_in_same_tab() {
     // core happy-path of #97: without this event the MCP peer
     // subprocess has nothing to push as a channel notification.
     let mut app = App::new(40, 80).expect("App::new");
-    let (_sub_id, rx) = app.event_bus.subscribe();
     let sender_id = app.ws().focused_pane_id;
     let sibling_id = app
         .handle_split(
@@ -98,15 +121,25 @@ fn handle_peer_send_emits_peer_inbox_to_sibling_in_same_tab() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("split succeeds");
-    // Drain PaneStarted events from the split so the assertion below
-    // only sees the PeerInbox we care about.
-    while let Ok(ev) = rx.try_recv() {
-        if !matches!(ev, ipc::Event::PaneStarted { .. }) {
-            panic!("unexpected event before peer send: {ev:?}");
-        }
-    }
+    // Bind the receiver to the sibling. Since #306 that makes it a
+    // precise instrument: the only `PeerInbox` it can ever hold is one
+    // addressed to this pane, so a misroute reads as an empty stream
+    // rather than hiding among other panes' traffic. (An unscoped
+    // subscription would see this delivery too — it would just see
+    // everything else with it.) Subscribing after the split also means
+    // the split's own `PaneStarted` events are already behind us and
+    // the stream starts empty.
+    let (_sub_id, rx) = app
+        .event_bus
+        .subscribe_scoped(ipc::EventScope::PaneInbox(sibling_id));
+    assert!(
+        rx.try_recv().is_err(),
+        "no events expected before the peer send"
+    );
     app.handle_peer_send(
         sender_id,
         &ipc::PaneRef::Id(sibling_id),
@@ -142,8 +175,13 @@ fn handle_peer_send_loops_back_to_sender_pane() {
     // loop picks it up. Prior to the fix the self-send was silently
     // dropped while JSON-RPC reported Delivered.
     let mut app = App::new(40, 80).expect("App::new");
-    let (_sub_id, rx) = app.event_bus.subscribe();
     let sender_id = app.ws().focused_pane_id;
+    // A self-send targets the sender pane, so that is the pane to bind
+    // to: the receiver then holds nothing but mail addressed back to
+    // the sender, which is the whole claim under test.
+    let (_sub_id, rx) = app
+        .event_bus
+        .subscribe_scoped(ipc::EventScope::PaneInbox(sender_id));
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(
@@ -174,13 +212,11 @@ fn handle_peer_send_loops_back_to_sender_pane() {
 }
 
 #[test]
-fn handle_peer_send_silently_drops_cross_tab_target() {
-    // Cross-tab delivery is a silent no-op by design — callers
-    // cannot enumerate panes in other tabs by probing ids. A
-    // PeerInbox event would leak "pane X exists somewhere", so
-    // the handler must emit nothing at all.
+fn handle_peer_send_delivers_to_cross_tab_target_by_id() {
+    // Issue #289 inverted the old silent-drop guard: a numeric id in
+    // another tab is a legitimate cross-tab address and must produce
+    // exactly one PeerInbox event, same as a same-tab send.
     let mut app = App::new(40, 80).expect("App::new");
-    let (_sub_id, rx) = app.event_bus.subscribe();
     let sender_id = app.ws().focused_pane_id;
     // Open a fresh tab; its pane id is distinct from sender's.
     let other_tab_pane = app
@@ -190,27 +226,309 @@ fn handle_peer_send_silently_drops_cross_tab_target() {
         other_tab_pane, sender_id,
         "new_tab must allocate a fresh pane id"
     );
+    // Pane ids are globally unique, so #306 routing is tab-agnostic:
+    // binding to the other tab's pane id is all a subscriber over
+    // there has to do.
+    let (_sub_id, rx) = app
+        .event_bus
+        .subscribe_scoped(ipc::EventScope::PaneInbox(other_tab_pane));
     // Drain PaneStarted / tab-switch events.
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(
         sender_id,
         &ipc::PaneRef::Id(other_tab_pane),
-        "should be silently dropped".to_string(),
+        "hello other tab".to_string(),
     )
-    .expect("cross-tab send reports success");
+    .expect("cross-tab send succeeds");
+    let inboxes: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|ev| match ev {
+            ipc::Event::PeerInbox {
+                target_pane,
+                from_pane,
+                body,
+                ..
+            } => Some((target_pane, from_pane, body)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        inboxes,
+        vec![(other_tab_pane, sender_id, "hello other tab".to_string())],
+        "cross-tab PeerSend must emit exactly one PeerInbox for the target"
+    );
+    app.shutdown();
+}
+
+#[test]
+fn handle_peer_send_resolves_name_in_sender_workspace_not_active_tab() {
+    // Pane names are only unique per tab. The sender sits in a
+    // background tab while the human views a tab holding a pane with
+    // the SAME name — resolution must prefer the sender's workspace,
+    // not the visible one, or background-tab orchestrators misroute
+    // (Issue #289 design review, Major 2).
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let same_tab_worker = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            Some("worker".into()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    // A second tab with an identically named pane, left as the active
+    // tab so the old active-tab-first resolution would pick it.
+    let other_tab_worker = app
+        .handle_new_tab(None, Some("worker".into()), None, None, None)
+        .expect("new tab succeeds");
+    assert_eq!(app.active_tab, 1, "new tab should be the visible one");
+    // One subscriber per candidate. Under #306 the misroute would show
+    // up as an empty `mine` *and* a non-empty `theirs`, so watching
+    // both keeps the failure diagnosable instead of just "nothing
+    // arrived".
+    let (_mine_id, mine) = app
+        .event_bus
+        .subscribe_scoped(ipc::EventScope::PaneInbox(same_tab_worker));
+    let (_theirs_id, theirs) = app
+        .event_bus
+        .subscribe_scoped(ipc::EventScope::PaneInbox(other_tab_worker));
+    while mine.try_recv().is_ok() {}
+    while theirs.try_recv().is_ok() {}
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Name("worker".into()),
+        "task for MY worker".to_string(),
+    )
+    .expect("name send succeeds");
+    let inbox_targets = |rx: &std::sync::mpsc::Receiver<ipc::Event>| -> Vec<usize> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|ev| match ev {
+                ipc::Event::PeerInbox { target_pane, .. } => Some(target_pane),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        inbox_targets(&mine),
+        vec![same_tab_worker],
+        "name must resolve to the sender's own tab, not the visible tab \
+         (other-tab worker is {other_tab_worker})"
+    );
+    assert!(
+        inbox_targets(&theirs).is_empty(),
+        "the identically named pane in the visible tab must receive nothing"
+    );
+    app.shutdown();
+}
+
+#[test]
+fn handle_peer_send_rejects_a_name_that_only_exists_in_another_tab() {
+    // Cross-tab sends require the numeric pane id. An unqualified
+    // name never leaves the sender's workspace, and an unresolvable
+    // target errors instead of faking "Delivered".
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let far_worker = app
+        .handle_new_tab(None, Some("far-worker".into()), None, None, None)
+        .expect("new tab succeeds");
+    // Bind to the only pane the name could have wrongly resolved to.
+    // An unscoped subscription carries every pane's `PeerInbox`, so the
+    // assertion below would have to re-check `target_pane` to mean
+    // anything; binding states it structurally — this receiver holds
+    // far-worker's mail or it holds nothing.
+    let (_sub_id, rx) = app
+        .event_bus
+        .subscribe_scoped(ipc::EventScope::PaneInbox(far_worker));
+    while rx.try_recv().is_ok() {}
+
+    let err = app
+        .handle_peer_send(
+            sender_id,
+            &ipc::PaneRef::Name("far-worker".into()),
+            "won't arrive".to_string(),
+        )
+        .expect_err("other-tab name must not resolve");
+    assert_eq!(err.code, Some(ipc::err_code::PANE_NOT_FOUND));
     let got_inbox = std::iter::from_fn(|| rx.try_recv().ok())
         .any(|ev| matches!(ev, ipc::Event::PeerInbox { .. }));
+    assert!(!got_inbox, "a failed resolution must not deliver anything");
+    app.shutdown();
+}
+
+#[test]
+fn flush_delivers_codex_nudge_to_background_tab_focused_pane() {
+    // A single-pane background tab's only pane is always its
+    // workspace-focused pane. The flush skip must therefore be limited
+    // to the pane the human actually sees (active tab), or cross-tab
+    // Codex nudges queue forever (Issue #289 design review, Major 1).
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_pane = app
+        .handle_new_tab(None, None, None, None, None)
+        .expect("new tab succeeds");
+    app.peer_client_kinds
+        .insert(codex_pane, PeerClientKind::Codex);
+    {
+        let pane = app.workspaces[1]
+            .panes
+            .get_mut(&codex_pane)
+            .expect("codex pane");
+        let mut parser = pane.parser.lock().unwrap();
+        parser.process(b"\x1b[?25h\x1b[2J\x1b[Hready for input\n\nenter to send\r\n");
+    }
+    // Send the human back to tab 0; the Codex tab is now background.
+    assert!(app.switch_tab(0), "switch back to the sender tab");
+    assert_eq!(app.active_tab, 0, "sender tab should be visible again");
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_pane),
+        "cross-tab codex ping".to_string(),
+    )
+    .expect("peer send");
+    assert_eq!(
+        app.pending_codex_peer_messages
+            .get(&codex_pane)
+            .map(|q| q.len()),
+        Some(1),
+        "background-tab Codex target should queue a nudge"
+    );
+
+    app.flush_pending_codex_peer_messages();
     assert!(
-        !got_inbox,
-        "cross-tab PeerSend must NOT emit a PeerInbox event"
+        matches!(
+            app.pending_codex_peer_messages
+                .get(&codex_pane)
+                .and_then(|q| q.front()),
+            Some(PendingCodexPeerDelivery::SubmitAt(_))
+        ),
+        "first flush must type the draft into the background tab's \
+         workspace-focused pane instead of skipping it"
+    );
+    if let Some(queue) = app.pending_codex_peer_messages.get_mut(&codex_pane) {
+        queue[0] = PendingCodexPeerDelivery::SubmitAt(Instant::now());
+    }
+    app.flush_pending_codex_peer_messages();
+    assert!(
+        !app.pending_codex_peer_messages.contains_key(&codex_pane),
+        "second flush should submit the queued nudge"
+    );
+    app.shutdown();
+}
+
+#[test]
+fn flush_promotes_queued_draft_to_notification_when_target_tab_activates() {
+    // A nudge queued while its tab was hidden must not stall when the
+    // human switches onto the pane before delivery: the flush promotes
+    // the still-undelivered draft into the focused-pane notification
+    // overlay instead of skipping it forever (Codex review of #289).
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_pane = app
+        .handle_new_tab(None, None, None, None, None)
+        .expect("new tab succeeds");
+    app.peer_client_kinds
+        .insert(codex_pane, PeerClientKind::Codex);
+    assert!(app.switch_tab(0), "back to the sender tab");
+
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_pane),
+        "queued while hidden".to_string(),
+    )
+    .expect("peer send");
+    assert!(app.pending_codex_peer_messages.contains_key(&codex_pane));
+
+    // The human switches onto the Codex tab before any flush delivered
+    // the draft (its screen was never ready).
+    assert!(app.switch_tab(1), "activate the codex tab");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(
+        !app.pending_codex_peer_messages.contains_key(&codex_pane),
+        "promotion must consume the queued draft"
+    );
+    let notification = app
+        .visible_codex_peer_notification()
+        .expect("draft should surface as a visible notification");
+    assert_eq!(notification.target_pane, codex_pane);
+    app.shutdown();
+}
+
+#[test]
+fn flush_cancels_half_delivered_nudge_once_target_pane_is_watched() {
+    // Once the draft text has been typed into the composer (SubmitAt
+    // stage), activating the tab hands ownership to the human: the
+    // typed nudge is on screen for them to submit or edit, so the
+    // deferred Enter is cancelled rather than resumed later — a
+    // resumed submit could fire into content the user rewrote in the
+    // meantime (Codex review of #289).
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_pane = app
+        .handle_new_tab(None, None, None, None, None)
+        .expect("new tab succeeds");
+    app.peer_client_kinds
+        .insert(codex_pane, PeerClientKind::Codex);
+    {
+        let pane = app.workspaces[1]
+            .panes
+            .get_mut(&codex_pane)
+            .expect("codex pane");
+        let mut parser = pane.parser.lock().unwrap();
+        parser.process(b"\x1b[?25h\x1b[2J\x1b[Hready for input\n\nenter to send\r\n");
+    }
+    assert!(app.switch_tab(0), "back to the sender tab");
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(codex_pane),
+        "half delivered".to_string(),
+    )
+    .expect("peer send");
+    app.flush_pending_codex_peer_messages();
+    assert!(
+        matches!(
+            app.pending_codex_peer_messages
+                .get(&codex_pane)
+                .and_then(|q| q.front()),
+            Some(PendingCodexPeerDelivery::SubmitAt(_))
+        ),
+        "draft should have been typed into the background pane"
+    );
+    if let Some(queue) = app.pending_codex_peer_messages.get_mut(&codex_pane) {
+        queue[0] = PendingCodexPeerDelivery::SubmitAt(Instant::now());
+    }
+
+    assert!(app.switch_tab(1), "activate the codex tab mid-delivery");
+    app.flush_pending_codex_peer_messages();
+    assert!(
+        !app.pending_codex_peer_messages.contains_key(&codex_pane),
+        "watching the pane must cancel the deferred submit outright"
+    );
+    assert!(
+        app.visible_codex_peer_notification().is_none(),
+        "half-delivered nudge must not double-surface as a notification"
+    );
+
+    // Leaving again must not resurrect the submit — the composer may
+    // no longer hold our text.
+    assert!(app.switch_tab(0), "leave the codex tab again");
+    app.flush_pending_codex_peer_messages();
+    assert!(
+        !app.pending_codex_peer_messages.contains_key(&codex_pane),
+        "a cancelled submit stays cancelled after the pane is unwatched"
     );
     app.shutdown();
 }
 #[test]
 fn handle_peer_send_queues_codex_nudge_and_emits_peer_inbox() {
     let mut app = App::new(40, 80).expect("App::new");
-    let (_sub_id, rx) = app.event_bus.subscribe();
     let sender_id = app.ws().focused_pane_id;
     let sibling_id = app
         .handle_split(
@@ -220,12 +538,20 @@ fn handle_peer_send_queues_codex_nudge_and_emits_peer_inbox() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
-    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+    app.handle_focus(&ipc::PaneRef::Id(sender_id), None)
         .expect("refocus sender");
+    // #306: bound to the target pane. A Codex target is no exception —
+    // the nudge is an extra delivery path, not a replacement for the
+    // event, so this receiver must still see one.
+    let (_sub_id, rx) = app
+        .event_bus
+        .subscribe_scoped(ipc::EventScope::PaneInbox(sibling_id));
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(
@@ -262,7 +588,7 @@ fn handle_peer_send_queues_codex_nudge_and_emits_peer_inbox() {
         .expect("queued codex peer message");
     assert_eq!(queued.len(), 1);
     match &queued[0] {
-        PendingCodexPeerDelivery::Draft(msg) => {
+        PendingCodexPeerDelivery::Draft(msg, 1, _) => {
             assert_eq!(msg.from_pane, sender_id);
             assert_eq!(msg.from_name.as_deref(), None);
             assert_eq!(msg.from_kind, None);
@@ -284,11 +610,13 @@ fn handle_peer_send_coalesces_codex_nudges_per_pane() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
-    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+    app.handle_focus(&ipc::PaneRef::Id(sender_id), None)
         .expect("refocus sender");
 
     app.handle_peer_send(
@@ -399,7 +727,6 @@ fn forward_paste_to_pty_clears_codex_transcript_overlay_hint() {
 #[test]
 fn handle_peer_send_defers_codex_nudge_while_target_is_focused() {
     let mut app = App::new(40, 80).expect("App::new");
-    let (_sub_id, rx) = app.event_bus.subscribe();
     let sender_id = app.ws().focused_pane_id;
     let sibling_id = app
         .handle_split(
@@ -409,12 +736,19 @@ fn handle_peer_send_defers_codex_nudge_while_target_is_focused() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
-    app.handle_focus(&ipc::PaneRef::Id(sibling_id))
+    app.handle_focus(&ipc::PaneRef::Id(sibling_id), None)
         .expect("focus sibling");
+    // #306: bound to the target pane, the same one the deferred nudge
+    // is queued for.
+    let (_sub_id, rx) = app
+        .event_bus
+        .subscribe_scoped(ipc::EventScope::PaneInbox(sibling_id));
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(
@@ -459,7 +793,7 @@ fn handle_peer_send_defers_codex_nudge_while_target_is_focused() {
         "focused Codex target should stay notification-only while it remains focused"
     );
 
-    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+    app.handle_focus(&ipc::PaneRef::Id(sender_id), None)
         .expect("refocus sender");
     app.flush_pending_codex_peer_messages();
     assert!(
@@ -476,7 +810,7 @@ fn handle_peer_send_defers_codex_nudge_while_target_is_focused() {
     {
         let pane = app.ws_mut().panes.get_mut(&sibling_id).expect("pane");
         let mut parser = pane.parser.lock().unwrap();
-        parser.process(b"\x1b[?25h\x1b[2J\x1b[Hready for input\n\nenter to send");
+        parser.process(b"\x1b[?25h\x1b[2J\x1b[Hready for input\n\nenter to send\r\n");
     }
     app.flush_pending_codex_peer_messages();
     assert_eq!(
@@ -509,11 +843,13 @@ fn handle_peer_send_coalesces_focused_codex_notifications() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
-    app.handle_focus(&ipc::PaneRef::Id(sibling_id))
+    app.handle_focus(&ipc::PaneRef::Id(sibling_id), None)
         .expect("focus sibling");
 
     app.handle_peer_send(
@@ -555,11 +891,13 @@ fn focused_codex_notification_esc_dismisses_without_queueing_nudge() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
-    app.handle_focus(&ipc::PaneRef::Id(sibling_id))
+    app.handle_focus(&ipc::PaneRef::Id(sibling_id), None)
         .expect("focus sibling");
     app.handle_peer_send(
         sender_id,
@@ -580,6 +918,199 @@ fn focused_codex_notification_esc_dismisses_without_queueing_nudge() {
 }
 
 #[test]
+fn focused_codex_notification_typing_snoozes_until_focus_leaves() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(sibling_id, PeerClientKind::Codex);
+    app.handle_focus(&ipc::PaneRef::Id(sibling_id), None)
+        .expect("focus sibling");
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "hello focused codex".to_string(),
+    )
+    .expect("peer send");
+
+    // An ordinary keystroke hides the overlay and reaches the pane...
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+        .expect("type past notification");
+    assert!(app.visible_codex_peer_notification().is_none());
+    // ...but the request is parked, not lost, while the pane stays watched.
+    app.flush_pending_codex_peer_messages();
+    assert!(app.visible_codex_peer_notification().is_none());
+    assert!(!app.pending_codex_peer_messages.contains_key(&sibling_id));
+
+    // A newer message brings the overlay back with both counted.
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "second message".to_string(),
+    )
+    .expect("second peer send");
+    assert_eq!(
+        app.visible_codex_peer_notification()
+            .map(|n| n.pending_count),
+        Some(2)
+    );
+    app.snooze_codex_peer_notification();
+
+    // Leaving the pane hands the parked request to the deferred nudge.
+    app.handle_focus(&ipc::PaneRef::Id(sender_id), None)
+        .expect("refocus sender");
+    app.flush_pending_codex_peer_messages();
+    assert!(app.codex_peer_notification.is_none());
+    assert_eq!(
+        app.pending_codex_peer_messages
+            .get(&sibling_id)
+            .map(|q| q.len()),
+        Some(1),
+        "a snoozed notification must still nudge once focus leaves"
+    );
+    app.shutdown();
+}
+
+/// Split off a Codex-registered sibling, focus it, and send it one
+/// peer message so the focused-pane notification is up.
+fn focused_codex_sibling_with_notification(app: &mut App) -> (usize, usize) {
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(sibling_id, PeerClientKind::Codex);
+    app.handle_focus(&ipc::PaneRef::Id(sibling_id), None)
+        .expect("focus sibling");
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "hello focused codex".to_string(),
+    )
+    .expect("peer send");
+    (sender_id, sibling_id)
+}
+
+#[test]
+fn focused_codex_notification_nudges_when_focus_moves_to_file_tree() {
+    // Focus on the same tab's file tree / preview leaves
+    // `focused_pane_id` on the Codex pane, but the human cannot type
+    // into it, so the nudge must go out instead of waiting (#355 a).
+    let mut app = App::new(40, 80).expect("App::new");
+    let (_, sibling_id) = focused_codex_sibling_with_notification(&mut app);
+    {
+        let pane = app.ws_mut().panes.get_mut(&sibling_id).expect("sibling");
+        let mut parser = pane.parser.lock().unwrap();
+        parser.process(b"\x1b[?25h\x1b[2J\x1b[Hready for input\n\nenter to send\r\n");
+    }
+    app.ws_mut().focus_target = FocusTarget::FileTree;
+
+    app.flush_pending_codex_peer_messages();
+    assert!(app.codex_peer_notification.is_none());
+    assert!(
+        matches!(
+            app.pending_codex_peer_messages
+                .get(&sibling_id)
+                .and_then(|q| q.front()),
+            Some(PendingCodexPeerDelivery::SubmitAt(_))
+        ),
+        "the nudge must be typed while focus is on the file tree"
+    );
+    app.shutdown();
+}
+
+#[test]
+fn focused_codex_notification_keeps_pending_count_through_the_queue() {
+    // Leaving the pane parks the notification in the queue; coming
+    // back must restore the full count, not 1 (#355 b).
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, sibling_id) = focused_codex_sibling_with_notification(&mut app);
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "second message".to_string(),
+    )
+    .expect("second peer send");
+
+    app.handle_focus(&ipc::PaneRef::Id(sender_id), None)
+        .expect("refocus sender");
+    app.flush_pending_codex_peer_messages();
+    assert!(matches!(
+        app.pending_codex_peer_messages
+            .get(&sibling_id)
+            .and_then(|q| q.front()),
+        Some(PendingCodexPeerDelivery::Draft(_, 2, _))
+    ));
+    app.handle_peer_send(
+        sender_id,
+        &ipc::PaneRef::Id(sibling_id),
+        "third message".to_string(),
+    )
+    .expect("third peer send");
+
+    app.handle_focus(&ipc::PaneRef::Id(sibling_id), None)
+        .expect("focus sibling again");
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(
+        app.visible_codex_peer_notification()
+            .map(|n| n.pending_count),
+        Some(3)
+    );
+    app.shutdown();
+}
+
+#[test]
+fn focused_codex_notification_is_not_visible_when_too_small_to_draw() {
+    // Below the box's minimum size nothing is drawn, so Esc and
+    // Alt+Enter must reach the pane and the status bar carries the
+    // hint instead (#355 c).
+    let mut app = App::new(40, 80).expect("App::new");
+    app.last_term_size = (40, 40);
+    let (_, sibling_id) = focused_codex_sibling_with_notification(&mut app);
+    assert!(app.visible_codex_peer_notification().is_none());
+    assert_eq!(app.codex_peer_notification_needs_hint(), Some(1));
+
+    app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc reaches the pane");
+    // Still parked while the pane is watched, not dismissed or queued.
+    app.flush_pending_codex_peer_messages();
+    assert!(app.codex_peer_notification.is_some());
+    assert!(!app.pending_codex_peer_messages.contains_key(&sibling_id));
+
+    // Too short for the UI at all: still not visible.
+    app.last_term_size = (80, 8);
+    assert!(app.visible_codex_peer_notification().is_none());
+    app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc reaches the pane");
+    assert!(app.codex_peer_notification.is_some());
+
+    app.last_term_size = (80, 40);
+    assert!(app.visible_codex_peer_notification().is_some());
+    assert_eq!(app.codex_peer_notification_needs_hint(), None);
+    app.shutdown();
+}
+
+#[test]
 fn focused_codex_notification_commit_clears_notification() {
     let mut app = App::new(40, 80).expect("App::new");
     let sender_id = app.ws().focused_pane_id;
@@ -591,11 +1122,13 @@ fn focused_codex_notification_commit_clears_notification() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
-    app.handle_focus(&ipc::PaneRef::Id(sibling_id))
+    app.handle_focus(&ipc::PaneRef::Id(sibling_id), None)
         .expect("focus sibling");
     app.handle_peer_send(
         sender_id,
@@ -627,11 +1160,13 @@ fn flush_pending_codex_peer_messages_requires_ready_screen() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
-    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+    app.handle_focus(&ipc::PaneRef::Id(sender_id), None)
         .expect("refocus sender");
     {
         let pane = app.ws_mut().panes.get_mut(&sibling_id).expect("pane");
@@ -657,7 +1192,7 @@ fn flush_pending_codex_peer_messages_requires_ready_screen() {
     {
         let pane = app.ws_mut().panes.get_mut(&sibling_id).expect("pane");
         let mut parser = pane.parser.lock().unwrap();
-        parser.process(b"\x1b[?25h\x1b[2J\x1b[Hready for input\n\nenter to send");
+        parser.process(b"\x1b[?25h\x1b[2J\x1b[Hready for input\n\nenter to send\r\n");
     }
     app.flush_pending_codex_peer_messages();
     assert_eq!(
@@ -690,11 +1225,13 @@ fn flush_pending_codex_peer_messages_waits_for_non_blank_codex_screen() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
-    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+    app.handle_focus(&ipc::PaneRef::Id(sender_id), None)
         .expect("refocus sender");
     app.handle_peer_send(
         sender_id,
@@ -775,11 +1312,13 @@ fn flush_pending_codex_peer_messages_does_not_interrupt_existing_codex_draft() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("split succeeds");
     app.peer_client_kinds
         .insert(sibling_id, PeerClientKind::Codex);
-    app.handle_focus(&ipc::PaneRef::Id(sender_id))
+    app.handle_focus(&ipc::PaneRef::Id(sender_id), None)
         .expect("refocus sender");
     app.handle_peer_send(
         sender_id,
@@ -840,6 +1379,8 @@ fn handle_peer_list_excludes_caller_and_lists_siblings() {
             Some("sibling".into()),
             Some("worker".into()),
             None,
+            None,
+            None,
         )
         .expect("split succeeds");
     let peers = app.handle_peer_list(sender_id).expect("peer list");
@@ -847,11 +1388,105 @@ fn handle_peer_list_excludes_caller_and_lists_siblings() {
     assert_eq!(peers[0].id, sibling_id);
     assert_eq!(peers[0].name.as_deref(), Some("sibling"));
     assert_eq!(peers[0].role.as_deref(), Some("worker"));
+    assert_eq!(peers[0].tab, Some(0));
+    assert_eq!(peers[0].same_tab, Some(true));
     // Caller must be excluded.
     assert!(
         peers.iter().all(|p| p.id != sender_id),
         "peer list must not include the caller"
     );
+    app.shutdown();
+}
+
+#[test]
+fn handle_peer_list_spans_all_tabs_with_caller_tab_first() {
+    // Issue #289: list_peers enumerates every workspace, still
+    // excluding only the caller. The caller's own tab leads so
+    // same-tab siblings (addressable by bare name) stay on top, and
+    // every entry carries tab metadata plus the same_tab flag.
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let sibling_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    let other_tab_pane = app
+        .handle_new_tab(None, None, None, Some("scout".into()), None)
+        .expect("new tab succeeds");
+    // The new tab is now active — listing from the tab-0 sender must
+    // still put the sender's own (background) tab first.
+    assert_eq!(app.active_tab, 1);
+
+    let peers = app.handle_peer_list(sender_id).expect("peer list");
+    let ids: Vec<usize> = peers.iter().map(|p| p.id).collect();
+    assert_eq!(
+        ids,
+        vec![sibling_id, other_tab_pane],
+        "caller's tab first, then remaining tabs in index order"
+    );
+    assert!(
+        peers.iter().all(|p| p.id != sender_id),
+        "peer list must not include the caller"
+    );
+
+    let sibling = &peers[0];
+    assert_eq!(sibling.tab, Some(0));
+    assert_eq!(sibling.same_tab, Some(true));
+    assert!(sibling.tab_name.is_some(), "tab label should be surfaced");
+
+    let other = &peers[1];
+    assert_eq!(other.tab, Some(1));
+    assert_eq!(other.same_tab, Some(false));
+    assert_eq!(other.role.as_deref(), Some("scout"));
+    app.shutdown();
+}
+
+#[test]
+fn handle_peer_list_reorders_middle_tab_caller_ahead_of_lower_tabs() {
+    // With the caller in tab 0 the caller-first order is
+    // indistinguishable from plain index order, so pin the reorder
+    // from a MIDDLE tab: the caller's tab-1 sibling must outrank the
+    // tab-0 pane even though tab 0 comes first by index.
+    let mut app = App::new(40, 80).expect("App::new");
+    let tab0_pane = app.ws().focused_pane_id;
+    let caller_id = app
+        .handle_new_tab(None, None, None, None, None)
+        .expect("second tab");
+    assert_eq!(app.active_tab, 1);
+    let caller_sibling = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split caller tab");
+    let tab2_pane = app
+        .handle_new_tab(None, None, None, None, None)
+        .expect("third tab");
+
+    let peers = app.handle_peer_list(caller_id).expect("peer list");
+    let ids: Vec<usize> = peers.iter().map(|p| p.id).collect();
+    assert_eq!(
+        ids,
+        vec![caller_sibling, tab0_pane, tab2_pane],
+        "caller's own tab leads even when a lower-indexed tab exists"
+    );
+    assert_eq!(peers[0].same_tab, Some(true));
+    assert_eq!(peers[1].tab, Some(0));
+    assert_eq!(peers[2].tab, Some(2));
     app.shutdown();
 }
 
@@ -863,7 +1498,6 @@ fn handle_peer_send_dedupes_identical_payload_within_window() {
     // worker can paper the receiver's transcript with phantom
     // Human: turns.
     let mut app = App::new(40, 80).expect("App::new");
-    let (_sub_id, rx) = app.event_bus.subscribe();
     let sender_id = app.ws().focused_pane_id;
     let sibling_id = app
         .handle_split(
@@ -873,8 +1507,15 @@ fn handle_peer_send_dedupes_identical_payload_within_window() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("split succeeds");
+    // #306: bound to the target pane, so the "how many arrived" count
+    // is read off a receiver that can hold nothing else.
+    let (_sub_id, rx) = app
+        .event_bus
+        .subscribe_scoped(ipc::EventScope::PaneInbox(sibling_id));
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(sender_id, &ipc::PaneRef::Id(sibling_id), "ack".to_string())
@@ -903,7 +1544,6 @@ fn handle_peer_send_distinct_bodies_are_not_deduped() {
     // "every reply gets the same prefix" pattern would silently
     // swallow follow-ups.
     let mut app = App::new(40, 80).expect("App::new");
-    let (_sub_id, rx) = app.event_bus.subscribe();
     let sender_id = app.ws().focused_pane_id;
     let sibling_id = app
         .handle_split(
@@ -913,8 +1553,14 @@ fn handle_peer_send_distinct_bodies_are_not_deduped() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("split succeeds");
+    // #306: bound to the target pane.
+    let (_sub_id, rx) = app
+        .event_bus
+        .subscribe_scoped(ipc::EventScope::PaneInbox(sibling_id));
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(
@@ -946,12 +1592,13 @@ fn handle_peer_send_dedupe_does_not_collapse_distinct_senders() {
     // sending the same text must both deliver, since they really
     // are independent messages in the human sense.
     let mut app = App::new(40, 80).expect("App::new");
-    let (_sub_id, rx) = app.event_bus.subscribe();
     let sender_a = app.ws().focused_pane_id;
     let sender_b = app
         .handle_split(
             &ipc::PaneRef::Focused,
             ipc::Direction::Vertical,
+            None,
+            None,
             None,
             None,
             None,
@@ -966,8 +1613,16 @@ fn handle_peer_send_dedupe_does_not_collapse_distinct_senders() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("split succeeds (target)");
+    // #306: both sends address the same pane, so one bound receiver
+    // sees both deliveries — which is exactly the fan-in this test is
+    // about.
+    let (_sub_id, rx) = app
+        .event_bus
+        .subscribe_scoped(ipc::EventScope::PaneInbox(target));
     while rx.try_recv().is_ok() {}
 
     app.handle_peer_send(sender_a, &ipc::PaneRef::Id(target), "ping".to_string())
@@ -985,5 +1640,675 @@ fn handle_peer_send_dedupe_does_not_collapse_distinct_senders() {
         count, 2,
         "same body from distinct senders must not collapse into one delivery"
     );
+    app.shutdown();
+}
+
+/// Real Codex screens captured from a PTY (`.vt` files are the vt100
+/// `state_formatted()` of the live byte stream), one directory per
+/// Codex version. A change to the readiness classification of any of
+/// them fails here (#354). To add a version, capture the same states
+/// and add its rows.
+const CODEX_SCREEN_FIXTURES: &[(&str, &[u8], u16, u16, bool)] = &[
+    (
+        "v0.153.4/idle",
+        include_bytes!("fixtures/codex/v0.153.4/idle_100x30.vt"),
+        30,
+        100,
+        true,
+    ),
+    (
+        "v0.153.4/idle_after_turn",
+        include_bytes!("fixtures/codex/v0.153.4/idle_after_turn_100x30.vt"),
+        30,
+        100,
+        true,
+    ),
+    (
+        "v0.153.4/idle_tall",
+        include_bytes!("fixtures/codex/v0.153.4/idle_tall_120x60.vt"),
+        60,
+        120,
+        true,
+    ),
+    (
+        "v0.153.4/draft",
+        include_bytes!("fixtures/codex/v0.153.4/draft_100x30.vt"),
+        30,
+        100,
+        false,
+    ),
+    (
+        "v0.153.4/draft_after_turn",
+        include_bytes!("fixtures/codex/v0.153.4/draft_after_turn_120x60.vt"),
+        60,
+        120,
+        false,
+    ),
+    (
+        "v0.153.4/busy",
+        include_bytes!("fixtures/codex/v0.153.4/busy_100x30.vt"),
+        30,
+        100,
+        false,
+    ),
+    (
+        "v0.153.4/busy_queued_draft",
+        include_bytes!("fixtures/codex/v0.153.4/busy_queued_draft_120x60.vt"),
+        60,
+        120,
+        false,
+    ),
+    (
+        "v0.153.4/approval_menu",
+        include_bytes!("fixtures/codex/v0.153.4/approval_menu_120x60.vt"),
+        60,
+        120,
+        false,
+    ),
+    (
+        "v0.153.4/model_menu",
+        include_bytes!("fixtures/codex/v0.153.4/model_menu_100x30.vt"),
+        30,
+        100,
+        false,
+    ),
+    (
+        "v0.153.4/update_dialog",
+        include_bytes!("fixtures/codex/v0.153.4/update_dialog_120x60.vt"),
+        60,
+        120,
+        false,
+    ),
+];
+
+#[test]
+fn codex_peer_screen_ready_matches_captured_codex_screens() {
+    let mismatches: Vec<_> = CODEX_SCREEN_FIXTURES
+        .iter()
+        .filter_map(|&(name, bytes, rows, cols, expected)| {
+            let mut parser = vt100::Parser::new(rows, cols, 0);
+            parser.process(bytes);
+            let actual = codex_peer_screen_ready(parser.screen());
+            (actual != expected).then(|| format!("{name}: expected {expected}, got {actual}"))
+        })
+        .collect();
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+#[test]
+fn codex_peer_screen_ready_fallback_requires_an_empty_composer() {
+    let ready = |bytes: &[u8]| {
+        let mut parser = vt100::Parser::new(8, 40, 0);
+        parser.process(bytes);
+        codex_peer_screen_ready(parser.screen())
+    };
+    // Banner plus a blank caret row (optionally behind a glyph): ready.
+    assert!(ready(b"\x1b[2J\x1b[Hready for input\r\n"));
+    assert!(ready(b"\x1b[2J\x1b[Henter to send\r\n> "));
+    // The caret row carries the human's draft: never append to it.
+    assert!(!ready(b"\x1b[2J\x1b[Henter to send\r\n> half a thought"));
+    // Caret moved home inside a draft.
+    assert!(!ready(
+        b"\x1b[2J\x1b[Henter to send\r\n> half a thought\x1b[2;1H"
+    ));
+    // Hidden caret: some widget owns input.
+    assert!(!ready(b"\x1b[2J\x1b[Hready for input\r\n\x1b[?25l"));
+}
+
+#[test]
+fn stalled_codex_nudge_emits_once_and_badges_until_drained() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_pane = app
+        .handle_new_tab(None, None, None, None, None)
+        .expect("new tab succeeds");
+    app.peer_client_kinds
+        .insert(codex_pane, PeerClientKind::Codex);
+    assert!(app.switch_tab(0), "Codex tab goes to the background");
+    // A screen the heuristic does not recognize as ready.
+    app.workspaces[1].panes.get_mut(&codex_pane).unwrap().parser =
+        std::sync::Arc::new(std::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+    app.workspaces[1].panes[&codex_pane]
+        .parser
+        .lock()
+        .unwrap()
+        .process(b"\x1b[2J\x1b[Hsomething new from Codex");
+    let (_sub, rx) = app.event_bus.subscribe();
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_pane), "ping".into())
+        .expect("peer send");
+    let stalled = |rx: &std::sync::mpsc::Receiver<ipc::Event>| {
+        rx.try_iter()
+            .filter(|e| matches!(e, ipc::Event::PeerNudgeStalled { .. }))
+            .collect::<Vec<_>>()
+    };
+
+    app.flush_pending_codex_peer_messages();
+    assert!(stalled(&rx).is_empty(), "a fresh draft is not stalled");
+    assert!(!app.workspaces[1].panes[&codex_pane].peer_nudge_stalled);
+
+    // Age the queued draft past the timeout.
+    match app
+        .pending_codex_peer_messages
+        .get_mut(&codex_pane)
+        .unwrap()
+        .front_mut()
+    {
+        Some(PendingCodexPeerDelivery::Draft(_, _, queued_at)) => {
+            *queued_at = Instant::now()
+                .checked_sub(CODEX_PEER_NUDGE_STALL_TIMEOUT + Duration::from_secs(1))
+                .expect("monotonic clock is past the stall timeout");
+        }
+        other => panic!("expected a queued draft, got {other:?}"),
+    }
+    app.flush_pending_codex_peer_messages();
+    let evs = stalled(&rx);
+    assert!(
+        matches!(&evs[..], [ipc::Event::PeerNudgeStalled { id, queued_ms, .. }]
+            if *id == codex_pane && *queued_ms >= 31_000),
+        "{evs:?}"
+    );
+    assert!(app.workspaces[1].panes[&codex_pane].peer_nudge_stalled);
+
+    // Still stuck: no repeat.
+    app.flush_pending_codex_peer_messages();
+    assert!(stalled(&rx).is_empty());
+
+    // A focus round trip hands the nudge to the overlay and back; the
+    // stall carries across both handoffs instead of clearing and
+    // re-firing.
+    assert!(app.switch_tab(1), "focus the Codex pane");
+    app.flush_pending_codex_peer_messages();
+    assert!(
+        app.codex_peer_notification
+            .as_ref()
+            .is_some_and(|n| n.target_pane == codex_pane),
+        "draft promoted to the overlay"
+    );
+    app.flush_pending_codex_peer_messages();
+    assert!(app.workspaces[1].panes[&codex_pane].peer_nudge_stalled);
+    assert!(app.switch_tab(0), "leave the Codex pane");
+    app.flush_pending_codex_peer_messages();
+    assert!(app.pending_codex_peer_messages.contains_key(&codex_pane));
+    assert!(app.workspaces[1].panes[&codex_pane].peer_nudge_stalled);
+    assert!(stalled(&rx).is_empty(), "no re-fire across the round trip");
+
+    // Draining the queue clears the badge.
+    app.pending_codex_peer_messages.remove(&codex_pane);
+    app.flush_pending_codex_peer_messages();
+    assert!(!app.workspaces[1].panes[&codex_pane].peer_nudge_stalled);
+    app.shutdown();
+}
+
+#[test]
+fn stall_clock_does_not_run_while_codex_is_busy() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_pane = app
+        .handle_new_tab(None, None, None, None, None)
+        .expect("new tab succeeds");
+    app.peer_client_kinds
+        .insert(codex_pane, PeerClientKind::Codex);
+    assert!(app.switch_tab(0), "Codex tab goes to the background");
+    let parser = std::sync::Arc::new(std::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+    app.workspaces[1].panes.get_mut(&codex_pane).unwrap().parser = parser.clone();
+    parser
+        .lock()
+        .unwrap()
+        .process("\x1b[2J\x1b[H\u{2022} Working (40s \u{2022} esc to interrupt)\r\n".as_bytes());
+    let (_sub, rx) = app.event_bus.subscribe();
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_pane), "ping".into())
+        .expect("peer send");
+    let age_draft = |app: &mut App| match app
+        .pending_codex_peer_messages
+        .get_mut(&codex_pane)
+        .unwrap()
+        .front_mut()
+    {
+        Some(PendingCodexPeerDelivery::Draft(_, _, queued_at)) => {
+            *queued_at = Instant::now()
+                .checked_sub(CODEX_PEER_NUDGE_STALL_TIMEOUT + Duration::from_secs(1))
+                .expect("monotonic clock is past the stall timeout");
+        }
+        other => panic!("expected a queued draft, got {other:?}"),
+    };
+    let stalled = |rx: &std::sync::mpsc::Receiver<ipc::Event>| {
+        rx.try_iter()
+            .filter(|e| matches!(e, ipc::Event::PeerNudgeStalled { .. }))
+            .count()
+    };
+
+    // Busy for longer than the timeout: no stall, and the clock is held.
+    age_draft(&mut app);
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(stalled(&rx), 0, "a busy Codex is not stalled");
+    assert!(!app.workspaces[1].panes[&codex_pane].peer_nudge_stalled);
+    match app.pending_codex_peer_messages[&codex_pane].front() {
+        Some(PendingCodexPeerDelivery::Draft(_, _, queued_at)) => {
+            assert!(
+                queued_at.elapsed() < Duration::from_secs(5),
+                "clock held at now"
+            );
+        }
+        other => panic!("expected a queued draft, got {other:?}"),
+    }
+
+    // Turn over but the screen still isn't recognized: counts again.
+    parser
+        .lock()
+        .unwrap()
+        .process(b"\x1b[2J\x1b[Hsomething new from Codex");
+    age_draft(&mut app);
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(stalled(&rx), 1, "stalls once 30 s pass after busy ends");
+    assert!(app.workspaces[1].panes[&codex_pane].peer_nudge_stalled);
+    app.shutdown();
+}
+
+/// Unfocused Codex sibling of the focused sender, with its MCP inbox
+/// subscribed (keep the receiver alive). Returns `(sender, codex, inbox)`.
+fn codex_sibling_unfocused(app: &mut App) -> (usize, usize, std::sync::mpsc::Receiver<ipc::Event>) {
+    let sender_id = app.ws().focused_pane_id;
+    let codex_id = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("split succeeds");
+    app.peer_client_kinds
+        .insert(codex_id, PeerClientKind::Codex);
+    app.handle_focus(&ipc::PaneRef::Id(sender_id), None)
+        .expect("refocus sender");
+    let (_sub, inbox) = app
+        .event_bus
+        .subscribe_scoped(ipc::EventScope::PaneInbox(codex_id));
+    (sender_id, codex_id, inbox)
+}
+
+fn listed_unread(app: &App, from: usize, pane: usize) -> Option<usize> {
+    app.handle_peer_list(from)
+        .expect("peer list")
+        .into_iter()
+        .find(|p| p.id == pane)
+        .expect("pane listed")
+        .unread
+}
+
+#[test]
+fn check_messages_drain_clears_pending_nudge_and_emits_peer_inbox_drained() {
+    // Issue #353: send, then drain, then event.
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, _inbox) = codex_sibling_unfocused(&mut app);
+    let (_sub, rx) = app.event_bus.subscribe();
+
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "do x".into())
+        .expect("peer send");
+    assert!(app.pending_codex_peer_messages.contains_key(&codex_id));
+    assert_eq!(listed_unread(&app, sender_id, codex_id), Some(1));
+    // Push-mode (Claude / unregistered) peers have no inbox to count.
+    assert_eq!(listed_unread(&app, codex_id, sender_id), None);
+
+    app.handle_peer_inbox_drained(codex_id, 1, &[])
+        .expect("drain");
+
+    assert!(
+        !app.pending_codex_peer_messages.contains_key(&codex_id),
+        "a drained inbox must not be nudged afterwards"
+    );
+    assert_eq!(listed_unread(&app, sender_id, codex_id), Some(0));
+    let drained = rx
+        .try_iter()
+        .find(|e| matches!(e, ipc::Event::PeerInboxDrained { .. }))
+        .expect("peer_inbox_drained emitted");
+    assert!(matches!(
+        drained,
+        ipc::Event::PeerInboxDrained { pane, count: 1, .. } if pane == codex_id
+    ));
+    app.shutdown();
+}
+
+#[test]
+fn partial_drain_keeps_the_nudge_for_a_message_sent_after_it() {
+    // The second send can land between the MCP drain and its report;
+    // that message is still unread and must keep its nudge.
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, _inbox) = codex_sibling_unfocused(&mut app);
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "one".into())
+        .expect("send one");
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "two".into())
+        .expect("send two");
+
+    app.handle_peer_inbox_drained(codex_id, 1, &[])
+        .expect("drain");
+
+    assert!(app.pending_codex_peer_messages.contains_key(&codex_id));
+    assert_eq!(listed_unread(&app, sender_id, codex_id), Some(1));
+    app.shutdown();
+}
+
+#[test]
+fn a_drain_reported_by_two_subscribers_keeps_the_nudge_of_an_undrained_message() {
+    // Issue #369: two MCP subprocesses bound to one pane both receive
+    // "one" and both report draining it. That must clear it once, not
+    // also count away "two", which neither has drained.
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, first) = codex_sibling_unfocused(&mut app);
+    let (_sub, second) = app
+        .event_bus
+        .subscribe_scoped(ipc::EventScope::PaneInbox(codex_id));
+    let msg_ids = |rx: &std::sync::mpsc::Receiver<ipc::Event>| -> Vec<u64> {
+        rx.try_iter()
+            .filter_map(|e| match e {
+                ipc::Event::PeerInbox { msg_id, .. } => msg_id,
+                _ => None,
+            })
+            .collect()
+    };
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "one".into())
+        .expect("send one");
+    let one = msg_ids(&first);
+    assert_eq!(msg_ids(&second), one, "both inboxes get the same message");
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "two".into())
+        .expect("send two");
+
+    app.handle_peer_inbox_drained(codex_id, 1, &one)
+        .expect("first drain");
+    app.handle_peer_inbox_drained(codex_id, 1, &one)
+        .expect("second drain");
+
+    assert!(app.pending_codex_peer_messages.contains_key(&codex_id));
+    assert_eq!(listed_unread(&app, sender_id, codex_id), Some(1));
+    app.shutdown();
+}
+
+#[test]
+fn drain_clears_focused_codex_notification_and_reregister_resets_unread() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, _inbox) = codex_sibling_unfocused(&mut app);
+    app.handle_focus(&ipc::PaneRef::Id(codex_id), None)
+        .expect("focus codex");
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "hi".into())
+        .expect("send");
+    assert!(app.codex_peer_notification.is_some());
+
+    app.handle_peer_inbox_drained(codex_id, 1, &[])
+        .expect("drain");
+    assert!(app.codex_peer_notification.is_none());
+
+    // A restarted MCP subprocess starts with an empty inbox.
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "lost".into())
+        .expect("send");
+    app.handle_peer_register_client(codex_id, PeerClientKind::Codex)
+        .expect("re-register");
+    assert_eq!(listed_unread(&app, sender_id, codex_id), Some(0));
+
+    assert!(app.handle_peer_inbox_drained(9999, 1, &[]).is_err());
+    app.shutdown();
+}
+
+#[test]
+fn drain_keeps_an_already_typed_nudge_and_dedupe_does_not_count() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, _inbox) = codex_sibling_unfocused(&mut app);
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "x".into())
+        .expect("send");
+    // The identical re-send is deduped: no PeerInbox, so no unread.
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "x".into())
+        .expect("dup send");
+    assert_eq!(listed_unread(&app, sender_id, codex_id), Some(1));
+    // The nudge text is already in the composer; only its Enter is due.
+    app.pending_codex_peer_messages.insert(
+        codex_id,
+        [PendingCodexPeerDelivery::SubmitAt(Instant::now())].into(),
+    );
+
+    app.handle_peer_inbox_drained(codex_id, 1, &[])
+        .expect("drain");
+
+    assert!(
+        matches!(
+            app.pending_codex_peer_messages
+                .get(&codex_id)
+                .and_then(|q| q.front()),
+            Some(PendingCodexPeerDelivery::SubmitAt(_))
+        ),
+        "dropping it would strand the half-written draft"
+    );
+    app.shutdown();
+}
+
+#[test]
+fn drain_clears_a_stalled_nudge_badge() {
+    // #354 x #353: the worker drained on its own, so the stuck nudge is
+    // moot and its badge must go on the next flush.
+    let mut app = App::new(40, 80).expect("App::new");
+    let sender_id = app.ws().focused_pane_id;
+    let codex_pane = app
+        .handle_new_tab(None, None, None, None, None)
+        .expect("new tab succeeds");
+    app.peer_client_kinds
+        .insert(codex_pane, PeerClientKind::Codex);
+    assert!(app.switch_tab(0), "Codex tab goes to the background");
+    app.workspaces[1].panes[&codex_pane]
+        .parser
+        .lock()
+        .unwrap()
+        .process(b"\x1b[2J\x1b[Hsomething new from Codex");
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_pane), "ping".into())
+        .expect("peer send");
+    match app
+        .pending_codex_peer_messages
+        .get_mut(&codex_pane)
+        .and_then(|q| q.front_mut())
+    {
+        Some(PendingCodexPeerDelivery::Draft(_, _, queued_at)) => {
+            *queued_at = Instant::now()
+                .checked_sub(CODEX_PEER_NUDGE_STALL_TIMEOUT + Duration::from_secs(1))
+                .expect("monotonic clock is past the stall timeout");
+        }
+        other => panic!("expected a queued draft, got {other:?}"),
+    }
+    app.flush_pending_codex_peer_messages();
+    assert!(app.workspaces[1].panes[&codex_pane].peer_nudge_stalled);
+
+    app.handle_peer_inbox_drained(codex_pane, 1, &[])
+        .expect("drain");
+    app.flush_pending_codex_peer_messages();
+
+    assert!(!app.pending_codex_peer_messages.contains_key(&codex_pane));
+    assert!(!app.workspaces[1].panes[&codex_pane].peer_nudge_stalled);
+    app.shutdown();
+}
+
+#[test]
+fn a_send_that_never_reached_an_inbox_is_not_unread() {
+    // Before the pane's MCP subprocess subscribes (or after it died),
+    // nothing can ever drain the message, so it must not be counted.
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, inbox) = codex_sibling_unfocused(&mut app);
+    drop(inbox);
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "early".into())
+        .expect("send");
+    assert_eq!(listed_unread(&app, sender_id, codex_id), Some(0));
+    // The nudge still goes out; only the unread accounting skips it.
+    assert!(app.pending_codex_peer_messages.contains_key(&codex_id));
+    app.shutdown();
+}
+
+fn listed_delivery(app: &App, pane: usize) -> Option<ipc::PeerDeliveryStatus> {
+    app.pane_infos_for_workspace(0, None)
+        .into_iter()
+        .find(|p| p.id == pane)
+        .expect("pane listed")
+        .peer_delivery
+}
+
+fn nudge_events(rx: &std::sync::mpsc::Receiver<ipc::Event>) -> Vec<&'static str> {
+    rx.try_iter()
+        .filter_map(|e| match e {
+            ipc::Event::PeerNudgeQueued { .. } => Some("queued"),
+            ipc::Event::PeerNudgeSubmitted { .. } => Some("submitted"),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn peer_delivery_tracks_queued_nudged_and_drained() {
+    // Issue #352: queued -> (typed, still queued) -> submitted/nudged -> drained.
+    use ipc::PeerDeliveryState::{Nudged, Queued};
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, _inbox) = codex_sibling_unfocused(&mut app);
+    let (_sub, rx) = app.event_bus.subscribe();
+    app.ws_mut().panes[&codex_id]
+        .parser
+        .lock()
+        .unwrap()
+        .process(b"\x1b[?25lworking");
+    for body in ["one", "two"] {
+        app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), body.into())
+            .expect("send");
+    }
+    app.flush_pending_codex_peer_messages();
+    let queued = listed_delivery(&app, codex_id).expect("queued");
+    assert_eq!((queued.state, queued.pending), (Queued, 2));
+    assert_eq!(nudge_events(&rx), ["queued"]);
+
+    // Ready: the nudge is typed but its Enter is still owed.
+    app.ws_mut().panes[&codex_id]
+        .parser
+        .lock()
+        .unwrap()
+        .process(b"\x1b[?25h\x1b[2J\x1b[Hready for input\n\nenter to send\r\n");
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(listed_delivery(&app, codex_id), Some(queued));
+    assert!(nudge_events(&rx).is_empty(), "same queued spell, no repeat");
+
+    app.pending_codex_peer_messages.get_mut(&codex_id).unwrap()[0] =
+        PendingCodexPeerDelivery::SubmitAt(Instant::now());
+    app.flush_pending_codex_peer_messages();
+    let nudged = listed_delivery(&app, codex_id).expect("nudged");
+    assert_eq!((nudged.state, nudged.pending), (Nudged, 2));
+    assert_eq!(nudge_events(&rx), ["submitted"]);
+    assert_eq!(app.ws().panes[&codex_id].peer_delivery, Some(nudged));
+
+    app.handle_peer_inbox_drained(codex_id, 1, &[])
+        .expect("partial drain");
+    app.flush_pending_codex_peer_messages();
+    let left = listed_delivery(&app, codex_id).expect("one left");
+    assert_eq!((left.state, left.pending), (Nudged, 1));
+    assert_eq!(left.since_ms, nudged.since_ms, "same state keeps its clock");
+
+    app.handle_peer_inbox_drained(codex_id, 1, &[])
+        .expect("drain");
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(listed_delivery(&app, codex_id), None);
+    app.shutdown();
+}
+
+#[test]
+fn peer_delivery_overlay_accept_counts_as_submitted() {
+    use ipc::PeerDeliveryState::{Nudged, Queued};
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, _inbox) = codex_sibling_unfocused(&mut app);
+    app.handle_focus(&ipc::PaneRef::Id(codex_id), None)
+        .expect("focus codex");
+    let (_sub, rx) = app.event_bus.subscribe();
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "hi".into())
+        .expect("send");
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(
+        listed_delivery(&app, codex_id).map(|d| d.state),
+        Some(Queued)
+    );
+
+    assert!(app.accept_codex_peer_notification().expect("accept"));
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(
+        listed_delivery(&app, codex_id).map(|d| d.state),
+        Some(Nudged)
+    );
+    assert_eq!(nudge_events(&rx), ["queued", "submitted"]);
+    app.shutdown();
+}
+
+#[test]
+fn peer_delivery_owes_nothing_for_an_enter_after_a_full_drain() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, _inbox) = codex_sibling_unfocused(&mut app);
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "x".into())
+        .expect("send");
+    app.pending_codex_peer_messages.insert(
+        codex_id,
+        [PendingCodexPeerDelivery::SubmitAt(
+            Instant::now() + Duration::from_secs(60),
+        )]
+        .into(),
+    );
+    app.handle_peer_inbox_drained(codex_id, 1, &[])
+        .expect("drain");
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(listed_delivery(&app, codex_id), None);
+    let (_sub, rx) = app.event_bus.subscribe();
+    app.pending_codex_peer_messages.get_mut(&codex_id).unwrap()[0] =
+        PendingCodexPeerDelivery::SubmitAt(Instant::now());
+    app.flush_pending_codex_peer_messages();
+    assert!(
+        nudge_events(&rx).is_empty(),
+        "no orphan peer_nudge_submitted"
+    );
+    app.shutdown();
+}
+
+#[test]
+fn peer_delivery_dismissed_overlay_is_not_nudged() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, _inbox) = codex_sibling_unfocused(&mut app);
+    app.handle_focus(&ipc::PaneRef::Id(codex_id), None)
+        .expect("focus codex");
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "hi".into())
+        .expect("send");
+    app.flush_pending_codex_peer_messages();
+    assert!(listed_delivery(&app, codex_id).is_some());
+
+    app.dismiss_codex_peer_notification();
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(listed_delivery(&app, codex_id), None);
+    assert_eq!(listed_unread(&app, sender_id, codex_id), Some(1));
+    app.shutdown();
+}
+
+#[test]
+fn peer_delivery_typed_nudge_handed_to_a_watching_human_is_submitted() {
+    let mut app = App::new(40, 80).expect("App::new");
+    let (sender_id, codex_id, _inbox) = codex_sibling_unfocused(&mut app);
+    let (_sub, rx) = app.event_bus.subscribe();
+    app.handle_peer_send(sender_id, &ipc::PaneRef::Id(codex_id), "x".into())
+        .expect("send");
+    // Listed right away, not one frame later.
+    assert_eq!(
+        listed_delivery(&app, codex_id).map(|d| d.state),
+        Some(ipc::PeerDeliveryState::Queued)
+    );
+    app.pending_codex_peer_messages.insert(
+        codex_id,
+        [PendingCodexPeerDelivery::SubmitAt(
+            Instant::now() + Duration::from_secs(60),
+        )]
+        .into(),
+    );
+    app.handle_focus(&ipc::PaneRef::Id(codex_id), None)
+        .expect("focus codex");
+    app.flush_pending_codex_peer_messages();
+    assert_eq!(
+        listed_delivery(&app, codex_id).map(|d| d.state),
+        Some(ipc::PeerDeliveryState::Nudged)
+    );
+    assert_eq!(nudge_events(&rx), ["queued", "submitted"]);
     app.shutdown();
 }

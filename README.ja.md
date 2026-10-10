@@ -131,7 +131,7 @@ Claude のペインにフォーカスした状態で `Ctrl+;` を押すと、画
 
 ## キーバインド チートシート
 
-最初に覚えるキーだけを置いています。フル表 (ペイン / ファイルツリー / プレビュー / マウス) と macOS Option-as-Meta 設定は [`docs/keymap.ja.md`](./docs/keymap.ja.md) を参照。
+最初に覚えるキーだけを置いています。フル表 (ペイン / ファイルツリー / プレビュー / org サイドバー / マウス) と macOS Option-as-Meta 設定は [`docs/keymap.ja.md`](./docs/keymap.ja.md) を参照。
 
 | キー | 動作 |
 |-----|--------|
@@ -142,6 +142,7 @@ Claude のペインにフォーカスした状態で `Ctrl+;` を押すと、画
 | `Alt+T` / `Alt+1..9` | 新しいタブ / 番号 N のタブへ移動 |
 | `Alt+P` | フォーカス中のペインに peer 対応 `claude …` 起動コマンドを入力 |
 | `Ctrl+F` | ファイルツリー表示切替 |
+| `Ctrl+B` | org サイドバー表示切替 — 全タブ / 全ペイン / Claude 稼働状態を 1 枚で表示 |
 | `Ctrl+;` | IME 合成 overlay を開く (`Alt+;` / `Alt+I` がフォールバック) |
 | `Ctrl+Q` | 終了 |
 
@@ -150,9 +151,10 @@ Claude のペインにフォーカスした状態で `Ctrl+;` を押すと、画
 - [`docs/peer-messaging.ja.md`](./docs/peer-messaging.ja.md) — `renga-peers` MCP チャネルのセットアップ・ワークフロー・トラブルシュート
 - [`docs/ime.ja.md`](./docs/ime.ja.md) — IME overlay の挙動、推奨上書き、overlay 内キーマップ
 - [`docs/configuration.ja.md`](./docs/configuration.ja.md) — canonical な TOML スキーマ (`[ime]`, `[ui]`)、CLI フラグ、優先順位
-- [`docs/keymap.ja.md`](./docs/keymap.ja.md) — フルキーバインド (ペイン / ファイルツリー / プレビュー / マウス) と macOS Option as Meta
+- [`docs/keymap.ja.md`](./docs/keymap.ja.md) — フルキーバインド (ペイン / ファイルツリー / プレビュー / org サイドバー / マウス) と macOS Option as Meta
 - [`docs/api-surface-v1.0.md`](./docs/api-surface-v1.0.md) — v1.0 wire-frozen コントラクト: MCP ツール / CLI / IPC / 設定・レイアウト・環境変数 (英語のみ)
-- [`docs/semver-policy.md`](./docs/semver-policy.md) — v1.0 freeze 前後の breaking / additive 変更ルール (英語のみ)
+- [`docs/semver-policy-2.0.md`](./docs/semver-policy-2.0.md) — **現行**の breaking / additive 変更ルール (2.0 系以降、英語のみ)
+- [`docs/semver-policy.md`](./docs/semver-policy.md) — v1.0 freeze 前後の breaking / additive 変更ルール (英語のみ)。上記に置き換えられたが 1.0〜1.4 系の記録として保持
 - [`BRANCHING.md`](./BRANCHING.md) — renga / 上流 ccmux の divergence と cherry-pick ポリシー (英語のみ)
 
 ## 構成
@@ -171,7 +173,7 @@ src/
 
 ## 安定性
 
-renga は v1.0 API freeze に近づいています。v1.0 が安定維持を約束するコントラクト (MCP ツール / CLI / IPC / 設定・レイアウト・環境変数) は [`docs/api-surface-v1.0.md`](./docs/api-surface-v1.0.md) に定義しています。breaking / additive 変更を支配する semver ルールは [`docs/semver-policy.md`](./docs/semver-policy.md)。pre-1.0 (`0.y.z`) リリースは未約束です。freeze 保証が必要な下流ツールは `>= 1.0` に pin してください。
+renga の API freeze は v1.0.0 で完了済みです。安定維持を約束するコントラクト (MCP ツール / CLI / IPC / 設定・レイアウト・環境変数) は [`docs/api-surface-v1.0.md`](./docs/api-surface-v1.0.md) に定義しています (このファイルは `main` に追随します。ファイル名の `v1.0` は「どの freeze として始まったか」の記録であって、記述対象のバージョンではありません)。breaking / additive 変更を支配する現行の semver ルールは [`docs/semver-policy-2.0.md`](./docs/semver-policy-2.0.md) (置き換えられた v1.0 系ポリシーは [`docs/semver-policy.md`](./docs/semver-policy.md) に保存)。pre-1.0 (`0.y.z`) リリースは約束の対象外でした。下流ツールは `>= 1.0` のような開いた指定ではなく、単一のメジャー範囲に pin してください。コントラクトの変更が許されるのはまさにメジャー bump のタイミングだからです。
 
 ## 技術スタック
 

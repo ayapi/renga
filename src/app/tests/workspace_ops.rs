@@ -146,7 +146,7 @@ fn handle_close_refuses_last_pane_of_only_tab() {
     let only = app.ws().focused_pane_id;
 
     let err = app
-        .handle_close(&ipc::PaneRef::Id(only))
+        .handle_close(&ipc::PaneRef::Id(only), None)
         .expect_err("closing the last pane must fail");
     assert_eq!(err.code, Some(ipc::err_code::LAST_PANE));
 
@@ -159,7 +159,7 @@ fn handle_close_refuses_last_pane_of_only_tab() {
 fn handle_close_returns_pane_not_found_for_bogus_id() {
     let mut app = App::new(40, 80).expect("App::new");
     let err = app
-        .handle_close(&ipc::PaneRef::Id(9_999))
+        .handle_close(&ipc::PaneRef::Id(9_999), None)
         .expect_err("bogus id should fail");
     assert_eq!(err.code, Some(ipc::err_code::PANE_NOT_FOUND));
     app.shutdown();
@@ -186,7 +186,7 @@ fn handle_close_removes_pane_and_returns_id() {
     let left_id = *app.ws().pane_names.get("left").expect("left registered");
 
     let closed = app
-        .handle_close(&ipc::PaneRef::Name("right".into()))
+        .handle_close(&ipc::PaneRef::Name("right".into()), None)
         .expect("close right pane");
     assert_eq!(closed, right_id);
 
@@ -242,7 +242,7 @@ fn handle_close_in_background_tab_marks_dirty_and_updates_list() {
         .expect("bg-right registered");
 
     let closed = app
-        .handle_close(&ipc::PaneRef::Id(bg_right_id))
+        .handle_close(&ipc::PaneRef::Id(bg_right_id), None)
         .expect("close bg-right");
     assert_eq!(closed, bg_right_id);
 
@@ -280,7 +280,7 @@ fn close_releases_pane_name_for_reuse() {
     app.apply_layout(&cfg).expect("apply_layout");
 
     let victim_id_before = *app.ws().pane_names.get("victim").expect("registered");
-    app.handle_close(&ipc::PaneRef::Name("victim".into()))
+    app.handle_close(&ipc::PaneRef::Name("victim".into()), None)
         .expect("close victim");
     assert!(!app.ws().pane_names.contains_key("victim"));
 
@@ -292,6 +292,8 @@ fn close_releases_pane_name_for_reuse() {
             ipc::Direction::Vertical,
             None,
             Some("victim".into()),
+            None,
+            None,
             None,
             None,
         )
@@ -339,7 +341,7 @@ fn close_after_natural_exit_does_not_double_emit() {
         .exit_event_emitted = true;
 
     let closed = app
-        .handle_close(&ipc::PaneRef::Id(b_id))
+        .handle_close(&ipc::PaneRef::Id(b_id), None)
         .expect("close pane b");
     assert_eq!(closed, b_id);
     assert!(!app.ws().panes.contains_key(&b_id));
@@ -461,6 +463,8 @@ fn handle_split_explicit_command_wins_over_role_claude_default() {
             None,
             Some("claude".into()),
             None,
+            None,
+            None,
         )
         .expect("split succeeds");
     let pane = app.ws().panes.get(&new_id).expect("pane exists");
@@ -497,6 +501,8 @@ fn handle_split_emits_pane_started_with_attached_name_and_role() {
             None,
             Some("worker-1".into()),
             Some("worker".into()),
+            None,
+            None,
             None,
         )
         .expect("split succeeds");
@@ -583,7 +589,8 @@ fn split_refused_keeps_focus_and_emits_no_pane_started() {
     // Drive handle_split into its refused arm (pane too small
     // after halving, below `min_pane_width` — default 20) and
     // confirm:
-    //   * SPLIT_REFUSED bubbles up,
+    //   * TARGET_TOO_SMALL bubbles up (Issue #335: a target-local
+    //     refusal is no longer folded into `split_refused`),
     //   * focus stays where it was,
     //   * the requested name is NOT registered,
     //   * no PaneStarted event leaks out for the nonexistent pane.
@@ -596,6 +603,8 @@ fn split_refused_keeps_focus_and_emits_no_pane_started() {
         ipc::Direction::Vertical,
         None,
         Some("first".into()),
+        None,
+        None,
         None,
         None,
     )
@@ -615,9 +624,11 @@ fn split_refused_keeps_focus_and_emits_no_pane_started() {
             Some("overflow".into()),
             None,
             None,
+            None,
+            None,
         )
         .expect_err("too-narrow split must be refused");
-    assert_eq!(err.code, Some(ipc::err_code::SPLIT_REFUSED));
+    assert_eq!(err.code, Some(ipc::err_code::TARGET_TOO_SMALL));
 
     assert_eq!(
         app.ws().focused_pane_id,
@@ -634,6 +645,123 @@ fn split_refused_keeps_focus_and_emits_no_pane_started() {
         .any(|ev| matches!(ev, ipc::Event::PaneStarted { .. }));
     assert!(!any_started, "refused split must not emit PaneStarted");
 
+    app.shutdown();
+}
+
+/// Issue #335: the target-local refusal must say so, and carry the
+/// numbers the decision was made from, so a caller can branch without
+/// a second round-trip.
+#[test]
+fn a_too_small_target_reports_its_geometry_and_the_tab_headroom() {
+    let mut app = App::new(40, 80).expect("App::new");
+    app.handle_split(
+        &ipc::PaneRef::Focused,
+        ipc::Direction::Vertical,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("first split should succeed");
+
+    let err = app
+        .handle_split(
+            &ipc::PaneRef::Focused,
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("too-narrow split must be refused");
+    assert_eq!(err.code, Some(ipc::err_code::TARGET_TOO_SMALL));
+    let msg = &err.message;
+    assert!(msg.contains("columns wide"), "{msg}");
+    assert!(msg.contains("min_pane_width"), "{msg}");
+    assert!(msg.contains("target-local"), "{msg}");
+    // The tab count is what tells the caller this is *not* a capacity
+    // problem: two panes against a cap of sixteen.
+    assert!(
+        msg.contains(&format!("2 of {} panes", App::MAX_PANES)),
+        "{msg}"
+    );
+    app.shutdown();
+}
+
+/// The sibling of the test above: the tab-global cause gets its own
+/// code, so an orchestrator can tell "retry against another target"
+/// from "this tab is full" (Issue #335).
+#[test]
+fn the_pane_cap_reports_pane_limit_reached_not_split_refused() {
+    let mut app = App::new(60, 240).expect("App::new");
+    // Split the roomiest pane each round so the tree stays balanced —
+    // chaining splits off one pane runs out of geometry long before
+    // the cap.
+    while app.ws().layout.pane_count() < App::MAX_PANES {
+        app.relayout_workspace(0);
+        let (id, rect) = app
+            .ws()
+            .last_pane_rects
+            .iter()
+            .copied()
+            .max_by_key(|(_, r)| u32::from(r.width) * u32::from(r.height))
+            .expect("laid-out panes");
+        let direction = if rect.width >= rect.height * 2 {
+            ipc::Direction::Vertical
+        } else {
+            ipc::Direction::Horizontal
+        };
+        app.handle_split(
+            &ipc::PaneRef::Id(id),
+            direction,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("fill up to MAX_PANES");
+    }
+    app.relayout_workspace(0);
+
+    let (id, rect) = app
+        .ws()
+        .last_pane_rects
+        .iter()
+        .copied()
+        .max_by_key(|(_, r)| u32::from(r.width) * u32::from(r.height))
+        .expect("laid-out panes");
+    // The cap is checked before any geometry, so even the roomiest
+    // pane — one that would otherwise split fine — is refused with the
+    // tab-global code.
+    assert!(
+        rect.width / 2 >= app.min_pane_width,
+        "{rect:?} is splittable"
+    );
+    let err = app
+        .handle_split(
+            &ipc::PaneRef::Id(id),
+            ipc::Direction::Vertical,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("pane cap reached");
+    assert_eq!(err.code, Some(ipc::err_code::PANE_LIMIT_REACHED));
+    assert!(
+        err.message
+            .contains(&format!("{} of {} panes", App::MAX_PANES, App::MAX_PANES)),
+        "{}",
+        err.message
+    );
     app.shutdown();
 }
 
@@ -658,6 +786,8 @@ fn set_min_pane_size_lets_split_succeed_below_default_threshold() {
         Some("first".into()),
         None,
         None,
+        None,
+        None,
     )
     .expect("first split should succeed");
 
@@ -674,6 +804,8 @@ fn set_min_pane_size_lets_split_succeed_below_default_threshold() {
             ipc::Direction::Vertical,
             None,
             Some("narrow".into()),
+            None,
+            None,
             None,
             None,
         )

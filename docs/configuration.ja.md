@@ -45,19 +45,22 @@ overlay_catchup_ms = 3000
 
 ```toml
 [ui]
-lang = "auto"   # "auto" | "ja" | "en"
+lang = "auto"          # "auto" | "ja" | "en"
 fps = 30
+org_sidebar = "coexist" # "coexist" | "replace" | "off"
 ```
 
 | キー | 型 | デフォルト | CLI フラグ | 説明 |
 |---|---|---|---|---|
 | `lang` | `"auto" \| "ja" \| "en"` | `"auto"` | `--lang <auto\|ja\|en>` | ステータスバー hint とプレビューのエラーメッセージの言語。`auto` は `sys-locale` (Unix は `nl_langinfo`、Windows は `GetUserDefaultLocaleName`) で OS ロケールを検出。`ja` 系で日本語、それ以外は英語にフォールバック。CLI でも TOML でも大小文字を区別しない。 |
 | `fps` | u16 | `30` | `--fps <FPS>` | メインイベントループの目標 rate。アイドル時の crossterm poll タイムアウトを決め、入力レイテンシとアニメーションの滑らかさを上げる代わりに wakeup を増やす。`0` は実行時に `1` に丸めるので、設定ミスでもビジーループにはならない。 |
+| `org_sidebar` | `"coexist" \| "replace" \| "off"` | `"coexist"` | — (まだフラグ未対応) | org サイドバー (全タブ構成 + Claude 稼働状態を集約した常設パネル) と file tree パネルの関係。`coexist` は両パネルを同時表示可能、`replace` は org サイドバーを開くと file tree の枠を置き換える (相互排他)、`off` は機能自体を無効化しトグルキーも効かなくなる。TOML では大小文字を区別しない。`coexist` / `replace` はいずれも起動時にパネルを開いた状態にする (`Ctrl+B` でそのセッション中は非表示にできる)。全部を収めるには狭すぎる端末では最後に退避する: まず preview、次に file tree を外し、続いて org サイドバーを compact 幅へ縮め、それでも pane 領域が 20 桁を切る場合にのみ org サイドバーを非表示にする。 |
 
 優先順位:
 
 - `lang` — CLI > 設定 > OS ロケール検出 > 英語フォールバック
 - `fps` — CLI > 設定 > デフォルト（最後に `0`→`1` の clamp を適用）
+- `org_sidebar` — 設定 > デフォルト（CLI 上書きは未対応）
 
 ## 関連ドキュメント
 

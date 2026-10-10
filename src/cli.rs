@@ -214,8 +214,10 @@ pub enum IpcCommand {
         id: Option<usize>,
         #[arg(long, conflicts_with_all = ["name", "id"])]
         focused: bool,
-        /// Limit to the bottom N rows of the screen grid (blank rows
-        /// preserved). Omit to return the full visible screen.
+        /// Return the last N rendered lines ending at the live bottom.
+        /// N beyond the visible height continues into scrollback
+        /// history (capped at 2000; scrollback rows have negative row
+        /// indices). Omit to return the full visible screen.
         #[arg(long)]
         lines: Option<usize>,
         /// Include the cursor position and visibility in the payload.
@@ -226,6 +228,18 @@ pub enum IpcCommand {
     /// line to stdout until the renga server closes the connection or
     /// one of `--timeout` / `--count` stops the drain. Pipeable into
     /// `while read -r line` for reactive shell scripts.
+    ///
+    /// The stream is unscoped, exactly as it has always been: it carries
+    /// `pane_started`, `pane_exited`, `pane_prompt_detected`,
+    /// `pane_waiting_input`, `pane_mode_changed`, `peer_nudge_stalled`,
+    /// `peer_nudge_queued`, `peer_nudge_submitted`, `peer_inbox_drained`,
+    /// `events_dropped` and `heartbeat`,
+    /// plus every `peer_inbox` no matter which pane the message was
+    /// addressed to. Since #306 an IPC client may narrow that by sending
+    /// `from_pane` on its `subscribe` request and receive only the
+    /// `peer_inbox` for that one pane; this command deliberately does
+    /// not, so its output is unchanged. Use the `renga mcp-peer` tools
+    /// if you want just one pane's peer messages.
     Events {
         /// Stop after this duration (e.g. "2s", "500ms", "1m"). If
         /// unset the stream continues until the server closes the
@@ -280,6 +294,17 @@ pub enum IpcCommand {
     /// Code spawns it, inherits `RENGA_PANE_ID` / `RENGA_SOCKET` from
     /// the pane PTY, and never blocks on its own subcommand dispatch.
     McpPeer,
+    // Issue #313: lets non-MCP consumers read the capability set
+    // without speaking JSON-RPC.
+    /// Report the running renga server's capability tokens without
+    /// sending any capability-gated request. Prints the same JSON as
+    /// the `server_info` MCP tool; branch on `status` first. Always
+    /// exits 0: "detached" and "unreachable" are answers, not errors.
+    Capabilities {
+        /// Print a human-readable summary instead of JSON.
+        #[arg(long)]
+        text: bool,
+    },
     /// Manage the `renga-peers` MCP server registration in Claude
     /// Code or Codex. Thin wrapper around their MCP management
     /// commands so users get a one-liner instead of having to know the
@@ -382,7 +407,10 @@ impl IpcCommand {
         }
 
         match self {
-            IpcCommand::List => Ok(Request::List),
+            IpcCommand::List => Ok(Request::List {
+                from_pane: None,
+                tab: None,
+            }),
             IpcCommand::NewTab {
                 command,
                 id,
@@ -406,12 +434,21 @@ impl IpcCommand {
                 target: pick_ref(name, id, *focused)?,
                 data: text.clone(),
                 append_enter: *enter,
+                // The CLI is a user typing at a shell, not a pane-bound
+                // agent: "the current tab" is the one on screen, which
+                // is what `from_pane: None` selects.
+                from_pane: None,
             }),
             IpcCommand::Focus { name, id } => Ok(Request::Focus {
                 target: pick_ref(name, id, false)?,
+                from_pane: None,
             }),
             IpcCommand::Close { name, id } => Ok(Request::Close {
                 target: pick_ref(name, id, false)?,
+                // Same reasoning as `Send`, plus: `renga close` has
+                // always searched every tab, and `from_pane: None` is
+                // what preserves that (Issue #296).
+                from_pane: None,
             }),
             IpcCommand::Split {
                 target_name,
@@ -435,6 +472,10 @@ impl IpcCommand {
                     id: id.clone(),
                     role: role.clone(),
                     cwd: resolve_cli_cwd(cwd.as_deref())?,
+                    from_pane: None,
+                    // The CLI has no tab-placement flag: `renga split`
+                    // keeps splitting in the visible tab.
+                    tab: None,
                 })
             }
             IpcCommand::Rename {
@@ -465,9 +506,21 @@ impl IpcCommand {
                     target: pick_ref(name, id, *focused)?,
                     name: name_change,
                     role: role_change,
+                    // Same reasoning as `Close` (Issue #296).
+                    from_pane: None,
                 })
             }
-            IpcCommand::Events { .. } => Ok(Request::Subscribe),
+            // `renga events` subscribes unscoped: it is a generic tap
+            // for shell scripts, not a pane's inbox, and it has no pane
+            // identity of its own to declare (it runs from whatever
+            // shell the operator typed it in, which may not be a renga
+            // pane at all). `from_pane: None` therefore declines #306's
+            // opt-in narrowing, which is what keeps this stream exactly
+            // what it was before #306 — `peer_inbox` lines for every pane
+            // included. `from_pane` is for consumers that want one pane's
+            // mail and nothing else; a CLI tap is the opposite of that,
+            // so there is deliberately no flag for it here.
+            IpcCommand::Events { .. } => Ok(Request::Subscribe { from_pane: None }),
             IpcCommand::Inspect {
                 name,
                 id,
@@ -478,9 +531,14 @@ impl IpcCommand {
                 target: pick_ref(name, id, *focused)?,
                 lines: *lines,
                 include_cursor: *cursor,
+                from_pane: None,
             }),
             IpcCommand::McpPeer => anyhow::bail!(
                 "mcp-peer is a standalone subprocess, not an IPC request; \
+                 this variant must be intercepted before to_request() in main.rs"
+            ),
+            IpcCommand::Capabilities { .. } => anyhow::bail!(
+                "capabilities runs only the hello handshake, not an IPC request; \
                  this variant must be intercepted before to_request() in main.rs"
             ),
             IpcCommand::Mcp { .. } => anyhow::bail!(
@@ -631,8 +689,9 @@ mod tests {
         let cli = Cli::try_parse_from(["renga", "close", "--id", "5"]).unwrap();
         let req = cli.command.unwrap().to_request().unwrap();
         match req {
-            crate::ipc::Request::Close { target } => {
+            crate::ipc::Request::Close { target, from_pane } => {
                 assert!(matches!(target, crate::ipc::PaneRef::Id(5)));
+                assert_eq!(from_pane, None, "the CLI never claims a caller pane");
             }
             other => panic!("expected Close, got {other:?}"),
         }
@@ -878,11 +937,24 @@ mod tests {
         }
     }
 
+    /// `renga events` must stay *unscoped* (`from_pane: None`). That is
+    /// what keeps its output identical to every previous release under
+    /// #306, and it keeps its wire form byte-identical too
+    /// (`skip_serializing_if` drops the `None`, so the line is still
+    /// exactly `{"cmd":"subscribe"}` and an older server sees nothing
+    /// new). Pinning the exact variant rather than just "is a Subscribe"
+    /// is the point: wiring some pane id in here would silently narrow
+    /// the CLI's long-standing output to one pane's `peer_inbox`, which
+    /// is the regression #306 must not cause.
     #[test]
-    fn events_to_request_is_subscribe() {
+    fn events_to_request_is_an_unscoped_subscribe() {
         let cli = Cli::try_parse_from(["renga", "events", "--count", "3"]).unwrap();
         let req = cli.command.unwrap().to_request().unwrap();
-        assert!(matches!(req, crate::ipc::Request::Subscribe));
+        assert_eq!(req, crate::ipc::Request::Subscribe { from_pane: None });
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"cmd":"subscribe"}"#
+        );
     }
 
     #[test]
@@ -944,6 +1016,7 @@ mod tests {
                 target,
                 lines,
                 include_cursor,
+                ..
             } => {
                 assert!(matches!(target, crate::ipc::PaneRef::Id(7)));
                 assert_eq!(lines, Some(2));
@@ -1108,6 +1181,20 @@ mod tests {
         let cli = Cli::try_parse_from(["renga", "--show-macos-tip"]).unwrap();
         assert!(cli.show_macos_tip);
         assert!(!cli.no_macos_tip);
+    }
+
+    #[test]
+    fn parses_capabilities_json_by_default() {
+        let cli = Cli::try_parse_from(["renga", "capabilities"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(IpcCommand::Capabilities { text: false })
+        ));
+        let cli = Cli::try_parse_from(["renga", "capabilities", "--text"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(IpcCommand::Capabilities { text: true })
+        ));
     }
 
     #[test]

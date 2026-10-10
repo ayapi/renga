@@ -43,19 +43,22 @@ overlay_catchup_ms = 3000
 
 ```toml
 [ui]
-lang = "auto"   # "auto" | "ja" | "en"
+lang = "auto"          # "auto" | "ja" | "en"
 fps = 30
+org_sidebar = "coexist" # "coexist" | "replace" | "off"
 ```
 
 | Key | Type | Default | CLI flag | Notes |
 |---|---|---|---|---|
 | `lang` | `"auto" \| "ja" \| "en"` | `"auto"` | `--lang <auto\|ja\|en>` | Language for status bar hints and preview panel error messages. `auto` detects from the OS locale via `sys-locale` (wraps `nl_langinfo` on Unix and `GetUserDefaultLocaleName` on Windows). Locales starting with `ja` render in Japanese; everything else falls back to English. Values are case-insensitive in both CLI and TOML. |
 | `fps` | u16 | `30` | `--fps <FPS>` | Main event-loop target rate. Drives the crossterm poll timeout used while the TUI is idle; higher values reduce input latency and make animations smoother at the cost of more wakeups. `0` is clamped to `1` at runtime so a bad config or CLI override never turns into a busy-spin. |
+| `org_sidebar` | `"coexist" \| "replace" \| "off"` | `"coexist"` | — (not yet exposed as a flag) | How the org sidebar (all-tabs overview + aggregated Claude activity state) relates to the file tree panel. `coexist` allows both panels to be shown at once; `replace` makes opening the org sidebar take over the file tree's panel slot instead; `off` disables the feature and its toggle key entirely. Values are case-insensitive in TOML. `coexist` and `replace` both open the panel at startup (`Ctrl+B` hides it for the session). On a terminal too narrow to fit everything the panel degrades last: the preview is dropped first, then the file tree, then the sidebar shrinks to a compact width, and only if the pane area would still fall below 20 columns is the sidebar hidden. |
 
 Precedence:
 
 - `lang` — CLI > config > OS locale detection > English fallback.
 - `fps` — CLI > config > default (with the `0`→`1` clamp applied last).
+- `org_sidebar` — config > default (no CLI override yet).
 
 ## See also
 

@@ -5,10 +5,27 @@ on:
   push:
     branches:
       - main
+  # `main` can sit untouched for weeks, and the jobs below pin
+  # `rust-toolchain@stable` with `-D warnings` — so a new Rust release
+  # turns `main` red with no commit involved. That happened once
+  # already: stable rolled to 1.97.1, `clippy::question_mark` grew a
+  # new case, and the breakage surfaced only when three external PRs
+  # all failed on a `src/pane.rs` line none of them touched (#274).
+  # Run weekly so CI, not a contributor, is what trips over the next
+  # toolchain bump. Off-the-hour minute because scheduled jobs queue
+  # behind everyone else's on-the-hour crons.
+  #
+  # Note: GitHub disables scheduled workflows after 60 days without
+  # repository activity, and re-enabling is manual.
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC (12:17 JST)
   workflow_dispatch:
 
+# Scheduled and push runs share a ref (`refs/heads/main`), so the event
+# name has to be part of the key — otherwise a cron firing mid-push
+# cancels the push's own checks.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -24,23 +41,84 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # Two jobs rather than one `os` matrix, because branch protection
+  # requires a status context named exactly `clippy`. A matrix reports
+  # `clippy (ubuntu-latest)` / `clippy (windows-latest)` and nothing
+  # named `clippy` ever arrives, so the required check stays pending
+  # forever and the PR can never merge — every leg green, mergeable
+  # BLOCKED. That is what happened to #319; keep this job's name
+  # verbatim unless the protection rule is updated in the same change.
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  # The other half of the lint surface (#280): `cfg(windows)` code was
+  # never linted at all while clippy ran only on ubuntu — `src/win_job.rs`
+  # in full, plus the gated blocks in pane.rs,
+  # ipc/{endpoint,server,client}.rs, mcp_peer/{mod,install,parent_watch}.rs,
+  # app/layout_ops.rs and main.rs.
+  #
+  # Two runners, not three: `src/` splits only on `cfg(windows)` vs
+  # `cfg(unix)` / `cfg(not(windows))` and has no
+  # `cfg(target_os = "macos")` anywhere, so a macos runner would re-lint
+  # exactly what the job above already covers.
+  clippy-windows:
+    name: clippy (windows)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  # Dependency vulnerability gate (#69). Kept separate from `clippy` so
+  # a fresh RUSTSEC advisory reads as "renga's dependencies grew a CVE",
+  # not as a lint failure on whatever PR happened to be open.
+  #
+  # Advisories are platform-independent (they key off Cargo.lock), so one
+  # ubuntu runner is enough. Like the `-D warnings` jobs above, this can
+  # turn `main` red with no commit involved — that is the point of a
+  # security gate, and the weekly `schedule:` trigger is what surfaces it
+  # instead of the next contributor.
+  #
+  # `cargo audit` exits non-zero on *vulnerabilities* only; informational
+  # advisories (unmaintained / unsound / notice) are printed but do not
+  # fail the job. That is the behavior we want — an upstream crate going
+  # unmaintained is a thing to plan for, not a thing that should block a
+  # hotfix at 2am. Add `--deny warnings` here if that ever needs to
+  # tighten.
+  #
+  # cargo-audit is installed from source rather than via a marketplace
+  # action so this job adds no new third-party action to the supply chain
+  # (every `uses:` in this file is SHA-pinned for the same reason). The
+  # ~2-3 min build is why the timeout is 20, not 5.
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
 
   test:
     name: test (${{ matrix.os }})
@@ -51,7 +129,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo build --locked --verbose

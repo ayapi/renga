@@ -1,6 +1,13 @@
+mod caller_scope;
+mod close_confirm;
 mod codex_peer;
+mod cross_tab_list;
 mod ipc_state;
 mod layout_tree;
+mod org_sidebar;
 mod overlay;
 mod pointer_input;
+mod prompt_events;
+mod tab_placement;
+mod user_turn;
 mod workspace_ops;

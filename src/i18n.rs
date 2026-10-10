@@ -134,6 +134,12 @@ pub struct Messages {
     pub tree_close: &'static str,
     pub tree_quit: &'static str,
     pub tree_claude_launch: &'static str,
+    // ── status bar: org sidebar focus ──────────────────────
+    pub org_move: &'static str,
+    pub org_activate: &'static str,
+    pub org_back: &'static str,
+    pub org_close: &'static str,
+    pub org_quit: &'static str,
     // ── status bar: pane focus ─────────────────────────────
     pub pane_split_vertical: &'static str,
     pub pane_split_horizontal: &'static str,
@@ -141,6 +147,7 @@ pub struct Messages {
     pub pane_new_tab: &'static str,
     pub pane_rename_tab: &'static str,
     pub pane_tree: &'static str,
+    pub pane_org: &'static str,
     pub pane_swap: &'static str,
     pub pane_ime: &'static str,
     pub pane_peer_launch: &'static str,
@@ -152,6 +159,18 @@ pub struct Messages {
     // ── macOS first-launch banner ─────────────────────────
     pub macos_tip_line1: &'static str,
     pub macos_tip_line2: &'static str,
+    // ── Ctrl+W close confirmation ─────────────────────────
+    //
+    // Separate full sentences per target instead of a shared
+    // "Close {}?" template — the JA and EN wordings don't share a
+    // slot position, and a mistranslated noun here closes the wrong
+    // thing in the user's head. The answer keys stay `y` / `n`
+    // regardless of language, so they are not translated. Written as
+    // `y: … n/Esc: …` rather than `[y/N]`, which would imply a default
+    // answer on Enter — Enter is not an answer here.
+    pub close_confirm_pane: &'static str,
+    pub close_confirm_tab: &'static str,
+    pub close_confirm_hint: &'static str,
 }
 
 impl Messages {
@@ -195,12 +214,18 @@ pub static MESSAGES_JA: Messages = Messages {
     tree_close: " 閉じる  ",
     tree_quit: " 終了",
     tree_claude_launch: " Claude左右/上下  ",
+    org_move: " 移動  ",
+    org_activate: " 移動先へ  ",
+    org_back: " 戻る  ",
+    org_close: " 閉じる  ",
+    org_quit: " 終了",
     pane_split_vertical: " 縦分割  ",
     pane_split_horizontal: " 横分割  ",
     pane_close: " 閉じる  ",
     pane_new_tab: " 新タブ  ",
     pane_rename_tab: " タブ名  ",
     pane_tree: " ツリー  ",
+    pane_org: " ORG  ",
     pane_swap: " 配置替  ",
     pane_ime: " IME入力  ",
     pane_peer_launch: " Claude Code起動  ",
@@ -211,6 +236,9 @@ pub static MESSAGES_JA: Messages = Messages {
     macos_tip_line1: "\u{26A0} macOS: Alt+<キー> には端末の Option=Meta 設定が必要です",
     macos_tip_line2:
         "  https://github.com/happy-ryo/renga/blob/main/docs/keymap.md#macos-option-as-meta  (任意のキーで消去)",
+    close_confirm_pane: "このペインを閉じますか？",
+    close_confirm_tab: "このタブを閉じますか？",
+    close_confirm_hint: " y: 閉じる  n/Esc: 取消 ",
 };
 
 pub static MESSAGES_EN: Messages = Messages {
@@ -231,12 +259,18 @@ pub static MESSAGES_EN: Messages = Messages {
     tree_close: " close  ",
     tree_quit: " quit",
     tree_claude_launch: " claude split  ",
+    org_move: " move  ",
+    org_activate: " go to  ",
+    org_back: " back  ",
+    org_close: " close  ",
+    org_quit: " quit",
     pane_split_vertical: " v-split  ",
     pane_split_horizontal: " h-split  ",
     pane_close: " close  ",
     pane_new_tab: " new tab  ",
     pane_rename_tab: " rename  ",
     pane_tree: " tree  ",
+    pane_org: " org  ",
     pane_swap: " swap  ",
     pane_ime: " ime  ",
     pane_peer_launch: " claude code  ",
@@ -247,6 +281,9 @@ pub static MESSAGES_EN: Messages = Messages {
     macos_tip_line1: "\u{26A0} macOS: Alt+<key> shortcuts require Option=Meta in your terminal",
     macos_tip_line2:
         "  https://github.com/happy-ryo/renga/blob/main/docs/keymap.md#macos-option-as-meta  (press any key to dismiss)",
+    close_confirm_pane: "Close this pane?",
+    close_confirm_tab: "Close this tab?",
+    close_confirm_hint: " y: close  n/Esc: cancel ",
 };
 
 #[cfg(test)]

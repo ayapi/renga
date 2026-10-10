@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, DragTarget, FocusTarget, SplitDirection};
+use crate::app::{App, CloseConfirm, DragTarget, FocusTarget, SplitDirection};
 
 // ─── Theme (terminal palette) ─────────────────────────────
 const BG: Color = Color::Reset;
@@ -17,15 +17,20 @@ const ACCENT_GREEN: Color = Color::Green;
 const ACCENT_BLUE: Color = Color::Blue;
 const ACCENT_CLAUDE: Color = Color::Yellow;
 const ACCENT_CODEX: Color = Color::Cyan;
+/// Amber used by the destructive-action confirmation modal, so it
+/// reads as "stop and answer" rather than as another info popup.
+const ACCENT_WARN: Color = Color::LightYellow;
 const HEADER_BG: Color = Color::Reset;
 const ACTIVE_TAB_BG: Color = Color::Reset;
 const LINE_NUM_COLOR: Color = Color::DarkGray;
 const SCROLL_BG: Color = Color::Reset;
 const SCROLL_THUMB: Color = Color::Gray;
 
-const MIN_TERMINAL_WIDTH: u16 = 40;
-const MIN_TERMINAL_HEIGHT: u16 = 10;
-const MIN_PANE_AREA_WIDTH: u16 = 20;
+pub(crate) const MIN_TERMINAL_WIDTH: u16 = 40;
+pub(crate) const MIN_TERMINAL_HEIGHT: u16 = 10;
+// `MIN_PANE_AREA_WIDTH` now lives in `app::layout_geometry` — it was
+// duplicated here and in `App::relayout_panes`, which is exactly the
+// drift the shared helper exists to prevent.
 
 // ─── File type icons ──────────────────────────────────────
 fn file_icon(name: &str) -> (&'static str, Color) {
@@ -105,6 +110,37 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     app.deferred_caret = None;
 
     if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
+        // Nothing below this point paints the main area, so retire the
+        // sidebar's hit-test cache instead of leaving last frame's rect
+        // behind. A click on "Terminal too small" would otherwise land
+        // on a row from the pre-resize layout and switch tabs — or grab
+        // the border and resize a panel — entirely invisibly.
+        app.last_org_sidebar_rect = None;
+        app.org_sidebar_row_targets.clear();
+        // A pending close confirmation is swallowing every key, paste,
+        // and mouse event, so it must stay visible even on a canvas too
+        // small for the real UI — otherwise the app just looks wedged.
+        // It outranks "Terminal too small": the user can resize once
+        // they know which key gets them out. Bare centered text, no
+        // box, because the borders alone can exceed the height here.
+        if let Some((prompt, hint)) = tiny_close_confirm_text(app) {
+            let mut lines = Vec::new();
+            if area.height >= 2 {
+                lines.push(Line::from(Span::styled(
+                    prompt,
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                hint,
+                Style::default().fg(ACCENT_WARN),
+            )));
+            let msg = Paragraph::new(lines)
+                .style(Style::default().bg(BG))
+                .alignment(Alignment::Center);
+            frame.render_widget(msg, area);
+            return;
+        }
         let msg = Paragraph::new("Terminal too small")
             .style(Style::default().fg(TEXT_DIM).bg(BG))
             .alignment(Alignment::Center);
@@ -123,9 +159,13 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // one row on narrow terminals because the URL is the whole point
     // — better to let line 2 truncate horizontally than drop it.
     let macos_tip_h: u16 = if show_macos_tip { 2 } else { 0 };
-    let show_overlay = app.overlay.is_some();
+    // The close confirmation outranks every other floating widget: it
+    // is the only one holding a destructive action, and while it is up
+    // no key can reach the others anyway.
+    let show_close_confirm = app.close_confirm.is_some();
+    let show_overlay = !show_close_confirm && app.overlay.is_some();
     let show_codex_peer_notification =
-        !show_overlay && app.visible_codex_peer_notification().is_some();
+        !show_close_confirm && !show_overlay && app.visible_codex_peer_notification().is_some();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -149,7 +189,10 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // having claimed a layout slot. Using the full terminal `area`
     // (not `chunks[1]`) keeps it visually centered on the whole
     // window even when the status bar is visible.
-    let overlay_caret = if show_overlay {
+    let overlay_caret = if show_close_confirm {
+        render_close_confirm(app, frame, area);
+        None
+    } else if show_overlay {
         render_ime_overlay(app, frame, area)
     } else if show_codex_peer_notification {
         render_codex_peer_notification(app, frame, area);
@@ -162,7 +205,15 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // over the pane caret when the overlay is open, reproducing the historical
     // last-write-wins ordering (the overlay previously called
     // `set_cursor_position` after the panes).
-    let caret = overlay_caret.or(pane_caret);
+    // While the close confirmation is up, suppress the hardware caret
+    // entirely. Leaving it blinking inside the pane behind the modal
+    // reads as "you can still type here" — you can't; every key goes
+    // to the y/n prompt.
+    let caret = if show_close_confirm {
+        None
+    } else {
+        overlay_caret.or(pane_caret)
+    };
 
     // Caret delivery. On conpty (Windows / WSL) defer the caret so the main
     // loop applies MoveTo->Show after `terminal.draw`, while the cursor is
@@ -196,6 +247,69 @@ const OVERLAY_TARGET_WIDTH_PCT: u16 = 60;
 const OVERLAY_MAX_WIDTH: u16 = 100;
 const OVERLAY_MIN_WIDTH: u16 = 42;
 
+// ─── Ctrl+W close confirmation (Issue #285) ───────────────
+
+/// The prompt / hint pair to show when the terminal is too small for
+/// the real modal, or `None` when no confirmation is pending.
+///
+/// Split out of [`render`] so the invariant that matters — an armed
+/// confirmation is never invisible, at any terminal size — is testable
+/// without standing up a backend.
+pub(crate) fn tiny_close_confirm_text(app: &App) -> Option<(&'static str, &'static str)> {
+    let msgs = app.messages();
+    let prompt = match app.close_confirm.as_ref()? {
+        CloseConfirm::Pane { .. } => msgs.close_confirm_pane,
+        CloseConfirm::Tab { .. } => msgs.close_confirm_tab,
+    };
+    Some((prompt, msgs.close_confirm_hint))
+}
+
+/// Centered y/n modal for a pending pane / tab close.
+///
+/// Deliberately a centered box rather than a status-bar line: the
+/// status bar is hidden by `Alt+S`, competes with the right-hand
+/// session info, and truncates on narrow terminals — none of which is
+/// acceptable for the only prompt that guards a destructive action.
+/// Sized to fit inside `MIN_TERMINAL_WIDTH`/`HEIGHT`, since below that
+/// `render` has already bailed out to "Terminal too small".
+fn render_close_confirm(app: &App, frame: &mut Frame, area: Rect) {
+    let Some((prompt, hint_text)) = tiny_close_confirm_text(app) else {
+        return;
+    };
+
+    let box_w = area.width.min(52);
+    let box_h = area.height.min(3);
+    if box_w < 4 || box_h < 3 {
+        return;
+    }
+    let box_x = area.x + (area.width.saturating_sub(box_w)) / 2;
+    let box_y = area.y + (area.height.saturating_sub(box_h)) / 2;
+    let box_rect = Rect::new(box_x, box_y, box_w, box_h);
+    frame.render_widget(ratatui::widgets::Clear, box_rect);
+
+    let title = Line::from(Span::styled(
+        " \u{26a0} Ctrl+W ",
+        Style::default()
+            .fg(ACCENT_WARN)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let hint = Line::from(Span::styled(hint_text, Style::default().fg(TEXT_DIM)));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT_WARN))
+        .style(Style::default().bg(PANEL_BG))
+        .title(title)
+        .title_bottom(hint);
+    let body = Paragraph::new(Line::from(Span::styled(
+        prompt,
+        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+    )))
+    .alignment(Alignment::Center)
+    .block(block);
+    frame.render_widget(body, box_rect);
+}
+
 fn render_codex_peer_notification(app: &mut App, frame: &mut Frame, area: Rect) {
     let Some(notification) = app.visible_codex_peer_notification() else {
         return;
@@ -203,7 +317,8 @@ fn render_codex_peer_notification(app: &mut App, frame: &mut Frame, area: Rect) 
 
     let box_w = area.width.min(68);
     let box_h = area.height.min(7);
-    if box_w < 44 || box_h < 5 {
+    let (min_w, min_h) = crate::app::CODEX_PEER_NOTIFICATION_MIN_SIZE;
+    if box_w < min_w || box_h < min_h {
         return;
     }
     let box_x = area.x + (area.width.saturating_sub(box_w)) / 2;
@@ -531,71 +646,174 @@ fn render_tab_bar(app: &mut App, frame: &mut Frame, area: Rect) {
 /// `render_terminal_content` so `render` can apply the caret-delivery policy
 /// once at the top level.
 fn render_main_area(app: &mut App, frame: &mut Frame, area: Rect) -> Option<(u16, u16)> {
-    let tree_width = app.file_tree_width;
-    let preview_width = app.preview_width;
+    // Widths, degrade order and panel positions all come from the
+    // shared helper so the painted geometry and the geometry
+    // `App::relayout_panes` reports to the PTYs cannot drift apart.
+    let layout = crate::app::layout_geometry::compute(app.main_area_input(area));
 
-    let mut has_tree = app.ws().file_tree_visible;
-    let mut has_preview = app.ws().preview.is_active();
-
-    let needed = MIN_PANE_AREA_WIDTH
-        + if has_tree { tree_width } else { 0 }
-        + if has_preview { preview_width } else { 0 };
-    if area.width < needed && has_preview {
-        has_preview = false;
-    }
-    let needed = MIN_PANE_AREA_WIDTH + if has_tree { tree_width } else { 0 };
-    if area.width < needed && has_tree {
-        has_tree = false;
-    }
-
-    let swapped = app.layout_swapped;
-
-    let mut constraints = Vec::new();
-    if has_tree {
-        constraints.push(Constraint::Length(tree_width));
-    }
-    if swapped && has_preview {
-        constraints.push(Constraint::Length(preview_width));
-    }
-    constraints.push(Constraint::Min(20));
-    if !swapped && has_preview {
-        constraints.push(Constraint::Length(preview_width));
+    // Focus can be left pointing at a panel this frame does not paint —
+    // the degrade ladder just squeezed it out, or `replace` mode took
+    // the tree's slot. Hand it back to the panes rather than let the
+    // panel handlers keep eating keystrokes for an invisible widget.
+    // The key dispatch guards against this too; doing it here as well
+    // means the status bar hints agree with where input is going.
+    let focus_is_painted = match app.ws().focus_target {
+        FocusTarget::OrgSidebar => layout.org_sidebar.is_some(),
+        FocusTarget::FileTree => layout.file_tree.is_some(),
+        FocusTarget::Preview => layout.preview.is_some(),
+        FocusTarget::Pane => true,
+    };
+    if !focus_is_painted {
+        app.ws_mut().focus_target = FocusTarget::Pane;
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(constraints)
-        .split(area);
-
-    let mut idx = 0;
-
-    if has_tree {
-        app.ws_mut().last_file_tree_rect = Some(chunks[idx]);
-        render_file_tree(app, frame, chunks[idx]);
-        idx += 1;
+    app.last_org_sidebar_rect = layout.org_sidebar;
+    if let Some(rect) = layout.org_sidebar {
+        render_org_sidebar(app, frame, rect, layout.org_sidebar_compact);
     } else {
-        app.ws_mut().last_file_tree_rect = None;
+        app.org_sidebar_row_targets.clear();
     }
 
-    if swapped && has_preview {
-        app.ws_mut().last_preview_rect = Some(chunks[idx]);
-        render_preview(app, frame, chunks[idx]);
-        idx += 1;
+    app.ws_mut().last_file_tree_rect = layout.file_tree;
+    if let Some(rect) = layout.file_tree {
+        render_file_tree(app, frame, rect);
     }
 
-    let pane_caret = render_panes(app, frame, chunks[idx]);
-    idx += 1;
-
-    if !swapped && has_preview {
-        app.ws_mut().last_preview_rect = Some(chunks[idx]);
-        render_preview(app, frame, chunks[idx]);
+    app.ws_mut().last_preview_rect = layout.preview;
+    if let Some(rect) = layout.preview {
+        render_preview(app, frame, rect);
     }
 
-    if !has_preview {
-        app.ws_mut().last_preview_rect = None;
-    }
+    render_panes(app, frame, layout.panes)
+}
 
-    pane_caret
+// ─── Org sidebar ──────────────────────────────────────────
+
+/// Paint the cross-tab org view: one header row per tab, one indented
+/// row per pane, with Claude activity pulled from the snapshot cache
+/// that [`App::tick_claude_snapshots`] maintains off the render path.
+///
+/// `compact` is set by the layout helper when a narrow terminal forced
+/// the panel down to [`ORG_SIDEBAR_COMPACT_WIDTH`]; in that mode the
+/// context meter is dropped rather than truncated into nonsense.
+///
+/// [`ORG_SIDEBAR_COMPACT_WIDTH`]: crate::app::layout_geometry::ORG_SIDEBAR_COMPACT_WIDTH
+fn render_org_sidebar(app: &mut App, frame: &mut Frame, area: Rect, compact: bool) {
+    let is_focused = app.ws().focus_target == FocusTarget::OrgSidebar;
+    let is_border_active = matches!(
+        app.dragging.as_ref().or(app.hover_border.as_ref()),
+        Some(DragTarget::OrgSidebarBorder)
+    );
+    let border_color = if is_border_active {
+        ACCENT_GREEN
+    } else if is_focused {
+        FOCUS_BORDER
+    } else {
+        BORDER
+    };
+    let title_style = if is_focused {
+        Style::default()
+            .fg(ACCENT_BLUE)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(TEXT_DIM)
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(" ORG ", title_style))
+        .style(Style::default().bg(PANEL_BG));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = app.org_sidebar_rows();
+    let selected = app.org_sidebar_selected_index(&rows);
+    let visible_height = inner.height as usize;
+    app.org_sidebar_ensure_visible(selected, visible_height, rows.len());
+    // Republished every paint so a click can only resolve to a row the
+    // user could actually see.
+    app.org_sidebar_row_targets = rows.iter().map(|r| r.target).collect();
+
+    let scroll = app.org_sidebar_scroll;
+    let max_width = inner.width as usize;
+
+    for (i, row) in rows.iter().skip(scroll).take(visible_height).enumerate() {
+        let y = inner.y + i as u16;
+        let is_selected = scroll + i == selected;
+
+        let indicator = if is_selected { "\u{258e}" } else { " " }; // ▎
+        let indicator_style = if is_selected {
+            Style::default().fg(ACCENT_BLUE)
+        } else {
+            Style::default()
+        };
+
+        let (content, content_color) = match row.kind {
+            // Tab header row.
+            None => {
+                let marker = if row.is_active_tab { "\u{25b8}" } else { " " }; // ▸
+                                                                               // `•2/3` — how many of this tab's panes are mid-turn.
+                                                                               // Only shown when something is actually running, so an
+                                                                               // idle tab list stays quiet.
+                let busy = if row.working_panes > 0 {
+                    format!(" \u{2022}{}/{}", row.working_panes, row.total_panes)
+                } else {
+                    String::new()
+                };
+                let color = if row.is_active_tab { TEXT } else { TEXT_DIM };
+                (
+                    format!("{} {} {}{}", marker, row.target.tab + 1, row.label, busy),
+                    color,
+                )
+            }
+            // Pane row.
+            Some(kind) => {
+                let working = row.snapshot.as_ref().is_some_and(|s| s.is_working);
+                let glyph = if working { "\u{25cf}" } else { "\u{25cb}" }; // ● / ○
+                let color = match kind {
+                    crate::app::org_sidebar::OrgPaneKind::Claude => ACCENT_CLAUDE,
+                    crate::app::org_sidebar::OrgPaneKind::Codex => ACCENT_CODEX,
+                    crate::app::org_sidebar::OrgPaneKind::Shell => TEXT_DIM,
+                };
+                let focus_mark = if row.is_focused_pane { "*" } else { " " };
+                let mut text = format!("  {}{} {}", glyph, focus_mark, row.label);
+                if !compact {
+                    if let Some(snap) = row.snapshot.as_ref() {
+                        if let Some(tool) = snap.current_tool.as_deref() {
+                            if working {
+                                text.push_str(&format!(" {tool}"));
+                            }
+                        }
+                        if snap.todo_total > 0 {
+                            text.push_str(&format!(" {}/{}", snap.todo_done, snap.todo_total));
+                        } else if snap.context_usage > 0 {
+                            text.push_str(&format!(" {}%", snap.context_usage));
+                        }
+                    }
+                }
+                (text, color)
+            }
+        };
+
+        let truncated = truncate_to_width(&content, max_width.saturating_sub(1));
+        let content_style = if is_selected {
+            Style::default()
+                .fg(TEXT)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default().fg(content_color).bg(PANEL_BG)
+        };
+        let spans = vec![
+            Span::styled(indicator, indicator_style),
+            Span::styled(truncated, content_style),
+        ];
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
 }
 
 // ─── File tree ────────────────────────────────────────────
@@ -937,7 +1155,35 @@ fn render_single_pane(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
-        .title(Span::styled(pane_title, title_style))
+        .title(Line::from(vec![
+            // A peer nudge renga could not deliver for 30 s (#354).
+            // First, so a narrow pane truncates the label, not this.
+            if pane.peer_nudge_stalled {
+                Span::styled(
+                    " \u{26a0} peer nudge stalled ",
+                    Style::default()
+                        .fg(ACCENT_WARN)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            },
+            // Undrained peer messages to a Codex pane (#352).
+            match pane.peer_delivery {
+                Some(d) => {
+                    let (label, color) = match d.state {
+                        crate::ipc::PeerDeliveryState::Queued => ("queued", ACCENT_WARN),
+                        crate::ipc::PeerDeliveryState::Nudged => ("nudged", ACCENT_BLUE),
+                    };
+                    Span::styled(
+                        format!(" \u{2709} {label} {} ", d.pending),
+                        Style::default().fg(color),
+                    )
+                }
+                None => Span::raw(""),
+            },
+            Span::styled(pane_title, title_style),
+        ]))
         .title_bottom(bottom_title)
         .style(Style::default().bg(BG));
 
@@ -1171,7 +1417,7 @@ fn clamp_caret_col(col: u16, width: u16) -> Option<u16> {
 }
 
 /// Prompt glyphs Claude Code renders at the left edge of its input box.
-const CLAUDE_PROMPT_GLYPHS: &[&str] = &[
+pub(crate) const CLAUDE_PROMPT_GLYPHS: &[&str] = &[
     ">", "\u{276F}", // ❯
     "\u{203A}", // ›
     "\u{27E9}", // ⟩
@@ -1181,7 +1427,7 @@ const CLAUDE_PROMPT_GLYPHS: &[&str] = &[
 ];
 
 /// Columns scanned at the left of a row when looking for a prompt glyph.
-const CLAUDE_PROMPT_SCAN_COLS: u16 = 8;
+pub(crate) const CLAUDE_PROMPT_SCAN_COLS: u16 = 8;
 
 /// Maximum rows to walk downward from `prompt_row` while probing for
 /// a wrapped continuation of Claude's input box. Each continuation row
@@ -1237,7 +1483,7 @@ fn row_has_non_blank(screen: &vt100::Screen, row: u16) -> bool {
 /// Find the bottom-most row that contains a Claude prompt glyph
 /// (`>`/`❯`/…) in its first few columns. Returns `None` if no prompt
 /// row is visible (e.g. Claude is fully occluded by streaming).
-fn find_prompt_row(screen: &vt100::Screen) -> Option<u16> {
+pub(crate) fn find_prompt_row(screen: &vt100::Screen) -> Option<u16> {
     let screen_rows = screen.size().0;
     (0..screen_rows)
         .rev()
@@ -1253,7 +1499,7 @@ fn find_prompt_row(screen: &vt100::Screen) -> Option<u16> {
 /// Returns the last row that qualified as a wrapped continuation.
 /// Defaults to `prompt_row` when nothing below it looks like wrapped
 /// content.
-fn resolve_input_row_last(screen: &vt100::Screen, prompt_row: u16) -> u16 {
+pub(crate) fn resolve_input_row_last(screen: &vt100::Screen, prompt_row: u16) -> u16 {
     let screen_rows = screen.size().0;
     let mut last = prompt_row;
     let mut blank_streak = 0u16;
@@ -1701,6 +1947,17 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled(m.rename_empty_enter_label, Style::default().fg(ACCENT_BLUE)),
             Span::styled(m.rename_reset, Style::default().fg(TEXT_DIM)),
         ])
+    } else if let Some(count) = app.codex_peer_notification_needs_hint() {
+        // The notification box does not fit; Esc / Alt+Enter are not
+        // captured, so just say there is something to check (#355).
+        let noun = if count == 1 { "message" } else { "messages" };
+        Line::from(vec![
+            Span::styled(" PEER ▷ ", Style::default().fg(ACCENT_CODEX)),
+            Span::styled(
+                format!("{count} pending {noun} - widen window"),
+                Style::default().fg(TEXT_DIM),
+            ),
+        ])
     } else {
         match focus {
             FocusTarget::Preview => Line::from(vec![
@@ -1731,6 +1988,18 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
                 Span::styled("^Q", Style::default().fg(ACCENT_BLUE)),
                 Span::styled(m.tree_quit, Style::default().fg(TEXT_DIM)),
             ]),
+            FocusTarget::OrgSidebar => Line::from(vec![
+                Span::styled(" j/k", Style::default().fg(ACCENT_BLUE)),
+                Span::styled(m.org_move, Style::default().fg(TEXT_DIM)),
+                Span::styled("Enter", Style::default().fg(ACCENT_BLUE)),
+                Span::styled(m.org_activate, Style::default().fg(TEXT_DIM)),
+                Span::styled("Esc", Style::default().fg(ACCENT_BLUE)),
+                Span::styled(m.org_back, Style::default().fg(TEXT_DIM)),
+                Span::styled("^B", Style::default().fg(ACCENT_BLUE)),
+                Span::styled(m.org_close, Style::default().fg(TEXT_DIM)),
+                Span::styled("^Q", Style::default().fg(ACCENT_BLUE)),
+                Span::styled(m.org_quit, Style::default().fg(TEXT_DIM)),
+            ]),
             FocusTarget::Pane => Line::from(vec![
                 Span::styled(" ^D", Style::default().fg(ACCENT_BLUE)),
                 Span::styled(m.pane_split_vertical, Style::default().fg(TEXT_DIM)),
@@ -1744,6 +2013,8 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
                 Span::styled(m.pane_rename_tab, Style::default().fg(TEXT_DIM)),
                 Span::styled("^F", Style::default().fg(ACCENT_BLUE)),
                 Span::styled(m.pane_tree, Style::default().fg(TEXT_DIM)),
+                Span::styled("^B", Style::default().fg(ACCENT_BLUE)),
+                Span::styled(m.pane_org, Style::default().fg(TEXT_DIM)),
                 Span::styled("^P", Style::default().fg(ACCENT_BLUE)),
                 Span::styled(m.pane_swap, Style::default().fg(TEXT_DIM)),
                 Span::styled("^;/A-;", Style::default().fg(ACCENT_BLUE)),

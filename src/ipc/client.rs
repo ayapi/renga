@@ -14,7 +14,7 @@ use interprocess::local_socket::{prelude::*, Stream};
 use subtle::ConstantTimeEq;
 
 use super::endpoint::{EndpointName, ENV_TOKEN};
-use super::{Event, Request, Response, RESPONSE_TIMEOUT};
+use super::{Event, EventScope, Request, Response, RESPONSE_TIMEOUT};
 
 /// Send a single request to the endpoint and return the response.
 ///
@@ -25,6 +25,35 @@ use super::{Event, Request, Response, RESPONSE_TIMEOUT};
 /// the helper thread is detached and cleaned up by the OS when the
 /// client process exits.
 pub fn send_request(endpoint: &EndpointName, request: &Request) -> Result<Response> {
+    send_request_inner(endpoint, request, None)
+}
+
+/// Like [`send_request`], but refuses to send unless the server
+/// advertised `required_cap` in its hello (see
+/// [`super::CAP_CALLER_SCOPE`]).
+///
+/// This is the **fail-closed** path for version skew. renga registers
+/// `renga mcp-peer` by absolute path, so upgrading the binary on disk
+/// leaves the *old* server process running while every newly spawned
+/// mcp-peer is the *new* one. An old server parses `from_pane` as an
+/// unknown field, drops it, and happily operates on whatever tab the
+/// human is looking at — a wrong-tab `send_keys` with no error
+/// anywhere. Erroring out with "restart renga" is the only safe
+/// answer; silently falling back to the old semantics is exactly the
+/// bug #288 exists to remove.
+pub fn send_request_requiring(
+    endpoint: &EndpointName,
+    request: &Request,
+    required_cap: &'static str,
+) -> Result<Response> {
+    send_request_inner(endpoint, request, Some(required_cap))
+}
+
+fn send_request_inner(
+    endpoint: &EndpointName,
+    request: &Request,
+    required_cap: Option<&'static str>,
+) -> Result<Response> {
     let name_string = endpoint.as_str().to_string();
     let endpoint_clone = endpoint.clone();
     let request_clone = request.clone();
@@ -36,7 +65,7 @@ pub fn send_request(endpoint: &EndpointName, request: &Request) -> Result<Respon
                 let name = make_connection_name(&endpoint_clone)?;
                 let conn = Stream::connect(name)
                     .with_context(|| format!("connect to {}", endpoint_clone.as_str()))?;
-                converse(conn, &request_clone)
+                converse(conn, &request_clone, required_cap)
             })();
             let _ = tx.send(result);
         })
@@ -66,28 +95,148 @@ fn make_connection_name(endpoint: &EndpointName) -> Result<interprocess::local_s
     }
 }
 
-fn converse(conn: Stream, request: &Request) -> Result<Response> {
-    let mut reader = BufReader::new(conn);
+/// What the running renga server said about itself in its
+/// [`Response::Hello`].
+///
+/// Every field here has always been on the wire — the handshake that
+/// precedes *every* request already carries it. Before #304 it was
+/// parsed and dropped on the floor inside [`converse`], reachable only
+/// indirectly through the `[server_too_old]` string
+/// [`require_capability`] builds. This type is what stops it being
+/// thrown away, so a caller can ask "what does this server support?"
+/// instead of inferring it from a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerHandshake {
+    /// PID of the renga process actually serving this endpoint. Note
+    /// this is the *server* process, which can be an older build than
+    /// the binary running this client — see [`send_request_requiring`].
+    pub server_pid: u32,
+    /// Feature tokens the server advertised (see
+    /// [`super::SERVER_CAPABILITIES`]). Empty from any pre-#288
+    /// server: they omit the field entirely, and `serde(default)`
+    /// turns that into an empty vec. Empty therefore means "asked, and
+    /// it supports nothing", which is a *different* fact from "could
+    /// not ask" — callers must not conflate the two.
+    pub capabilities: Vec<String>,
+    /// Identity of the server *process instance* behind this endpoint
+    /// (see [`super::session_id`]), or `None` from any pre-#326 server
+    /// that does not send the field.
+    ///
+    /// This is the field that makes a persisted pane id safe to reuse:
+    /// pane ids restart from a fresh counter on every renga launch, so
+    /// a stored pane id only means anything paired with the session it
+    /// was minted in. `None` must be read as "cannot tell", never as
+    /// "same session as before".
+    pub session_id: Option<String>,
+    /// Release the server process was built from, or `None` from any
+    /// pre-#312 server. May differ from this client's own version when
+    /// the binary on disk was upgraded under a still-running server.
+    pub server_version: Option<String>,
+}
 
-    // Handshake
+/// Complete the [`Request::Hello`] handshake and return what the
+/// server advertised, **without sending any command**.
+///
+/// This is the ungated introspection path behind the `server_info` MCP
+/// tool (#304). Three properties make it safe against arbitrarily old
+/// servers, which is the whole point:
+///
+/// 1. It writes only `hello`. The server answers the handshake before
+///    reading a command and treats the following EOF as a clean close
+///    (`read_line_or_eof` → `Ok(())` in [`super::server`]), so a
+///    handshake-only connection is valid against every renga server
+///    that has ever shipped.
+/// 2. It sends no [`Request`] variant beyond `hello`. A dedicated
+///    variant would be rejected as `protocol` by existing servers —
+///    that is learning-by-failed-attempt, exactly the pattern #304
+///    exists to replace.
+/// 3. It gates on nothing, so it still answers for a server that
+///    advertises no capabilities at all.
+///
+/// The session-token check is deliberately kept: reporting the
+/// capabilities of a renga instance that is not ours would be worse
+/// than reporting nothing, because the caller would pre-flight against
+/// one instance and then send commands to another.
+pub fn probe_server(endpoint: &EndpointName) -> Result<ServerHandshake> {
+    let name_string = endpoint.as_str().to_string();
+    let endpoint_clone = endpoint.clone();
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("renga-ipc-probe".into())
+        .spawn(move || {
+            let result = (|| -> Result<ServerHandshake> {
+                let name = make_connection_name(&endpoint_clone)?;
+                let conn = Stream::connect(name)
+                    .with_context(|| format!("connect to {}", endpoint_clone.as_str()))?;
+                perform_handshake(&mut BufReader::new(conn))
+            })();
+            let _ = tx.send(result);
+        })
+        .context("spawn IPC probe thread")?;
+
+    match rx.recv_timeout(RESPONSE_TIMEOUT) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!(
+            "no response from renga within {:?} (endpoint: {})",
+            RESPONSE_TIMEOUT,
+            name_string
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!("IPC probe thread panicked")),
+    }
+}
+
+/// Send `hello`, validate the reply, and hand back what the server
+/// advertised. Shared by [`converse`], [`subscribe_events_scoped`], and
+/// [`probe_server`] so the three cannot drift on token verification or
+/// on the error strings operators grep for.
+fn perform_handshake(reader: &mut BufReader<Stream>) -> Result<ServerHandshake> {
     let hello = Request::Hello {
         client_pid: std::process::id(),
     };
     write_request_line(reader.get_mut(), &hello)?;
-    let hello_resp = read_response_line(&mut reader)?;
-    match hello_resp {
-        Response::Hello { session_token, .. } => {
+    match read_response_line(reader)? {
+        Response::Hello {
+            server_pid,
+            session_token,
+            capabilities,
+            session_id,
+            server_version,
+        } => {
+            // Verifying the token here is also what makes a cached
+            // capability answer safe without any staleness key: a
+            // `ServerHandshake` can only ever come from the instance
+            // that published this process's `RENGA_TOKEN`. If renga
+            // restarts, either the PID-derived endpoint no longer
+            // exists or the token no longer matches — both fail, and
+            // neither can masquerade as a successful probe of a server
+            // whose capabilities have silently changed.
             verify_session_token(&session_token, std::env::var(ENV_TOKEN).ok().as_deref())?;
+            Ok(ServerHandshake {
+                server_pid,
+                capabilities,
+                session_id,
+                server_version,
+            })
         }
-        Response::Err { message, code } => {
-            return Err(anyhow!(
-                "server refused hello: {}",
-                fmt_err(&message, &code)
-            ));
-        }
-        Response::Ok { .. } | Response::Subscribed => {
-            return Err(anyhow!("unexpected response to hello"));
-        }
+        Response::Err { message, code } => Err(anyhow!(
+            "server refused hello: {}",
+            fmt_err(&message, &code)
+        )),
+        Response::Ok { .. } | Response::Subscribed => Err(anyhow!("unexpected response to hello")),
+    }
+}
+
+fn converse(
+    conn: Stream,
+    request: &Request,
+    required_cap: Option<&'static str>,
+) -> Result<Response> {
+    let mut reader = BufReader::new(conn);
+
+    // Handshake
+    let handshake = perform_handshake(&mut reader)?;
+    if let Some(cap) = required_cap {
+        require_capability(cap, &handshake.capabilities)?;
     }
 
     // Actual command
@@ -96,8 +245,21 @@ fn converse(conn: Stream, request: &Request) -> Result<Response> {
     Ok(resp)
 }
 
-/// Open a long-lived connection, complete the handshake, send
-/// [`Request::Subscribe`], then stream [`Event`]s into `on_event`
+/// Subscribe to the **whole** event stream: every lifecycle event
+/// (`pane_started`, `pane_exited`, `events_dropped`, `heartbeat`) *and*
+/// every [`Event::PeerInbox`], whatever pane it is addressed to. This is
+/// the tap behind `renga events` and it behaves exactly as it did before
+/// Issue #306 — the request it puts on the wire declares no pane, so the
+/// server applies no routing to it.
+///
+/// Scoping is opt-in and this entry point declines it. A caller that
+/// only cares about one pane's mail should use [`subscribe_inbox_events`]
+/// instead: it gets the same lifecycle events without the rest of the
+/// session's peer traffic passing through its queue. Everything else
+/// about the two is identical.
+///
+/// Opens a long-lived connection, completes the handshake, sends
+/// [`Request::Subscribe`], then streams [`Event`]s into `on_event`
 /// until either the server closes the connection, the callback
 /// returns `false`, or an I/O error occurs.
 ///
@@ -105,7 +267,62 @@ fn converse(conn: Stream, request: &Request) -> Result<Response> {
 /// thread for the full lifetime of the stream. Callers that want a
 /// finite stream should wrap it in a thread or return `false` from
 /// `on_event` when done.
-pub fn subscribe_events<F>(endpoint: &EndpointName, mut on_event: F) -> Result<()>
+pub fn subscribe_events<F>(endpoint: &EndpointName, on_event: F) -> Result<()>
+where
+    F: FnMut(Event) -> bool,
+{
+    subscribe_events_scoped(endpoint, EventScope::Unscoped, on_event)
+}
+
+/// Subscribe to lifecycle events **plus only** the [`Event::PeerInbox`]
+/// messages addressed to `pane_id` — the opt-in narrowing added by Issue
+/// #306. Otherwise identical to [`subscribe_events`], including the
+/// blocking / `false`-to-stop contract; the difference is purely that
+/// other panes' peer messages are never sent down this connection.
+///
+/// `pane_id` is the pane the caller itself runs in, read from
+/// `RENGA_PANE_ID`. It travels as `Request::Subscribe { from_pane }` and
+/// is the *only* thing that binds this connection to an inbox: the
+/// server deliberately does not infer it from the handshake pid or from
+/// an earlier `PeerRegisterClient`, since neither describes *this*
+/// subscription.
+///
+/// **The caller must still check `target_pane` on every `PeerInbox` it
+/// receives.** Server-side routing is an optimisation layered on top of
+/// that check, not a replacement for it, for a concrete reason: a renga
+/// binary can be upgraded on disk while the old server process keeps
+/// running, so this client may well be talking to a pre-#306 server that
+/// broadcasts every peer message to every subscriber. The client-side
+/// comparison is what keeps that combination correct. It also costs
+/// nothing to keep — see `classify_inbox_event` in the `mcp_peer`
+/// module.
+///
+/// Naming a pane here is not authentication; any process running as this
+/// user can name any pane id (see the threat model in [`super`]). What
+/// it buys is defense in depth: another pane's peer messages are no
+/// longer copied into *this* subscriber's queue, which removes both the
+/// unintended delivery to a pane the message was not meant for and the
+/// queue pressure those copies caused. Callers that decline the opt-in
+/// keep the full stream and give up nothing else.
+pub fn subscribe_inbox_events<F>(endpoint: &EndpointName, pane_id: usize, on_event: F) -> Result<()>
+where
+    F: FnMut(Event) -> bool,
+{
+    subscribe_events_scoped(endpoint, EventScope::PaneInbox(pane_id), on_event)
+}
+
+/// Shared body of [`subscribe_events`] and [`subscribe_inbox_events`].
+///
+/// The two public entry points exist so a caller has to say which slice
+/// of the stream it wants; the wire difference between them is exactly
+/// the `from_pane` field this function derives from `scope`. Keeping the
+/// I/O in one place means the handshake, the `Subscribed` ack handling
+/// and the forward-compat skip logic cannot drift between them.
+fn subscribe_events_scoped<F>(
+    endpoint: &EndpointName,
+    scope: EventScope,
+    mut on_event: F,
+) -> Result<()>
 where
     F: FnMut(Event) -> bool,
 {
@@ -114,27 +331,18 @@ where
         Stream::connect(name).with_context(|| format!("connect to {}", endpoint.as_str()))?;
     let mut reader = BufReader::new(conn);
 
-    // Handshake (same as converse).
-    let hello = Request::Hello {
-        client_pid: std::process::id(),
-    };
-    write_request_line(reader.get_mut(), &hello)?;
-    let hello_resp = read_response_line(&mut reader)?;
-    match hello_resp {
-        Response::Hello { session_token, .. } => {
-            verify_session_token(&session_token, std::env::var(ENV_TOKEN).ok().as_deref())?;
-        }
-        Response::Err { message, code } => {
-            return Err(anyhow!(
-                "server refused hello: {}",
-                fmt_err(&message, &code)
-            ));
-        }
-        _ => return Err(anyhow!("unexpected response to hello")),
-    }
+    // Handshake (same as converse). Event subscribers don't gate on
+    // capabilities — not on `subscribe_pane_scope` either: unknown
+    // `Event` variants are skipped by the read loop below, and a
+    // pre-#306 server drops the unknown `from_pane` and simply
+    // broadcasts, which the caller's own `target_pane` check absorbs. An
+    // old server is therefore degraded-but-correct here rather than
+    // silently wrong, and failing closed would only take away a stream
+    // that still works.
+    perform_handshake(&mut reader)?;
 
     // Switch into event-stream mode.
-    write_request_line(reader.get_mut(), &Request::Subscribe)?;
+    write_request_line(reader.get_mut(), &subscribe_request_for(scope))?;
     match read_response_line(&mut reader)? {
         Response::Subscribed => {}
         Response::Err { message, code } => {
@@ -182,10 +390,35 @@ where
     }
 }
 
+/// Translate a client-side [`EventScope`] into the `subscribe` request
+/// that asks for it.
+///
+/// Split out of [`subscribe_events_scoped`] so the wire consequence of
+/// each entry point can be asserted without standing up a server — in
+/// particular that [`subscribe_events`] names no pane and therefore
+/// keeps serializing to exactly `{"cmd":"subscribe"}`, the shape every
+/// renga server ever shipped already understands and answers with the
+/// full broadcast.
+fn subscribe_request_for(scope: EventScope) -> Request {
+    Request::Subscribe {
+        from_pane: match scope {
+            EventScope::Unscoped => None,
+            EventScope::PaneInbox(pane_id) => Some(pane_id),
+        },
+    }
+}
+
 /// True when `line` is valid JSON for an object whose `type` field is
 /// a string but not one of the [`Event`] variants this client knows
 /// about. Only this narrow case is swallowed by the subscribe loop;
 /// malformed JSON or wrong shapes on known variants still surface.
+///
+/// [`KNOWN_EVENT_TAGS`] must name **every** [`Event`] variant. A missing
+/// tag is not a harmless omission: it reclassifies a shape error on a
+/// real variant as "some future server sent something new", and the
+/// subscribe loop then discards the line without a word. `peer_inbox`
+/// was missing here until Issue #306, which meant a malformed peer
+/// message vanished instead of surfacing as a parse error.
 fn is_unknown_event_variant(line: &str) -> bool {
     let value: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -195,11 +428,34 @@ fn is_unknown_event_variant(line: &str) -> bool {
         Some(s) => s,
         None => return false,
     };
-    !matches!(
-        ty,
-        "pane_started" | "pane_exited" | "events_dropped" | "heartbeat"
-    )
+    !KNOWN_EVENT_TAGS.contains(&ty)
 }
+
+/// The serde `type` tag of every [`Event`] variant this client can
+/// parse.
+///
+/// **Adding an `Event` variant means adding its tag here.** Rust cannot
+/// enforce that on its own — a `&str` match has no exhaustiveness check
+/// — so the guard is split across two places that a new variant does
+/// break: `wire_tag` in this module's tests is an exhaustive `match` and
+/// stops compiling, and `every_event_variant_tag_is_known_to_the_client`
+/// asserts this list and the sample set agree in length. Between them a
+/// maintainer has to touch this constant deliberately rather than by
+/// remembering to.
+const KNOWN_EVENT_TAGS: &[&str] = &[
+    "pane_started",
+    "pane_exited",
+    "pane_prompt_detected",
+    "pane_waiting_input",
+    "pane_mode_changed",
+    "peer_nudge_stalled",
+    "peer_nudge_queued",
+    "peer_nudge_submitted",
+    "events_dropped",
+    "heartbeat",
+    "peer_inbox",
+    "peer_inbox_drained",
+];
 
 /// Render an error `message` plus optional machine-readable `code` as
 /// a single human string. Shell-visible so operators can grep by code.
@@ -247,6 +503,26 @@ fn verify_session_token(server_token: &str, expected: Option<&str>) -> Result<()
             "{ENV_TOKEN} not set; are you running inside renga?"
         )),
     }
+}
+
+/// Reject the call when the connected server does not advertise
+/// `cap`. The message names the remedy (restart renga) because the
+/// cause is always the same: a renga process started from an older
+/// binary than the client that is talking to it.
+fn require_capability(cap: &str, advertised: &[String]) -> Result<()> {
+    if advertised.iter().any(|c| c == cap) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "[server_too_old] this renga server does not support the `{cap}` protocol capability \
+         (it advertised: {advertised}). The running renga process predates this feature — \
+         restart renga so the server and its panes speak the same protocol.",
+        advertised = if advertised.is_empty() {
+            "none".to_string()
+        } else {
+            advertised.join(", ")
+        }
+    ))
 }
 
 fn read_response_line<R: BufRead>(r: &mut R) -> Result<Response> {
@@ -297,10 +573,221 @@ mod tests {
         assert!(!is_unknown_event_variant(r#"{"id":1,"ts_ms":1}"#));
     }
 
+    /// The wire tag serde derives for each [`Event`] variant.
+    ///
+    /// Exhaustive by construction: no wildcard arm, so adding an
+    /// `Event` variant stops this file compiling until someone states
+    /// its tag here. That is the one compile-time hook available —
+    /// [`KNOWN_EVENT_TAGS`] is a `&str` list and `is_unknown_event_variant`
+    /// matches against it at runtime, neither of which Rust can check
+    /// for exhaustiveness. So this arm is where a maintainer is
+    /// *stopped*, and the length assertion in
+    /// `every_event_variant_tag_is_known_to_the_client` is what then
+    /// sends them to [`KNOWN_EVENT_TAGS`] and to
+    /// [`one_of_every_event_variant`] rather than letting a green suite
+    /// imply the work is finished. `peer_inbox` was silently absent
+    /// from the matcher for as long as that list was maintained purely
+    /// by hand.
+    fn wire_tag(event: &Event) -> &'static str {
+        match event {
+            Event::PaneStarted { .. } => "pane_started",
+            Event::PaneExited { .. } => "pane_exited",
+            Event::PanePromptDetected { .. } => "pane_prompt_detected",
+            Event::PaneWaitingInput { .. } => "pane_waiting_input",
+            Event::PaneModeChanged { .. } => "pane_mode_changed",
+            Event::PeerNudgeStalled { .. } => "peer_nudge_stalled",
+            Event::PeerNudgeQueued { .. } => "peer_nudge_queued",
+            Event::PeerNudgeSubmitted { .. } => "peer_nudge_submitted",
+            Event::EventsDropped { .. } => "events_dropped",
+            Event::Heartbeat { .. } => "heartbeat",
+            Event::PeerInbox { .. } => "peer_inbox",
+            Event::PeerInboxDrained { .. } => "peer_inbox_drained",
+        }
+    }
+
+    /// One sample of every [`Event`] variant, so the pin below can
+    /// serialize each and check the real serde output rather than a
+    /// hand-written string that could drift from it.
+    fn one_of_every_event_variant() -> Vec<Event> {
+        vec![
+            Event::PaneStarted {
+                id: 1,
+                name: None,
+                role: None,
+                ts_ms: 1,
+            },
+            Event::PaneExited {
+                id: 1,
+                name: None,
+                role: None,
+                ts_ms: 1,
+            },
+            Event::PanePromptDetected {
+                id: 1,
+                name: None,
+                role: None,
+                kind: "choice".into(),
+                prompt: "Do you want to proceed?".into(),
+                ts_ms: 1,
+            },
+            Event::PaneWaitingInput {
+                id: 1,
+                name: None,
+                role: None,
+                idle_ms: 5000,
+                ts_ms: 1,
+            },
+            Event::PaneModeChanged {
+                id: 1,
+                name: None,
+                role: None,
+                mode: "plan".into(),
+                prev_mode: Some("default".into()),
+                ts_ms: 1,
+            },
+            Event::PeerNudgeStalled {
+                id: 1,
+                name: None,
+                role: None,
+                queued_ms: 30_000,
+                ts_ms: 1,
+            },
+            Event::PeerNudgeQueued {
+                id: 1,
+                name: None,
+                role: None,
+                pending: 2,
+                ts_ms: 1,
+            },
+            Event::PeerNudgeSubmitted {
+                id: 1,
+                name: None,
+                role: None,
+                pending: 2,
+                ts_ms: 1,
+            },
+            Event::EventsDropped { count: 2, ts_ms: 1 },
+            Event::Heartbeat { ts_ms: 1 },
+            Event::PeerInbox {
+                target_pane: 3,
+                from_pane: 4,
+                from_name: Some("sender".into()),
+                from_kind: None,
+                body: "hi".into(),
+                ts_ms: 1,
+                msg_id: None,
+            },
+            Event::PeerInboxDrained {
+                pane: 3,
+                count: 2,
+                ts_ms: 1,
+            },
+        ]
+    }
+
+    #[test]
+    fn every_event_variant_tag_is_known_to_the_client() {
+        let samples = one_of_every_event_variant();
+        // Catches the half `wire_tag`'s exhaustive match cannot: a new
+        // variant that was given a tag there but never added to
+        // `KNOWN_EVENT_TAGS`, or added to the constant but left without
+        // a sample, so that the loop below silently exercises nothing.
+        let mut tags: Vec<&str> = samples.iter().map(wire_tag).collect();
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(
+            tags.len(),
+            samples.len(),
+            "one_of_every_event_variant must not sample the same variant twice"
+        );
+        let mut known = KNOWN_EVENT_TAGS.to_vec();
+        known.sort_unstable();
+        assert_eq!(
+            tags, known,
+            "KNOWN_EVENT_TAGS and the sample set have diverged — a new Event \
+             variant needs a tag in the constant AND a sample here, or a \
+             malformed line of that type will be silently discarded"
+        );
+        for event in samples {
+            let json = serde_json::to_string(&event).expect("serialize event");
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                parsed.get("type").and_then(|v| v.as_str()),
+                Some(wire_tag(&event)),
+                "serde tag drifted from wire_tag for {event:?}"
+            );
+            assert!(
+                !is_unknown_event_variant(&json),
+                "{} is a real Event variant but the client treats it as unknown \
+                 and would silently drop it",
+                wire_tag(&event)
+            );
+        }
+    }
+
+    // ─── Issue #306 subscribe scoping ─────────────────────
+
+    /// The split API only helps if the two entry points really do put
+    /// different things on the wire. Pin both directions, plus the byte
+    /// shape of the unscoped one: `renga events` and every pre-#306
+    /// client send exactly `{"cmd":"subscribe"}`, and a new client must
+    /// keep doing so — both so old servers never see an unfamiliar line,
+    /// and so that declining the #306 opt-in really is a no-op on the
+    /// wire rather than a subtly different request.
+    #[test]
+    fn unscoped_sends_the_legacy_subscribe() {
+        let req = subscribe_request_for(EventScope::Unscoped);
+        assert_eq!(req, Request::Subscribe { from_pane: None });
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"cmd":"subscribe"}"#
+        );
+    }
+
+    #[test]
+    fn inbox_scope_names_the_pane_on_the_wire() {
+        let req = subscribe_request_for(EventScope::PaneInbox(7));
+        assert_eq!(req, Request::Subscribe { from_pane: Some(7) });
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"cmd":"subscribe","from_pane":7}"#
+        );
+    }
+
+    /// Pane 0 is a real pane id in renga, and `Option` makes it easy to
+    /// write a mapping where a falsy pane silently degrades to "no pane
+    /// named". A subscriber for pane 0 must bind pane 0; degrading it to
+    /// the unscoped stream would not lose events — the unscoped stream is
+    /// a superset — but it would silently hand pane 0 the whole session's
+    /// peer traffic, i.e. the firehose it explicitly opted out of.
+    #[test]
+    fn pane_zero_binds_the_pane_instead_of_degrading_to_unscoped() {
+        assert_eq!(
+            subscribe_request_for(EventScope::PaneInbox(0)),
+            Request::Subscribe { from_pane: Some(0) }
+        );
+    }
+
+    /// The bug the missing `peer_inbox` tag caused, pinned directly: a
+    /// `peer_inbox` line whose shape is wrong (here `target_pane` is a
+    /// string, and the required fields are absent) must be reported as
+    /// a parse error by the subscribe loop, not swallowed as "a future
+    /// server sent a variant we don't know".
+    #[test]
+    fn malformed_peer_inbox_is_not_swallowed_as_a_future_variant() {
+        assert!(!is_unknown_event_variant(
+            r#"{"type":"peer_inbox","target_pane":"not-a-number"}"#
+        ));
+        assert!(!is_unknown_event_variant(r#"{"type":"peer_inbox"}"#));
+    }
+
     #[test]
     fn write_request_line_is_newline_terminated() {
         let mut out: Vec<u8> = Vec::new();
-        let req = Request::List;
+        let req = Request::List {
+            from_pane: None,
+            tab: None,
+        };
         write_request_line(&mut out, &req).unwrap();
         assert!(out.ends_with(b"\n"));
         // The line without the trailing newline must parse back to the
@@ -308,7 +795,13 @@ mod tests {
         // multi-line JSON.
         let line = std::str::from_utf8(&out).unwrap().trim_end();
         let parsed: Request = serde_json::from_str(line).unwrap();
-        assert_eq!(parsed, Request::List);
+        assert_eq!(
+            parsed,
+            Request::List {
+                from_pane: None,
+                tab: None,
+            }
+        );
     }
 
     #[test]
@@ -317,6 +810,233 @@ mod tests {
         let mut reader = std::io::BufReader::new(input);
         let resp = read_response_line(&mut reader).unwrap();
         assert!(matches!(resp, Response::Ok { .. }));
+    }
+
+    // ─── Issue #288 version-skew gate ─────────────────────
+
+    /// #304 exposes the capability set but must not mint a token for
+    /// doing so — that would be circular (you would have to read the
+    /// list to learn the list is readable) and would break its own
+    /// primary use case, since an old server cannot advertise a new
+    /// token and old servers are exactly what the probe must answer
+    /// for. Pinned so a future change has to be deliberate.
+    ///
+    /// The list is pinned whole, so every addition lands here on
+    /// purpose. `peer_user_turn` is #323's, and earns a token for the
+    /// reason #304 does not: it changes what a request *does*, and an
+    /// older server would ignore the new `deliver` field and perform a
+    /// channel send while answering `Ok`.
+    ///
+    /// `subscribe_pane_scope` is #306's, and is a third kind again:
+    /// advertise-only. Nothing in this file passes it to
+    /// [`send_request_requiring`], because an old server's fallback
+    /// (ignore `from_pane`, broadcast everything — which is also what a
+    /// new server does for a subscription that names no pane) is still
+    /// correct once the subscriber applies its own `target_pane` check.
+    /// It is on the list purely so `server_info` can report whether a
+    /// `from_pane` on subscribe will actually be honored.
+    ///
+    /// `cross_tab_list` is #329's, and belongs to the first kind — it
+    /// changes what a request does. An older server drops the unknown
+    /// `tab` on a `List` and answers with the caller's tab alone, and
+    /// does so with an `Ok` a client cannot distinguish from a correct
+    /// one, which is why it is gated rather than advertise-only.
+    ///
+    /// `split_refusal_causes` is #335's, and belongs to the first kind
+    /// even though the client sends nothing new: what changed is which
+    /// error code a refused `Split` comes back with, and `spawn_pane`
+    /// now tells callers that a refusal which is not
+    /// `pane_limit_reached` is target-local. A pre-3.0 server answers
+    /// both causes with `split_refused`, so that promise would be
+    /// wrong precisely when a caller acts on it — and the reply gives
+    /// no way to notice, since `split_refused` is a valid answer on
+    /// either server with two different meanings. Hence gated, not
+    /// advertise-only.
+    #[test]
+    fn capability_exposure_mints_no_new_token() {
+        assert_eq!(
+            super::super::SERVER_CAPABILITIES,
+            &[
+                super::super::CAP_CALLER_SCOPE,
+                super::super::CAP_CROSS_TAB_PEERS,
+                super::super::CAP_SPAWN_TAB,
+                super::super::CAP_CALLER_SCOPE_CLOSE_IDENTITY,
+                super::super::CAP_PEER_USER_TURN,
+                super::super::CAP_SUBSCRIBE_PANE_SCOPE,
+                super::super::CAP_CROSS_TAB_LIST,
+                super::super::CAP_SPLIT_REFUSAL_CAUSES,
+            ],
+            "#304 is introspection only and adds no capability token"
+        );
+    }
+
+    #[test]
+    fn require_capability_accepts_an_advertised_token() {
+        let advertised = vec![super::super::CAP_CALLER_SCOPE.to_string()];
+        assert!(require_capability(super::super::CAP_CALLER_SCOPE, &advertised).is_ok());
+    }
+
+    /// An old renga process advertises nothing. Failing closed here is
+    /// what keeps a new mcp-peer from issuing a `from_pane` request the
+    /// old server silently strips and executes against the wrong tab.
+    #[test]
+    fn require_capability_fails_closed_and_names_the_remedy() {
+        let err = require_capability(super::super::CAP_CALLER_SCOPE, &[]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("server_too_old"), "got: {msg}");
+        assert!(msg.contains("restart renga"), "got: {msg}");
+    }
+
+    #[test]
+    fn require_capability_ignores_unrelated_tokens() {
+        let advertised = vec!["something_else".to_string()];
+        assert!(require_capability(super::super::CAP_CALLER_SCOPE, &advertised).is_err());
+    }
+
+    /// A #288-era server advertises `caller_scope` but still silently
+    /// drops cross-tab peer sends. The peer tools gate on the distinct
+    /// `cross_tab_peers` token, so that server must be rejected — a
+    /// success here would let "Delivered" lie about a dropped message.
+    #[test]
+    fn require_cross_tab_peers_fails_closed_against_a_288_server() {
+        let advertised = vec![super::super::CAP_CALLER_SCOPE.to_string()];
+        let err = require_capability(super::super::CAP_CROSS_TAB_PEERS, &advertised).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("server_too_old"), "got: {msg}");
+        assert!(msg.contains("cross_tab_peers"), "got: {msg}");
+    }
+
+    #[test]
+    fn require_cross_tab_peers_accepts_a_289_server() {
+        let advertised: Vec<String> = super::super::SERVER_CAPABILITIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(require_capability(super::super::CAP_CROSS_TAB_PEERS, &advertised).is_ok());
+    }
+
+    /// A #289-era server advertises `caller_scope` and
+    /// `cross_tab_peers` but ignores the unknown `tab` field on a
+    /// split — it would spawn into the caller's tab and report
+    /// success. Tab-directed spawns gate on the distinct `spawn_tab`
+    /// token, so that server must be rejected (Issue #290).
+    #[test]
+    fn require_spawn_tab_fails_closed_against_a_289_server() {
+        let advertised = vec![
+            super::super::CAP_CALLER_SCOPE.to_string(),
+            super::super::CAP_CROSS_TAB_PEERS.to_string(),
+        ];
+        let err = require_capability(super::super::CAP_SPAWN_TAB, &advertised).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("server_too_old"), "got: {msg}");
+        assert!(msg.contains("spawn_tab"), "got: {msg}");
+    }
+
+    #[test]
+    fn require_spawn_tab_accepts_a_290_server() {
+        let advertised: Vec<String> = super::super::SERVER_CAPABILITIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(require_capability(super::super::CAP_SPAWN_TAB, &advertised).is_ok());
+    }
+
+    /// A #290-era server advertises the three earlier tokens but still
+    /// resolves `close`'s `focused` against the visible tab, dropping
+    /// the unknown `from_pane`. Since `close_pane` is destructive and
+    /// irreversible, that server must be refused rather than trusted
+    /// (Issue #296).
+    #[test]
+    fn require_caller_scope_close_identity_fails_closed_against_a_290_server() {
+        let advertised = vec![
+            super::super::CAP_CALLER_SCOPE.to_string(),
+            super::super::CAP_CROSS_TAB_PEERS.to_string(),
+            super::super::CAP_SPAWN_TAB.to_string(),
+        ];
+        let err = require_capability(super::super::CAP_CALLER_SCOPE_CLOSE_IDENTITY, &advertised)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("server_too_old"), "got: {msg}");
+        assert!(msg.contains("caller_scope_close_identity"), "got: {msg}");
+    }
+
+    #[test]
+    fn require_caller_scope_close_identity_accepts_a_296_server() {
+        let advertised: Vec<String> = super::super::SERVER_CAPABILITIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            require_capability(super::super::CAP_CALLER_SCOPE_CLOSE_IDENTITY, &advertised).is_ok()
+        );
+    }
+
+    /// A #328-era server advertises every earlier token, yet answers a
+    /// `List` carrying an unknown `tab` with the caller's tab alone —
+    /// an `Ok` whose shape is indistinguishable from a correct answer.
+    /// An orchestrator that trusts it reads a truncated population and
+    /// retires live panes. Cross-tab lists therefore gate on the
+    /// distinct `cross_tab_list` token, and that server must be refused
+    /// (Issue #329).
+    #[test]
+    fn require_cross_tab_list_fails_closed_against_a_328_server() {
+        // Spelled out rather than derived from SERVER_CAPABILITIES:
+        // the point is to simulate the token set of an older build.
+        let advertised = vec![
+            super::super::CAP_CALLER_SCOPE.to_string(),
+            super::super::CAP_CROSS_TAB_PEERS.to_string(),
+            super::super::CAP_SPAWN_TAB.to_string(),
+            super::super::CAP_CALLER_SCOPE_CLOSE_IDENTITY.to_string(),
+            super::super::CAP_PEER_USER_TURN.to_string(),
+            super::super::CAP_SUBSCRIBE_PANE_SCOPE.to_string(),
+        ];
+        let err = require_capability(super::super::CAP_CROSS_TAB_LIST, &advertised).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("server_too_old"), "got: {msg}");
+        assert!(msg.contains("cross_tab_list"), "got: {msg}");
+    }
+
+    #[test]
+    fn require_cross_tab_list_accepts_a_329_server() {
+        let advertised: Vec<String> = super::super::SERVER_CAPABILITIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(require_capability(super::super::CAP_CROSS_TAB_LIST, &advertised).is_ok());
+    }
+
+    /// A 2.x server answers both of #335's causes with `split_refused`,
+    /// so a client that has been told "a refusal which is not
+    /// `pane_limit_reached` is target-local" would act on a promise
+    /// that server never made — and nothing in the reply reveals it,
+    /// since `split_refused` is a valid answer on both. Refuse it.
+    #[test]
+    fn require_split_refusal_causes_fails_closed_against_a_2x_server() {
+        // Spelled out rather than derived from SERVER_CAPABILITIES:
+        // the point is to simulate the token set of an older build.
+        let advertised = vec![
+            super::super::CAP_CALLER_SCOPE.to_string(),
+            super::super::CAP_CROSS_TAB_PEERS.to_string(),
+            super::super::CAP_SPAWN_TAB.to_string(),
+            super::super::CAP_CALLER_SCOPE_CLOSE_IDENTITY.to_string(),
+            super::super::CAP_PEER_USER_TURN.to_string(),
+            super::super::CAP_SUBSCRIBE_PANE_SCOPE.to_string(),
+            super::super::CAP_CROSS_TAB_LIST.to_string(),
+        ];
+        let err =
+            require_capability(super::super::CAP_SPLIT_REFUSAL_CAUSES, &advertised).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("server_too_old"), "got: {msg}");
+        assert!(msg.contains("split_refusal_causes"), "got: {msg}");
+    }
+
+    #[test]
+    fn require_split_refusal_causes_accepts_a_335_server() {
+        let advertised: Vec<String> = super::super::SERVER_CAPABILITIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(require_capability(super::super::CAP_SPLIT_REFUSAL_CAUSES, &advertised).is_ok());
     }
 
     #[test]
@@ -376,6 +1096,8 @@ mod tests {
             id: Some("foo".into()),
             role: None,
             cwd: None,
+            from_pane: None,
+            tab: None,
         };
         let mut out: Vec<u8> = Vec::new();
         write_request_line(&mut out, &req).unwrap();
